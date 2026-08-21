@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: bot-trading
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PORT
+        fromService:
+          type: web
+          property: port
