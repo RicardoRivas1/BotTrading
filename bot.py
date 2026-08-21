@@ -42,8 +42,8 @@ def iniciar_servidor_puerto():
 
 
 # --- Configuración del Exchange Binance con credenciales de .env ---
-api_key = os.environ.get("BINANCE_API_KEY")
-api_secret = os.environ.get("BINANCE_API_SECRET") or os.environ.get(
+api_key = os.environ.get("BINANCE_API_KEY1")
+api_secret = os.environ.get("BINANCE_API_SECRE1T") or os.environ.get(
     "BINANCE_SECRET_KEY"
 )
 
