@@ -14,6 +14,7 @@ from logic import (
     calcular_profit_factor,
     validar_profit_factor_minimo,
     crear_registro_csv,
+    notificar_operacion_telegram,
 )
 
 
@@ -137,6 +138,11 @@ def run():
                 reg = crear_registro_csv("COMPRA", current_price, saldo_btc, monto_usdt)
                 guardar_csv(reg)
 
+                # Envío de notificación a Telegram
+                notificar_operacion_telegram(
+                    "COMPRA", current_price, saldo_btc, monto_usdt
+                )
+
             elif senial == "VENTA" and saldo_btc > 0:
                 print("SEÑAL DE VENTA MULTIVARIABLE DETECTADA")
 
@@ -177,6 +183,16 @@ def run():
                     ganancias=(ganancia_usdt, ganancia_pct),
                 )
                 guardar_csv(reg)
+
+                # Envío de notificación a Telegram
+                notificar_operacion_telegram(
+                    "VENTA",
+                    current_price,
+                    saldo_btc,
+                    saldo_usdt,
+                    ganancias=(ganancia_usdt, ganancia_pct),
+                )
+
                 saldo_btc = 0.0
 
             else:

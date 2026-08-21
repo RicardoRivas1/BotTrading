@@ -1,7 +1,9 @@
 """Módulo con la lógica pura de negocio para el bot de trading."""
 
 from datetime import datetime
+import os
 import pandas as pd
+import requests
 
 
 def calcular_sma(precios: pd.Series, period: int = 20) -> pd.Series:
@@ -35,7 +37,9 @@ def calcular_rsi(precios: pd.Series, period: int = 14) -> pd.Series:
     return rsi
 
 
-def calcular_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+def calcular_atr(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
     """Calcula el Average True Range (ATR)."""
     if len(high) < period + 1:
         raise ValueError("Datos insuficientes para el período solicitado")
@@ -52,8 +56,17 @@ def calcular_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int 
 class EstrategiaMultivariable:
     """Contenedor para los parámetros de la estrategia multivariable."""
 
-    def __init__(self, precio_actual, ema_9, ema_21, rsi, volumen,
-                 volumen_promedio, prev_precio, prev_ema_9):
+    def __init__(
+        self,
+        precio_actual,
+        ema_9,
+        ema_21,
+        rsi,
+        volumen,
+        volumen_promedio,
+        prev_precio,
+        prev_ema_9,
+    ):
         self.precio_actual = precio_actual
         self.ema_9 = ema_9
         self.ema_21 = ema_21
@@ -67,15 +80,19 @@ class EstrategiaMultivariable:
 def evaluar_estrategia_multivariable(estrategia: EstrategiaMultivariable) -> str:
     """Evalúa estrategia multivariable con EMA 9/21, RSI y filtro de volumen."""
     # Condiciones de COMPRA
-    compra_ema = (estrategia.prev_precio <= estrategia.prev_ema_9 and
-                  estrategia.precio_actual > estrategia.ema_9)
+    compra_ema = (
+        estrategia.prev_precio <= estrategia.prev_ema_9
+        and estrategia.precio_actual > estrategia.ema_9
+    )
     compra_tendencia = estrategia.ema_9 > estrategia.ema_21
     compra_rsi = 30 < estrategia.rsi < 70
     compra_volumen = estrategia.volumen > estrategia.volumen_promedio * 1.2
 
     # Condiciones de VENTA
-    venta_ema = (estrategia.prev_precio >= estrategia.prev_ema_9 and
-                 estrategia.precio_actual < estrategia.ema_9)
+    venta_ema = (
+        estrategia.prev_precio >= estrategia.prev_ema_9
+        and estrategia.precio_actual < estrategia.ema_9
+    )
     venta_tendencia = estrategia.ema_9 < estrategia.ema_21
     venta_rsi = estrategia.rsi > 30
     venta_volumen = estrategia.volumen > estrategia.volumen_promedio * 0.8
@@ -92,7 +109,7 @@ def calcular_ganancia_con_stoploss(
     precio_compra: float,
     saldo_btc: float,
     atr: float,
-    tipo_salida: str = "TP"
+    tipo_salida: str = "TP",
 ) -> tuple:
     """Calcula la ganancia con Stop-Loss/Take-Profit dinámico basado en ATR."""
     if precio_compra <= 0 or saldo_btc <= 0 or atr <= 0:
@@ -117,20 +134,15 @@ def calcular_ganancia_con_stoploss(
     return round(ganancia_usdt, 2), round(ganancia_pct, 2)
 
 
-def calcular_profit_factor(
-    ganancias_totales: float,
-    perdidas_totales: float
-) -> float:
+def calcular_profit_factor(ganancias_totales: float, perdidas_totales: float) -> float:
     """Calcula el Profit Factor (ganancias/perdidas)."""
     if perdidas_totales == 0:
-        return float('inf') if ganancias_totales > 0 else 1.0
+        return float("inf") if ganancias_totales > 0 else 1.0
     return round(abs(ganancias_totales) / abs(perdidas_totales), 2)
 
 
 def validar_profit_factor_minimo(
-    ganancias_totales: float,
-    perdidas_totales: float,
-    minimo: float = 1.2
+    ganancias_totales: float, perdidas_totales: float, minimo: float = 1.2
 ) -> bool:
     """Valida si el Profit Factor cumple con el mínimo requerido."""
     pf = calcular_profit_factor(ganancias_totales, perdidas_totales)
@@ -153,3 +165,54 @@ def crear_registro_csv(
         if tipo == "VENTA"
         else "N/A",
     }
+
+
+# ==========================================
+# MÓDULO DE NOTIFICACIONES TELEGRAM
+# ==========================================
+
+
+def enviar_notificacion_telegram(mensaje: str) -> bool:
+    """Envía un mensaje a Telegram utilizando las variables de entorno de Render."""
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": mensaje, "parse_mode": "Markdown"}
+
+    try:
+        response = requests.post(url, json=payload, timeout=5)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def notificar_operacion_telegram(
+    tipo: str, precio: float, btc: float, usdt: float, ganancias: tuple = (0.0, 0.0)
+):
+    """Genera y envía la alerta visual a Telegram al ejecutar compra/venta."""
+    ganancia_usdt, ganancia_pct = ganancias
+
+    if tipo == "COMPRA":
+        mensaje = (
+            f"🟢 *ORDEN DE COMPRA EJECUTADA*\n\n"
+            f"• *Precio BTC:* ${precio:,.2f}\n"
+            f"• *Monto BTC:* {btc:.6f}\n"
+            f"• *Total USDT:* ${usdt:,.2f}"
+        )
+    elif tipo == "VENTA":
+        mensaje = (
+            f"🔴 *ORDEN DE VENTA EJECUTADA*\n\n"
+            f"• *Precio Venta:* ${precio:,.2f}\n"
+            f"• *Monto BTC:* {btc:.6f}\n"
+            f"• *Total USDT:* ${usdt:,.2f}\n"
+            f"• *Ganancia USDT:* ${ganancia_usdt:,.2f}\n"
+            f"• *Rendimiento:* {ganancia_pct:.2f}%"
+        )
+    else:
+        return
+
+    enviar_notificacion_telegram(mensaje)
