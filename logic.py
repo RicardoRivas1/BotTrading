@@ -1,0 +1,155 @@
+"""Módulo con la lógica pura de negocio para el bot de trading."""
+
+from datetime import datetime
+import pandas as pd
+
+
+def calcular_sma(precios: pd.Series, period: int = 20) -> pd.Series:
+    """Calcula la Media Móvil Simple (SMA)."""
+    if len(precios) < period:
+        raise ValueError("Datos insuficientes para el período solicitado")
+    return precios.rolling(window=period).mean()
+
+
+def calcular_ema(precios: pd.Series, period: int) -> pd.Series:
+    """Calcula la Media Móvil Exponencial (EMA)."""
+    if len(precios) < period:
+        raise ValueError("Datos insuficientes para el período solicitado")
+    return precios.ewm(span=period, adjust=False).mean()
+
+
+def calcular_rsi(precios: pd.Series, period: int = 14) -> pd.Series:
+    """Calcula el Índice de Fuerza Relativa (RSI)."""
+    if len(precios) < period + 1:
+        raise ValueError("Datos insuficientes para el período solicitado")
+
+    delta = precios.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def calcular_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Calcula el Average True Range (ATR)."""
+    if len(high) < period + 1:
+        raise ValueError("Datos insuficientes para el período solicitado")
+
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = true_range.rolling(window=period).mean()
+    return atr
+
+
+class EstrategiaMultivariable:
+    """Contenedor para los parámetros de la estrategia multivariable."""
+
+    def __init__(self, precio_actual, ema_9, ema_21, rsi, volumen,
+                 volumen_promedio, prev_precio, prev_ema_9):
+        self.precio_actual = precio_actual
+        self.ema_9 = ema_9
+        self.ema_21 = ema_21
+        self.rsi = rsi
+        self.volumen = volumen
+        self.volumen_promedio = volumen_promedio
+        self.prev_precio = prev_precio
+        self.prev_ema_9 = prev_ema_9
+
+
+def evaluar_estrategia_multivariable(estrategia: EstrategiaMultivariable) -> str:
+    """Evalúa estrategia multivariable con EMA 9/21, RSI y filtro de volumen."""
+    # Condiciones de COMPRA
+    compra_ema = (estrategia.prev_precio <= estrategia.prev_ema_9 and
+                  estrategia.precio_actual > estrategia.ema_9)
+    compra_tendencia = estrategia.ema_9 > estrategia.ema_21
+    compra_rsi = 30 < estrategia.rsi < 70
+    compra_volumen = estrategia.volumen > estrategia.volumen_promedio * 1.2
+
+    # Condiciones de VENTA
+    venta_ema = (estrategia.prev_precio >= estrategia.prev_ema_9 and
+                 estrategia.precio_actual < estrategia.ema_9)
+    venta_tendencia = estrategia.ema_9 < estrategia.ema_21
+    venta_rsi = estrategia.rsi > 30
+    venta_volumen = estrategia.volumen > estrategia.volumen_promedio * 0.8
+
+    if compra_ema and compra_tendencia and compra_rsi and compra_volumen:
+        return "COMPRA"
+    if venta_ema and venta_tendencia and venta_rsi and venta_volumen:
+        return "VENTA"
+    return "NEUTRAL"
+
+
+def calcular_ganancia_con_stoploss(
+    precio_venta: float,
+    precio_compra: float,
+    saldo_btc: float,
+    atr: float,
+    tipo_salida: str = "TP"
+) -> tuple:
+    """Calcula la ganancia con Stop-Loss/Take-Profit dinámico basado en ATR."""
+    if precio_compra <= 0 or saldo_btc <= 0 or atr <= 0:
+        return 0.0, 0.0
+
+    # Definir niveles basados en ATR
+    atr_multiplier_tp = 2.0  # Take-Profit a 2 ATRs
+    atr_multiplier_sl = 1.0  # Stop-Loss a 1 ATR
+
+    if tipo_salida == "TP":
+        precio_venta_real = precio_compra + (atr * atr_multiplier_tp)
+    elif tipo_salida == "SL":
+        precio_venta_real = precio_compra - (atr * atr_multiplier_sl)
+    else:
+        precio_venta_real = precio_venta
+
+    monto_usdt_inicial = saldo_btc * precio_compra
+    monto_usdt_final = saldo_btc * precio_venta_real
+    ganancia_usdt = monto_usdt_final - monto_usdt_inicial
+    ganancia_pct = ((precio_venta_real - precio_compra) / precio_compra) * 100
+
+    return round(ganancia_usdt, 2), round(ganancia_pct, 2)
+
+
+def calcular_profit_factor(
+    ganancias_totales: float,
+    perdidas_totales: float
+) -> float:
+    """Calcula el Profit Factor (ganancias/perdidas)."""
+    if perdidas_totales == 0:
+        return float('inf') if ganancias_totales > 0 else 1.0
+    return round(abs(ganancias_totales) / abs(perdidas_totales), 2)
+
+
+def validar_profit_factor_minimo(
+    ganancias_totales: float,
+    perdidas_totales: float,
+    minimo: float = 1.2
+) -> bool:
+    """Valida si el Profit Factor cumple con el mínimo requerido."""
+    pf = calcular_profit_factor(ganancias_totales, perdidas_totales)
+    return pf >= minimo
+
+
+def crear_registro_csv(
+    tipo: str, precio: float, btc: float, usdt: float, ganancias: tuple = (0.0, 0.0)
+) -> dict:
+    """Estructura una fila lista para persistir en el historial CSV."""
+    ganancia_usdt, ganancia_pct = ganancias
+    return {
+        "Fecha_Hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Tipo_Operacion": tipo,
+        "Precio_BTC": round(precio, 2),
+        "Monto_BTC": round(btc, 6),
+        "Monto_USDT": round(usdt, 2),
+        "Ganancia_USDT": round(ganancia_usdt, 2),
+        "Ganancia_Porcentaje": f"{round(ganancia_pct, 2)}%"
+        if tipo == "VENTA"
+        else "N/A",
+    }
