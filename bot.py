@@ -18,6 +18,10 @@ from logic import (
     notificar_operacion_telegram,
 )
 
+# Detectar si estamos en Render (para usar claves demo)
+if "RENDER" in os.environ:
+    os.environ["RENDER"] = "true"
+
 # Cargar variables del archivo .env
 load_dotenv()
 
@@ -41,11 +45,16 @@ def iniciar_servidor_puerto():
     server.serve_forever()
 
 
-# --- Configuración del Exchange Binance con credenciales de .env ---
-api_key = os.environ.get("BINANCE_API_KEY1")
-api_secret = os.environ.get("BINANCE_API_SECRE1T") or os.environ.get(
-    "BINANCE_SECRET_KEY"
-)
+# --- Configuraci�n del Exchange Binance con credenciales de .env ---
+# Usar claves demo en producci�n (Render) y claves reales en desarrollo local
+if os.environ.get("RENDER"):
+    # Estamos en Render - usar cuenta demo
+    api_key = os.environ.get("BINANCE_API_KEY_DEMO")
+    api_secret = os.environ.get("BINANCE_SECRET_KEY_DEMO")
+else:
+    # Estamos en desarrollo local - usar cuenta real
+    api_key = os.environ.get("BINANCE_API_KEY_REAL")
+    api_secret = os.environ.get("BINANCE_SECRET_KEY_REAL")
 
 exchange = ccxt.binance(
     {
