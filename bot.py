@@ -25,7 +25,8 @@ print(f"Variables de entorno RENDER_EXTERNAL_URL: {os.environ.get('RENDER_EXTERN
 
 if "RENDER" in os.environ or "RENDER_EXTERNAL_URL" in os.environ:
     os.environ["USE_DEMO_ACCOUNT"] = "true"
-    print("✅ Modo demo activado (entorno Render detectado)")
+    os.environ["MODO_SIMULACION"] = "true"  # Activar modo simulaci�n en Render
+    print("✅ Modo demo y simulaci�n activados (entorno Render detectado)")
 else:
     print("🔧 Modo desarrollo local (usando cuenta real)")
 
@@ -134,7 +135,27 @@ def run():
 
     while True:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+            # Verificar modo simulaci�n
+            if os.environ.get("MODO_SIMULACION") == "true":
+                print("🔧 Modo simulaci�n: Simulando datos de mercado...")
+                # Simular datos OHLCV en lugar de conectar a Binance
+                import random
+                import time as time_module
+                current_time = int(time_module.time() * 1000)
+                ohlcv = []
+                for i in range(100):
+                    price = 30000 + random.randint(-1000, 1000)
+                    ohlcv.append([
+                        current_time - (99-i)*60000,
+                        price - random.randint(10, 100),
+                        price + random.randint(10, 100), 
+                        price - random.randint(50, 200),
+                        price,
+                        random.randint(100, 1000)
+                    ])
+            else:
+                # Conexi�n real a Binance
+                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
             df = pd.DataFrame(
                 ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
             )
