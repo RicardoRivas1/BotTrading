@@ -252,3 +252,13 @@ def run():
         except Exception as e:
             print(f"Error en ejecucion: {e}")
             time.sleep(10)
+
+
+if __name__ == "__main__":
+    # Iniciar servidor HTTP en un hilo separado para Render
+    server_thread = threading.Thread(target=iniciar_servidor_puerto, daemon=True)
+    server_thread.start()
+    
+    # Iniciar el bot de trading
+    print("Iniciando bot de trading...")
+    run()
