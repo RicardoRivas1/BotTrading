@@ -60,17 +60,25 @@ def guardar_csv(registro: dict):
 
 
 def run():
-    global \
-        saldo_usdt, \
-        saldo_btc, \
-        precio_compra, \
-        atr_compra, \
-        ganancias_totales, \
-        perdidas_totales
+    global (
+        saldo_usdt,
+        saldo_btc,
+        precio_compra,
+        atr_compra,
+        ganancias_totales,
+        perdidas_totales,
+    )
     print("Bot iniciado en Paper Trading Local (Validado por QA Pipeline)...")
     print(
         "Estrategia: EMA 9/21 con filtros RSI y Volumen, Stop-Loss/Take-Profit dinamico con ATR"
     )
+
+    # 🟢 NOTIFICACIÓN DE PRUEBA AL ARRANQUE
+    try:
+        notificar_operacion_telegram("COMPRA", 65000.0, 0.015, 1000.0)
+        print("✅ Notificación de prueba enviada exitosamente a Telegram.")
+    except Exception as e:
+        print(f"❌ Error al enviar notificación de prueba a Telegram: {e}")
 
     while True:
         try:
