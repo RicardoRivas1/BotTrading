@@ -20,9 +20,14 @@ from logic import (
 
 # Detectar si estamos en Render (para usar claves demo)
 # Render establece autom�ticamente estas variables de entorno
+print(f"Variables de entorno RENDER: {os.environ.get('RENDER')}")
+print(f"Variables de entorno RENDER_EXTERNAL_URL: {os.environ.get('RENDER_EXTERNAL_URL')}")
+
 if "RENDER" in os.environ or "RENDER_EXTERNAL_URL" in os.environ:
     os.environ["USE_DEMO_ACCOUNT"] = "true"
     print("✅ Modo demo activado (entorno Render detectado)")
+else:
+    print("🔧 Modo desarrollo local (usando cuenta real)")
 
 # Cargar variables del archivo .env
 load_dotenv()
