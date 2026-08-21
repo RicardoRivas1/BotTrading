@@ -135,27 +135,8 @@ def run():
 
     while True:
         try:
-            # Verificar modo simulaci�n
-            if os.environ.get("MODO_SIMULACION") == "true":
-                print("🔧 Modo simulaci�n: Simulando datos de mercado...")
-                # Simular datos OHLCV en lugar de conectar a Binance
-                import random
-                import time as time_module
-                current_time = int(time_module.time() * 1000)
-                ohlcv = []
-                for i in range(100):
-                    price = 30000 + random.randint(-1000, 1000)
-                    ohlcv.append([
-                        current_time - (99-i)*60000,
-                        price - random.randint(10, 100),
-                        price + random.randint(10, 100), 
-                        price - random.randint(50, 200),
-                        price,
-                        random.randint(100, 1000)
-                    ])
-            else:
-                # Conexi�n real a Binance
-                ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+            # Conexi�n real a Binance - siempre usar datos reales
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
             df = pd.DataFrame(
                 ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
             )
