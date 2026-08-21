@@ -19,8 +19,10 @@ from logic import (
 )
 
 # Detectar si estamos en Render (para usar claves demo)
-if "RENDER" in os.environ:
-    os.environ["RENDER"] = "true"
+# Render establece autom�ticamente estas variables de entorno
+if "RENDER" in os.environ or "RENDER_EXTERNAL_URL" in os.environ:
+    os.environ["USE_DEMO_ACCOUNT"] = "true"
+    print("✅ Modo demo activado (entorno Render detectado)")
 
 # Cargar variables del archivo .env
 load_dotenv()
@@ -47,14 +49,16 @@ def iniciar_servidor_puerto():
 
 # --- Configuraci�n del Exchange Binance con credenciales de .env ---
 # Usar claves demo en producci�n (Render) y claves reales en desarrollo local
-if os.environ.get("RENDER"):
+if os.environ.get("USE_DEMO_ACCOUNT") == "true":
     # Estamos en Render - usar cuenta demo
     api_key = os.environ.get("BINANCE_API_KEY_DEMO")
     api_secret = os.environ.get("BINANCE_SECRET_KEY_DEMO")
+    print("🔧 Usando cuenta DEMO de Binance")
 else:
     # Estamos en desarrollo local - usar cuenta real
     api_key = os.environ.get("BINANCE_API_KEY_REAL")
     api_secret = os.environ.get("BINANCE_SECRET_KEY_REAL")
+    print("🔧 Usando cuenta REAL de Binance")
 
 exchange = ccxt.binance(
     {
@@ -68,8 +72,10 @@ exchange = ccxt.binance(
 )
 
 # Si deseas usar Binance Testnet, define BINANCE_TESTNET=true en tu .env
-if os.environ.get("BINANCE_TESTNET", "false").lower() == "true":
+# O usar testnet autom�ticamente en modo demo
+if os.environ.get("BINANCE_TESTNET", "false").lower() == "true" or os.environ.get("USE_DEMO_ACCOUNT") == "true":
     exchange.set_sandbox_mode(True)
+    print("🔧 Modo testnet/sandbox activado")
 
 saldo_usdt = 1000.0
 saldo_btc = 0.0
