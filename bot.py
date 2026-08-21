@@ -4,6 +4,7 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import ccxt
 import pandas as pd
+from dotenv import load_dotenv
 from logic import (
     calcular_ema,
     calcular_rsi,
@@ -16,6 +17,9 @@ from logic import (
     crear_registro_csv,
     notificar_operacion_telegram,
 )
+
+# Cargar variables del archivo .env
+load_dotenv()
 
 
 # --- Servidor de Salud para Render (Escucha en el puerto requerido) ---
@@ -37,8 +41,22 @@ def iniciar_servidor_puerto():
     server.serve_forever()
 
 
-# --- Configuración del Exchange y Bot ---
-exchange = ccxt.binance({"enableRateLimit": True})
+# --- Configuración del Exchange Binance con credenciales de .env ---
+api_key = os.environ.get("BINANCE_API_KEY")
+api_secret = os.environ.get("BINANCE_API_SECRET") or os.environ.get("BINANCE_SECRET_KEY")
+
+exchange = ccxt.binance({
+    "apiKey": api_key,
+    "secret": api_secret,
+    "enableRateLimit": True,
+    "options": {
+        "defaultType": "spot",
+    },
+})
+
+# Si deseas usar Binance Testnet, define BINANCE_TESTNET=true en tu .env
+if os.environ.get("BINANCE_TESTNET", "false").lower() == "true":
+    exchange.set_sandbox_mode(True)
 
 saldo_usdt = 1000.0
 saldo_btc = 0.0
@@ -52,6 +70,18 @@ timeframe = "1m"
 csv_file = "historial_trading.csv"
 
 
+def obtener_saldo_real():
+    """Consulta los saldos disponibles directamente desde tu cuenta de Binance."""
+    try:
+        balance = exchange.fetch_balance()
+        usdt = balance["free"].get("USDT", 0.0)
+        btc = balance["free"].get("BTC", 0.0)
+        return usdt, btc
+    except Exception as e:
+        print(f"Error consultando saldo en Binance: {e}")
+        return None, None
+
+
 def guardar_csv(registro: dict):
     df = pd.DataFrame([registro])
     header = not os.path.exists(csv_file)
@@ -60,17 +90,23 @@ def guardar_csv(registro: dict):
 
 
 def run():
-    global \
-        saldo_usdt, \
-        saldo_btc, \
-        precio_compra, \
-        atr_compra, \
-        ganancias_totales, \
-        perdidas_totales
-    print("Bot iniciado en Paper Trading Local (Validado por QA Pipeline)...")
+    global (
+        saldo_usdt,
+        saldo_btc,
+        precio_compra,
+        atr_compra,
+        ganancias_totales,
+        perdidas_totales,
+    )
+    print("Bot iniciado con credenciales autenticadas de Binance (.env)...")
     print(
         "Estrategia: EMA 9/21 con filtros RSI y Volumen, Stop-Loss/Take-Profit dinamico con ATR"
     )
+
+    # Para obtener automáticamente los saldos reales de Binance al iniciar:
+    # real_usdt, real_btc = obtener_saldo_real()
+    # if real_usdt is not None:
+    #     saldo_usdt, saldo_btc = real_usdt, real_btc
 
     while True:
         try:
