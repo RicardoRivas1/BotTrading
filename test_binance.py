@@ -6,8 +6,15 @@ load_dotenv()
 
 
 def probar_binance():
-    api_key = os.getenv("BINANCE_API_KEY")
-    secret_key = os.getenv("BINANCE_SECRET_KEY")
+    # Usar claves demo en producci�n y claves reales en desarrollo local
+    if os.environ.get("USE_DEMO_ACCOUNT") == "true":
+        api_key = os.getenv("BINANCE_API_KEY_DEMO")
+        secret_key = os.getenv("BINANCE_SECRET_KEY_DEMO")
+        print("Usando cuenta DEMO de Binance")
+    else:
+        api_key = os.getenv("BINANCE_API_KEY_REAL")
+        secret_key = os.getenv("BINANCE_SECRET_KEY_REAL")
+        print("Usando cuenta REAL de Binance")
 
     if not api_key or not secret_key:
         print(
