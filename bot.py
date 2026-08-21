@@ -43,16 +43,20 @@ def iniciar_servidor_puerto():
 
 # --- Configuración del Exchange Binance con credenciales de .env ---
 api_key = os.environ.get("BINANCE_API_KEY")
-api_secret = os.environ.get("BINANCE_API_SECRET") or os.environ.get("BINANCE_SECRET_KEY")
+api_secret = os.environ.get("BINANCE_API_SECRET") or os.environ.get(
+    "BINANCE_SECRET_KEY"
+)
 
-exchange = ccxt.binance({
-    "apiKey": api_key,
-    "secret": api_secret,
-    "enableRateLimit": True,
-    "options": {
-        "defaultType": "spot",
-    },
-})
+exchange = ccxt.binance(
+    {
+        "apiKey": api_key,
+        "secret": api_secret,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "spot",
+        },
+    }
+)
 
 # Si deseas usar Binance Testnet, define BINANCE_TESTNET=true en tu .env
 if os.environ.get("BINANCE_TESTNET", "false").lower() == "true":
@@ -90,14 +94,14 @@ def guardar_csv(registro: dict):
 
 
 def run():
-    global (
-        saldo_usdt,
-        saldo_btc,
-        precio_compra,
-        atr_compra,
-        ganancias_totales,
-        perdidas_totales,
-    )
+    global \
+        saldo_usdt, \
+        saldo_btc, \
+        precio_compra, \
+        atr_compra, \
+        ganancias_totales, \
+        perdidas_totales
+
     print("Bot iniciado con credenciales autenticadas de Binance (.env)...")
     print(
         "Estrategia: EMA 9/21 con filtros RSI y Volumen, Stop-Loss/Take-Profit dinamico con ATR"
@@ -239,11 +243,3 @@ def run():
         except Exception as e:
             print(f"Error en ejecucion: {e}")
             time.sleep(10)
-
-
-if __name__ == "__main__":
-    # Inicia el servidor de salud en un hilo secundario sin bloquear el bot
-    threading.Thread(target=iniciar_servidor_puerto, daemon=True).start()
-
-    # Inicia el bucle principal del bot
-    run()
