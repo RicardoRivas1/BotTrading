@@ -1,213 +1,218 @@
+"""Módulo con la lógica pura de negocio para el bot de trading."""
+
+from datetime import datetime
 import os
-import time
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import ccxt
 import pandas as pd
-from logic import (
-    calcular_ema,
-    calcular_rsi,
-    calcular_atr,
-    EstrategiaMultivariable,
-    evaluar_estrategia_multivariable,
-    calcular_ganancia_con_stoploss,
-    calcular_profit_factor,
-    validar_profit_factor_minimo,
-    crear_registro_csv,
-    notificar_operacion_telegram,
-)
+import requests
 
 
-# --- Servidor de Salud para Render (Escucha en el puerto requerido) ---
-class DummyHealthCheck(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot de Trading Activo en Render")
+def calcular_sma(precios: pd.Series, period: int = 20) -> pd.Series:
+    """Calcula la Media Móvil Simple (SMA)."""
+    if len(precios) < period:
+        raise ValueError("Datos insuficientes para el período solicitado")
+    return precios.rolling(window=period).mean()
 
-    def log_message(self, format, *args):
-        # Silenciar logs HTTP en consola para mantener limpios los logs del bot
+
+def calcular_ema(precios: pd.Series, period: int) -> pd.Series:
+    """Calcula la Media Móvil Exponencial (EMA)."""
+    if len(precios) < period:
+        raise ValueError("Datos insuficientes para el período solicitado")
+    return precios.ewm(span=period, adjust=False).mean()
+
+
+def calcular_rsi(precios: pd.Series, period: int = 14) -> pd.Series:
+    """Calcula el Índice de Fuerza Relativa (RSI)."""
+    if len(precios) < period + 1:
+        raise ValueError("Datos insuficientes para el período solicitado")
+
+    delta = precios.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def calcular_atr(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
+    """Calcula el Average True Range (ATR)."""
+    if len(high) < period + 1:
+        raise ValueError("Datos insuficientes para el período solicitado")
+
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = true_range.rolling(window=period).mean()
+    return atr
+
+
+class EstrategiaMultivariable:
+    """Contenedor para los parámetros de la estrategia multivariable."""
+
+    def __init__(
+        self,
+        precio_actual,
+        ema_9,
+        ema_21,
+        rsi,
+        volumen,
+        volumen_promedio,
+        prev_precio,
+        prev_ema_9,
+    ):
+        self.precio_actual = precio_actual
+        self.ema_9 = ema_9
+        self.ema_21 = ema_21
+        self.rsi = rsi
+        self.volumen = volumen
+        self.volumen_promedio = volumen_promedio
+        self.prev_precio = prev_precio
+        self.prev_ema_9 = prev_ema_9
+
+
+def evaluar_estrategia_multivariable(estrategia: EstrategiaMultivariable) -> str:
+    """Evalúa estrategia multivariable con EMA 9/21, RSI y filtro de volumen."""
+    # Condiciones de COMPRA
+    compra_ema = (
+        estrategia.prev_precio <= estrategia.prev_ema_9
+        and estrategia.precio_actual > estrategia.ema_9
+    )
+    compra_tendencia = estrategia.ema_9 > estrategia.ema_21
+    compra_rsi = 30 < estrategia.rsi < 70
+    compra_volumen = estrategia.volumen > estrategia.volumen_promedio * 1.2
+
+    # Condiciones de VENTA
+    venta_ema = (
+        estrategia.prev_precio >= estrategia.prev_ema_9
+        and estrategia.precio_actual < estrategia.ema_9
+    )
+    venta_tendencia = estrategia.ema_9 < estrategia.ema_21
+    venta_rsi = estrategia.rsi > 30
+    venta_volumen = estrategia.volumen > estrategia.volumen_promedio * 0.8
+
+    if compra_ema and compra_tendencia and compra_rsi and compra_volumen:
+        return "COMPRA"
+    if venta_ema and venta_tendencia and venta_rsi and venta_volumen:
+        return "VENTA"
+    return "NEUTRAL"
+
+
+def calcular_ganancia_con_stoploss(
+    precio_venta: float,
+    precio_compra: float,
+    saldo_btc: float,
+    atr: float,
+    tipo_salida: str = "TP",
+) -> tuple:
+    """Calcula la ganancia con Stop-Loss/Take-Profit dinámico basado en ATR."""
+    if precio_compra <= 0 or saldo_btc <= 0 or atr <= 0:
+        return 0.0, 0.0
+
+    # Definir niveles basados en ATR
+    atr_multiplier_tp = 2.0  # Take-Profit a 2 ATRs
+    atr_multiplier_sl = 1.0  # Stop-Loss a 1 ATR
+
+    if tipo_salida == "TP":
+        precio_venta_real = precio_compra + (atr * atr_multiplier_tp)
+    elif tipo_salida == "SL":
+        precio_venta_real = precio_compra - (atr * atr_multiplier_sl)
+    else:
+        precio_venta_real = precio_venta
+
+    monto_usdt_inicial = saldo_btc * precio_compra
+    monto_usdt_final = saldo_btc * precio_venta_real
+    ganancia_usdt = monto_usdt_final - monto_usdt_inicial
+    ganancia_pct = ((precio_venta_real - precio_compra) / precio_compra) * 100
+
+    return round(ganancia_usdt, 2), round(ganancia_pct, 2)
+
+
+def calcular_profit_factor(ganancias_totales: float, perdidas_totales: float) -> float:
+    """Calcula el Profit Factor (ganancias/perdidas)."""
+    if perdidas_totales == 0:
+        return float("inf") if ganancias_totales > 0 else 1.0
+    return round(abs(ganancias_totales) / abs(perdidas_totales), 2)
+
+
+def validar_profit_factor_minimo(
+    ganancias_totales: float, perdidas_totales: float, minimo: float = 1.2
+) -> bool:
+    """Valida si el Profit Factor cumple con el mínimo requerido."""
+    pf = calcular_profit_factor(ganancias_totales, perdidas_totales)
+    return pf >= minimo
+
+
+def crear_registro_csv(
+    tipo: str, precio: float, btc: float, usdt: float, ganancias: tuple = (0.0, 0.0)
+) -> dict:
+    """Estructura una fila lista para persistir en el historial CSV."""
+    ganancia_usdt, ganancia_pct = ganancias
+    return {
+        "Fecha_Hora": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Tipo_Operacion": tipo,
+        "Precio_BTC": round(precio, 2),
+        "Monto_BTC": round(btc, 6),
+        "Monto_USDT": round(usdt, 2),
+        "Ganancia_USDT": round(ganancia_usdt, 2),
+        "Ganancia_Porcentaje": f"{round(ganancia_pct, 2)}%"
+        if tipo == "VENTA"
+        else "N/A",
+    }
+
+
+# ==========================================
+# MÓDULO DE NOTIFICACIONES TELEGRAM
+# ==========================================
+
+
+def enviar_notificacion_telegram(mensaje: str) -> bool:
+    """Envía un mensaje a Telegram utilizando las variables de entorno de Render."""
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
+    if not token or not chat_id:
+        return False
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": mensaje, "parse_mode": "Markdown"}
+
+    try:
+        response = requests.post(url, json=payload, timeout=5)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def notificar_operacion_telegram(
+    tipo: str, precio: float, btc: float, usdt: float, ganancias: tuple = (0.0, 0.0)
+):
+    """Genera y envía la alerta visual a Telegram al ejecutar compra/venta."""
+    ganancia_usdt, ganancia_pct = ganancias
+
+    if tipo == "COMPRA":
+        mensaje = (
+            f"🟢 *ORDEN DE COMPRA EJECUTADA*\n\n"
+            f"• *Precio BTC:* ${precio:,.2f}\n"
+            f"• *Monto BTC:* {btc:.6f}\n"
+            f"• *Total USDT:* ${usdt:,.2f}"
+        )
+    elif tipo == "VENTA":
+        mensaje = (
+            f"🔴 *ORDEN DE VENTA EJECUTADA*\n\n"
+            f"• *Precio Venta:* ${precio:,.2f}\n"
+            f"• *Monto BTC:* {btc:.6f}\n"
+            f"• *Total USDT:* ${usdt:,.2f}\n"
+            f"• *Ganancia USDT:* ${ganancia_usdt:,.2f}\n"
+            f"• *Rendimiento:* {ganancia_pct:.2f}%"
+        )
+    else:
         return
 
-
-def iniciar_servidor_puerto():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), DummyHealthCheck)
-    print(f"Servidor HTTP activo escuchando en el puerto {port} para Render.")
-    server.serve_forever()
-
-
-# --- Configuración del Exchange y Bot ---
-exchange = ccxt.binance({"enableRateLimit": True})
-
-saldo_usdt = 1000.0
-saldo_btc = 0.0
-precio_compra = 0.0
-atr_compra = 0.0
-ganancias_totales = 0.0
-perdidas_totales = 0.0
-
-symbol = "BTC/USDT"
-timeframe = "1m"
-csv_file = "historial_trading.csv"
-
-
-def guardar_csv(registro: dict):
-    df = pd.DataFrame([registro])
-    header = not os.path.exists(csv_file)
-    df.to_csv(csv_file, mode="a", header=header, index=False)
-    print(f"Operacion registrada en '{csv_file}'")
-
-
-def run():
-    global \
-        saldo_usdt, \
-        saldo_btc, \
-        precio_compra, \
-        atr_compra, \
-        ganancias_totales, \
-        perdidas_totales
-    print("Bot iniciado en Paper Trading Local (Validado por QA Pipeline)...")
-    print(
-        "Estrategia: EMA 9/21 con filtros RSI y Volumen, Stop-Loss/Take-Profit dinamico con ATR"
-    )
-
-    while True:
-        try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-            df = pd.DataFrame(
-                ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
-            )
-
-            # Calcular indicadores técnicos
-            df["ema_9"] = calcular_ema(df["close"], period=9)
-            df["ema_21"] = calcular_ema(df["close"], period=21)
-            df["rsi"] = calcular_rsi(df["close"], period=14)
-            df["atr"] = calcular_atr(df["high"], df["low"], df["close"], period=14)
-            df["volumen_promedio"] = df["volume"].rolling(window=20).mean()
-
-            current_price = df["close"].iloc[-1]
-            current_ema9 = df["ema_9"].iloc[-1]
-            current_ema21 = df["ema_21"].iloc[-1]
-            current_rsi = df["rsi"].iloc[-1]
-            current_volume = df["volume"].iloc[-1]
-            current_vol_avg = df["volumen_promedio"].iloc[-1]
-            current_atr = df["atr"].iloc[-1]
-
-            prev_price = df["close"].iloc[-2]
-            prev_ema9 = df["ema_9"].iloc[-2]
-            prev_ema21 = df["ema_21"].iloc[-2]
-
-            print(f"\n[INFO] {time.strftime('%H:%M:%S')}")
-            print(
-                f"Precio BTC: ${current_price:.2f} | EMA 9: ${current_ema9:.2f} | EMA 21: ${current_ema21:.2f}"
-            )
-            print(
-                f"RSI: {current_rsi:.1f} | ATR: ${current_atr:.2f} | Volumen: {current_volume:.0f}"
-            )
-            print(f"Billetera: ${saldo_usdt:.2f} USDT | {saldo_btc:.4f} BTC")
-            print(
-                f"Profit Factor actual: {calcular_profit_factor(ganancias_totales, perdidas_totales):.2f}"
-            )
-
-            senial = evaluar_estrategia_multivariable(
-                EstrategiaMultivariable(
-                    precio_actual=current_price,
-                    ema_9=current_ema9,
-                    ema_21=current_ema21,
-                    rsi=current_rsi,
-                    volumen=current_volume,
-                    volumen_promedio=current_vol_avg,
-                    prev_precio=prev_price,
-                    prev_ema_9=prev_ema9,
-                )
-            )
-
-            if senial == "COMPRA" and saldo_usdt > 0:
-                print("SEÑAL DE COMPRA MULTIVARIABLE DETECTADA")
-                print(
-                    f"Condiciones: EMA 9 > EMA 21, RSI={current_rsi:.1f}, Volumen={current_volume:.0f} > {current_vol_avg:.0f}"
-                )
-
-                monto_usdt = saldo_usdt
-                saldo_btc = saldo_usdt / current_price
-                precio_compra = current_price
-                atr_compra = current_atr
-                saldo_usdt = 0.0
-
-                reg = crear_registro_csv("COMPRA", current_price, saldo_btc, monto_usdt)
-                guardar_csv(reg)
-
-                # Envío de notificación a Telegram
-                notificar_operacion_telegram(
-                    "COMPRA", current_price, saldo_btc, monto_usdt
-                )
-
-            elif senial == "VENTA" and saldo_btc > 0:
-                print("SEÑAL DE VENTA MULTIVARIABLE DETECTADA")
-
-                # Verificar si es Take-Profit o Stop-Loss
-                precio_tp = precio_compra + (atr_compra * 2.0)
-                precio_sl = precio_compra - (atr_compra * 1.0)
-
-                if current_price >= precio_tp:
-                    tipo_salida = "TP"
-                    print(
-                        f"TAKE-PROFIT alcanzado: ${current_price:.2f} >= ${precio_tp:.2f}"
-                    )
-                elif current_price <= precio_sl:
-                    tipo_salida = "SL"
-                    print(
-                        f"STOP-LOSS activado: ${current_price:.2f} <= ${precio_sl:.2f}"
-                    )
-                else:
-                    tipo_salida = "REGULAR"
-                    print("VENTA por señal de estrategia")
-
-                saldo_usdt = saldo_btc * current_price
-                ganancia_usdt, ganancia_pct = calcular_ganancia_con_stoploss(
-                    current_price, precio_compra, saldo_btc, atr_compra, tipo_salida
-                )
-
-                # Actualizar métricas de Profit Factor
-                if ganancia_usdt >= 0:
-                    ganancias_totales += ganancia_usdt
-                else:
-                    perdidas_totales += abs(ganancia_usdt)
-
-                reg = crear_registro_csv(
-                    "VENTA",
-                    current_price,
-                    saldo_btc,
-                    saldo_usdt,
-                    ganancias=(ganancia_usdt, ganancia_pct),
-                )
-                guardar_csv(reg)
-
-                # Envío de notificación a Telegram
-                notificar_operacion_telegram(
-                    "VENTA",
-                    current_price,
-                    saldo_btc,
-                    saldo_usdt,
-                    ganancias=(ganancia_usdt, ganancia_pct),
-                )
-
-                saldo_btc = 0.0
-
-            else:
-                print("Monitoreando mercado...")
-
-            time.sleep(60)
-
-        except Exception as e:
-            print(f"Error en ejecucion: {e}")
-            time.sleep(10)
-
-
-if __name__ == "__main__":
-    # Inicia el servidor de salud en un hilo secundario sin bloquear el bot
-    threading.Thread(target=iniciar_servidor_puerto, daemon=True).start()
-
-    # Inicia el bucle principal del bot
-    run()
+    enviar_notificacion_telegram(mensaje)
