@@ -4,6 +4,7 @@ from datetime import datetime
 import os
 import pandas as pd
 import requests
+import ccxt
 
 
 def calcular_sma(precios: pd.Series, period: int = 20) -> pd.Series:
@@ -53,6 +54,40 @@ def calcular_atr(
     return atr
 
 
+def calcular_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Calcula el Average Directional Index (ADX)."""
+    if len(high) < period * 2:
+        raise ValueError("Datos insuficientes para el período solicitado")
+    
+    # Calcular +DM y -DM
+    high_diff = high.diff()
+    low_diff = low.diff()
+    
+    plus_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
+    minus_dm = -low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
+    
+    # Calcular True Range
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # Suavizar +DM, -DM y TR
+    plus_di = 100 * (plus_dm.ewm(alpha=1/period).mean() / tr.ewm(alpha=1/period).mean())
+    minus_di = 100 * (minus_dm.ewm(alpha=1/period).mean() / tr.ewm(alpha=1/period).mean())
+    
+    # Calcular DX y ADX
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    adx = dx.ewm(alpha=1/period).mean()
+    
+    return adx
+
+
+def calcular_sma_atr(atr_series: pd.Series, period: int = 20) -> pd.Series:
+    """Calcula la SMA del ATR para filtro de volatilidad relativa."""
+    return calcular_sma(atr_series, period)
+
+
 class EstrategiaMultivariable:
     """Contenedor para los parámetros de la estrategia multivariable."""
 
@@ -77,6 +112,60 @@ class EstrategiaMultivariable:
         self.prev_ema_9 = prev_ema_9
 
 
+class FiltrosCuantitativos:
+    """Contenedor para todos los filtros cuantitativos del sistema."""
+    
+    def __init__(self, exchange: ccxt.Exchange, symbol: str = "BTC/USDT"):
+        self.exchange = exchange
+        self.symbol = symbol
+    
+    def obtener_datos_mtf(self, timeframe_superior: str = "1h", limit: int = 200) -> pd.DataFrame:
+        """Obtiene datos del timeframe superior para confirmación MTF."""
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(self.symbol, timeframe_superior, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            return df
+        except Exception as e:
+            print(f"Error obteniendo datos MTF {timeframe_superior}: {e}")
+            return None
+    
+    def confirmar_ema_200_mtf(self, df_mtf: pd.DataFrame) -> bool:
+        """Valida si el precio actual está por encima de EMA 200 en timeframe superior."""
+        if df_mtf is None or len(df_mtf) < 200:
+            return False
+        
+        df_mtf["ema_200"] = calcular_ema(df_mtf["close"], period=200)
+        current_price_mtf = df_mtf["close"].iloc[-1]
+        current_ema_200_mtf = df_mtf["ema_200"].iloc[-1]
+        
+        return current_price_mtf > current_ema_200_mtf
+    
+    def validar_adx_tendencia(self, high: pd.Series, low: pd.Series, close: pd.Series, threshold: float = 25.0) -> bool:
+        """Valida que el mercado está en tendencia (ADX > threshold)."""
+        try:
+            adx = calcular_adx(high, low, close, period=14)
+            current_adx = adx.iloc[-1]
+            return bool(current_adx > threshold) if not pd.isna(current_adx) else False
+        except Exception:
+            return False
+    
+    def validar_volatilidad_relativa(self, atr_series: pd.Series, period: int = 20) -> bool:
+        """Valida que el ATR actual es mayor que la SMA del ATR."""
+        try:
+            sma_atr = calcular_sma_atr(atr_series, period)
+            current_atr = atr_series.iloc[-1]
+            current_sma_atr = sma_atr.iloc[-1]
+            return bool(current_atr > current_sma_atr)
+        except Exception:
+            return False
+    
+    def validar_horario_mercado(self, hora_inicio: int = 13, hora_fin: int = 21) -> bool:
+        """Valida si la hora actual está dentro del rango de máxima liquidez (UTC)."""
+        from datetime import datetime
+        current_hour = datetime.utcnow().hour
+        return hora_inicio <= current_hour < hora_fin
+
+
 def evaluar_estrategia_multivariable(estrategia: EstrategiaMultivariable) -> str:
     """Evalúa estrategia multivariable con EMA 9/21, RSI y filtro de volumen."""
     # Condiciones de COMPRA
@@ -85,7 +174,7 @@ def evaluar_estrategia_multivariable(estrategia: EstrategiaMultivariable) -> str
         and estrategia.precio_actual > estrategia.ema_9
     )
     compra_tendencia = estrategia.ema_9 > estrategia.ema_21
-    compra_rsi = 30 < estrategia.rsi < 70
+    compra_rsi = 35 < estrategia.rsi < 65  # Más estricto: 35-65 en lugar de 30-70
     compra_volumen = estrategia.volumen > estrategia.volumen_promedio * 1.2
 
     # Condiciones de VENTA
@@ -94,7 +183,7 @@ def evaluar_estrategia_multivariable(estrategia: EstrategiaMultivariable) -> str
         and estrategia.precio_actual < estrategia.ema_9
     )
     venta_tendencia = estrategia.ema_9 < estrategia.ema_21
-    venta_rsi = estrategia.rsi > 30
+    venta_rsi = estrategia.rsi > 40  # Más estricto: RSI > 40 para venta (antes > 30)
     venta_volumen = estrategia.volumen > estrategia.volumen_promedio * 0.8
 
     if compra_ema and compra_tendencia and compra_rsi and compra_volumen:
@@ -115,9 +204,9 @@ def calcular_ganancia_con_stoploss(
     if precio_compra <= 0 or saldo_btc <= 0 or atr <= 0:
         return 0.0, 0.0
 
-    # Definir niveles basados en ATR
-    atr_multiplier_tp = 2.0  # Take-Profit a 2 ATRs
-    atr_multiplier_sl = 1.0  # Stop-Loss a 1 ATR
+    # Definir niveles basados en ATR - MÁS CONSERVADORES
+    atr_multiplier_tp = 1.5  # Take-Profit a 1.5 ATRs (reducido de 2.0)
+    atr_multiplier_sl = 1.2  # Stop-Loss a 1.2 ATRs (aumentado de 1.0)
 
     if tipo_salida == "TP":
         precio_venta_real = precio_compra + (atr * atr_multiplier_tp)
