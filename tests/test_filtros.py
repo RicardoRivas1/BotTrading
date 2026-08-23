@@ -46,15 +46,19 @@ class TestFiltrosCuantitativos:
 class TestIndicadoresTecnicos:
     
     def test_calcular_adx(self):
-        high = pd.Series([100, 102, 105, 103, 108, 110, 112, 115, 118, 120, 122, 125, 128, 130, 132, 135, 138, 140, 142, 145, 148, 150, 152, 155, 158, 160, 162, 165])
-        low = pd.Series([98, 100, 103, 101, 106, 108, 110, 113, 116, 118, 120, 123, 126, 128, 130, 133, 136, 138, 140, 143, 146, 148, 150, 153, 156, 158, 160, 163])
-        close = pd.Series([101, 103, 104, 107, 107, 109, 111, 114, 117, 119, 121, 124, 127, 129, 131, 134, 137, 139, 141, 144, 147, 149, 151, 154, 157, 159, 161, 164])
+        # Necesita al menos period*2+1 = 29 puntos
+        data = list(range(100, 130))
+        high = pd.Series([x + 2 for x in data])
+        low = pd.Series([x - 2 for x in data])
+        close = pd.Series(data)
         
         adx = calcular_adx(high, low, close, period=14)
         assert len(adx) == len(close)
-        # ADX puede devolver NaN si hay división por cero
-        # Simplemente verificar que se ejecuta sin error
         assert adx is not None
+        # Verificar que ADX esta en rango 0-100
+        valid_adx = adx.dropna()
+        assert valid_adx.min() >= 0
+        assert valid_adx.max() <= 100
     
     def test_calcular_sma_atr(self):
         atr_series = pd.Series([10, 12, 14, 16, 18])

@@ -59,17 +59,15 @@ def iniciar_servidor_puerto():
     server.serve_forever()
 
 
-# --- Configuraci�n del Exchange Binance ---
-# Render: datos publicos de mercado (OHLCV) -> NO se necesitan API keys.
-# Las operaciones se simulan localmente (paper trading).
-# Local: claves reales para datos y posibles ordenes futuras.
+# --- Configuraci�n del Exchange ---
+# Render: Bybit (sin bloqueo geografico HTTP 451) + datos publicos, NO API keys.
+# Local: Binance con API keys reales para datos y posibles ordenes futuras.
+# Todas las operaciones se simulan localmente (paper trading).
+
 if os.environ.get("USE_DEMO_ACCOUNT") == "true":
-    # Sin API keys - solo lectura de datos publicos
-    exchange = ccxt.binance({
-        "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
-    print("Modo Render: conectando a Binance Mainnet (datos publicos, paper trading)")
+    exchange = ccxt.bybit({"enableRateLimit": True})
+    symbol = "BTC/USDT"
+    print("Modo Render: Bybit Mainnet (datos publicos, paper trading)")
 else:
     api_key = os.environ.get("BINANCE_API_KEY_REAL")
     api_secret = os.environ.get("BINANCE_SECRET_KEY_REAL")
@@ -79,14 +77,11 @@ else:
         "enableRateLimit": True,
         "options": {"defaultType": "spot"},
     })
-    print("Modo local: usando cuenta REAL de Binance")
+    symbol = "BTC/USDT"
+    print("Modo local: Binance Mainnet (cuenta REAL)")
 
 # Inicializar filtros cuantitativos
-filtros = FiltrosCuantitativos(exchange)
-
-# IMPORTANTE: NO usar sandbox/testnet en Render (HTTP 451 - bloqueo geografico).
-# El bot conecta a Binance Mainnet para leer datos de mercado publicos (OHLCV).
-# Todas las operaciones se simulan localmente con billetera virtual (paper trading).
+filtros = FiltrosCuantitativos(exchange, symbol=symbol)
 
 saldo_usdt = 1000.0
 saldo_btc = 0.0
@@ -97,7 +92,6 @@ perdidas_totales = 0.0
 breakeven_activado = False  # Trailing Stop a Break-Even activado
 hora_compra = None  # Hora UTC de última compra
 
-symbol = "BTC/USDT"
 timeframe = "1m"
 csv_file = "historial_trading.csv"
 
