@@ -176,7 +176,9 @@ def run():
             df["ema_21"] = calcular_ema(df["close"], period=21)
             df["rsi"] = calcular_rsi(df["close"], period=14)
             df["atr"] = calcular_atr(df["high"], df["low"], df["close"], period=14)
+            df["volume_usdt"] = df["volume"] * df["close"]
             df["volumen_promedio"] = df["volume"].rolling(window=20).mean()
+            df["volumen_promedio_usdt"] = df["volume_usdt"].rolling(window=20).mean()
             df["adx"] = calcular_adx(df["high"], df["low"], df["close"], period=14)
             df["sma_atr"] = calcular_sma_atr(df["atr"], period=20)
 
@@ -185,7 +187,9 @@ def run():
             current_ema21 = df["ema_21"].iloc[-1]
             current_rsi = df["rsi"].iloc[-1]
             current_volume = df["volume"].iloc[-2]
+            current_volume_usdt = df["volume_usdt"].iloc[-2]
             current_vol_avg = df["volumen_promedio"].iloc[-1]
+            current_vol_avg_usdt = df["volumen_promedio_usdt"].iloc[-1]
             current_atr = df["atr"].iloc[-1]
             current_adx = df["adx"].iloc[-1]
             current_sma_atr = df["sma_atr"].iloc[-1]
@@ -204,7 +208,7 @@ def run():
                 f"Precio BTC: ${current_price:.2f} | EMA 9: ${current_ema9:.2f} | EMA 21: ${current_ema21:.2f}"
             )
             print(
-                f"RSI: {current_rsi:.1f} | ATR: ${current_atr:.2f} | ADX: {current_adx:.1f} | Volumen: {current_volume:.0f}"
+                f"RSI: {current_rsi:.1f} | ATR: ${current_atr:.2f} | ADX: {current_adx:.1f} | Volumen: ${current_volume_usdt:,.0f} USDT"
             )
             print(
                 f"ATR > SMA(ATR): {current_atr:.2f} > {current_sma_atr:.2f} = {current_atr > current_sma_atr}"
@@ -223,8 +227,8 @@ def run():
                     ema_9=current_ema9,
                     ema_21=current_ema21,
                     rsi=current_rsi,
-                    volumen=current_volume,
-                    volumen_promedio=current_vol_avg,
+                    volumen=current_volume_usdt,
+                    volumen_promedio=current_vol_avg_usdt,
                     prev_precio=prev_price,
                     prev_ema_9=prev_ema9,
                 )
@@ -252,7 +256,7 @@ def run():
                     "✅ SEÑAL DE COMPRA MULTIVARIABLE CONFIRMADA (todos los filtros OK)"
                 )
                 print(
-                    f"Condiciones: EMA 9 > EMA 21, RSI={current_rsi:.1f}, Volumen={current_volume:.0f} > {current_vol_avg:.0f}"
+                    f"Condiciones: EMA 9 > EMA 21, RSI={current_rsi:.1f}, Volumen=${current_volume_usdt:,.0f} > ${current_vol_avg_usdt:,.0f} USDT"
                 )
                 print(
                     f"Filtros: ADX={current_adx:.1f}>25, MTF OK, ATR>{current_sma_atr:.2f}, Horario OK"
