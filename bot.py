@@ -60,14 +60,14 @@ def iniciar_servidor_puerto():
 
 
 # --- Configuraci�n del Exchange ---
-# Render: Bybit (sin bloqueo geografico HTTP 451) + datos publicos, NO API keys.
+# Render: Kraken (sin bloqueo geografico en EE. UU.) + datos publicos, NO API keys.
 # Local: Binance con API keys reales para datos y posibles ordenes futuras.
 # Todas las operaciones se simulan localmente (paper trading).
 
 if os.environ.get("USE_DEMO_ACCOUNT") == "true":
-    exchange = ccxt.bybit({"enableRateLimit": True})
+    exchange = ccxt.kraken({"enableRateLimit": True})
     symbol = "BTC/USDT"
-    print("Modo Render: Bybit Mainnet (datos publicos, paper trading)")
+    print("Modo Render: Kraken Mainnet (datos publicos, paper trading)")
 else:
     api_key = os.environ.get("BINANCE_API_KEY_REAL")
     api_secret = os.environ.get("BINANCE_SECRET_KEY_REAL")
