@@ -71,19 +71,21 @@ if os.environ.get("USE_DEMO_ACCOUNT") == "true":
 else:
     api_key = os.environ.get("BINANCE_API_KEY_REAL")
     api_secret = os.environ.get("BINANCE_SECRET_KEY_REAL")
-    exchange = ccxt.binance({
-        "apiKey": api_key,
-        "secret": api_secret,
-        "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
+    exchange = ccxt.binance(
+        {
+            "apiKey": api_key,
+            "secret": api_secret,
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
+        }
+    )
     symbol = "BTC/USDT"
     print("Modo local: Binance Mainnet (cuenta REAL)")
 
 # Inicializar filtros cuantitativos
 filtros = FiltrosCuantitativos(exchange, symbol=symbol)
 
-saldo_usdt = 1000.0
+saldo_usdt = 10.0
 saldo_btc = 0.0
 precio_compra = 0.0
 atr_compra = 0.0
@@ -92,6 +94,7 @@ perdidas_totales = 0.0
 breakeven_activado = False  # Trailing Stop a Break-Even activado
 hora_compra = None  # Hora UTC de última compra
 
+MIN_VOLUMEN_USDT = 500
 timeframe = "1m"
 csv_file = "historial_trading.csv"
 
@@ -203,19 +206,21 @@ def run():
                 validar_filtros_cuantitativos(df, df_mtf)
             )
 
+            vol_liquidez_ok = current_volume_usdt >= MIN_VOLUMEN_USDT
+
             print(f"\n[INFO] {time.strftime('%H:%M:%S UTC')}")
             print(
                 f"Precio BTC: ${current_price:.2f} | EMA 9: ${current_ema9:.2f} | EMA 21: ${current_ema21:.2f}"
             )
             print(
-                f"RSI: {current_rsi:.1f} | ATR: ${current_atr:.2f} | ADX: {current_adx:.1f} | Volumen: ${current_volume_usdt:,.0f} USDT"
+                f"RSI: {current_rsi:.1f} | ATR: ${current_atr:.2f} | ADX: {current_adx:.1f} | Volumen: ${current_volume_usdt:,.0f} USDT (Minimo: ${MIN_VOLUMEN_USDT:,.0f}) -> {vol_liquidez_ok}"
             )
             print(
                 f"ATR > SMA(ATR): {current_atr:.2f} > {current_sma_atr:.2f} = {current_atr > current_sma_atr}"
             )
             print(f"Billetera: ${saldo_usdt:.2f} USDT | {saldo_btc:.4f} BTC")
             print(
-                f"Filtros: ADX>{current_adx:.1f}>25={adx_valido}, MTF={ema_mtf_valido}, Vol={atr_valido}, Horario={horario_valido}"
+                f"Filtros: ADX>{current_adx:.1f}>25={adx_valido}, MTF={ema_mtf_valido}, Vol={atr_valido}, Horario={horario_valido}, Liquidez={vol_liquidez_ok}"
             )
             print(
                 f"Profit Factor: {calcular_profit_factor(ganancias_totales, perdidas_totales):.2f}"
@@ -237,7 +242,9 @@ def run():
             # Verificar trailing stop a break-even para posiciones abiertas
             if saldo_btc > 0 and not breakeven_activado:
                 ganancia_flotante_atr = (current_price - precio_compra) / atr_compra
-                if ganancia_flotante_atr >= 0.5:  # +0.5 ATR desde entrada (más conservador)
+                if (
+                    ganancia_flotante_atr >= 0.5
+                ):  # +0.5 ATR desde entrada (más conservador)
                     breakeven_activado = True
                     mensaje = f"🚨 *TRAILING STOP BREAK-EVEN ACTIVADO*\n\n• Precio Entrada: ${precio_compra:.2f}\n• Precio Actual: ${current_price:.2f}\n• Ganancia ATR: +{ganancia_flotante_atr:.1f} ATR\n• Stop-Loss movido al punto de entrada (Break-Even)"
                     enviar_notificacion_telegram(mensaje)
@@ -245,9 +252,17 @@ def run():
 
             if senial == "COMPRA" and saldo_usdt > 0:
                 # Aplicar TODOS los filtros cuantitativos antes de comprar
-                if not all([adx_valido, ema_mtf_valido, atr_valido, horario_valido]):
+                if not all(
+                    [
+                        adx_valido,
+                        ema_mtf_valido,
+                        atr_valido,
+                        horario_valido,
+                        vol_liquidez_ok,
+                    ]
+                ):
                     print(
-                        f"❌ Señal de COMPRA BLOQUEADA por filtros: ADX={adx_valido}, MTF={ema_mtf_valido}, Vol={atr_valido}, Horario={horario_valido}"
+                        f"❌ Señal de COMPRA BLOQUEADA por filtros: ADX={adx_valido}, MTF={ema_mtf_valido}, Vol={atr_valido}, Horario={horario_valido}, Liquidez={vol_liquidez_ok}"
                     )
                     time.sleep(60)
                     continue
