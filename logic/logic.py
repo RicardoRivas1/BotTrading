@@ -55,32 +55,55 @@ def calcular_atr(
 
 
 def calcular_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """Calcula el Average Directional Index (ADX)."""
-    if len(high) < period * 2:
+    """Calcula el Average Directional Index (ADX) con suavizado Wilder, rango 0-100."""
+    if len(high) < period * 2 + 1:
         raise ValueError("Datos insuficientes para el período solicitado")
-    
-    # Calcular +DM y -DM
-    high_diff = high.diff()
-    low_diff = low.diff()
-    
-    plus_dm = high_diff.where((high_diff > low_diff) & (high_diff > 0), 0)
-    minus_dm = -low_diff.where((low_diff > high_diff) & (low_diff > 0), 0)
-    
-    # Calcular True Range
+
+    # True Range
     tr1 = high - low
-    tr2 = abs(high - close.shift(1))
-    tr3 = abs(low - close.shift(1))
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
-    # Suavizar +DM, -DM y TR
-    plus_di = 100 * (plus_dm.ewm(alpha=1/period).mean() / tr.ewm(alpha=1/period).mean())
-    minus_di = 100 * (minus_dm.ewm(alpha=1/period).mean() / tr.ewm(alpha=1/period).mean())
-    
-    # Calcular DX y ADX
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-    adx = dx.ewm(alpha=1/period).mean()
-    
-    return adx
+
+    # +DM y -DM
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+    plus_dm = pd.Series(
+        up_move.where((up_move > down_move) & (up_move > 0), 0.0),
+        index=high.index,
+    )
+    minus_dm = pd.Series(
+        down_move.where((down_move > up_move) & (down_move > 0), 0.0),
+        index=high.index,
+    )
+
+    # Wilder smoothing (RMA): valor anterior * (period-1) + actual / period
+    def rma(series, length):
+        result = series.copy()
+        first_valid = series.first_valid_index()
+        first_pos = series.index.get_loc(first_valid)
+        result.iloc[:first_pos + length] = float('nan')
+        result.iloc[first_pos + length - 1] = series.iloc[first_pos:first_pos + length].mean()
+        for i in range(first_pos + length, len(series)):
+            result.iloc[i] = (result.iloc[i - 1] * (length - 1) + series.iloc[i]) / length
+        return result
+
+    smoothed_tr = rma(tr, period)
+    smoothed_plus_dm = rma(plus_dm, period)
+    smoothed_minus_dm = rma(minus_dm, period)
+
+    # +DI y -DI
+    plus_di = 100 * smoothed_plus_dm / smoothed_tr
+    minus_di = 100 * smoothed_minus_dm / smoothed_tr
+
+    # DX
+    di_sum = plus_di + minus_di
+    dx = (100 * (plus_di - minus_di).abs() / di_sum).fillna(0)
+
+    # ADX = Wilder smoothing de DX
+    adx = rma(dx, period)
+
+    return adx.clip(0, 100)
 
 
 def calcular_sma_atr(atr_series: pd.Series, period: int = 20) -> pd.Series:

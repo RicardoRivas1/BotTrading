@@ -32,7 +32,7 @@ print(
 if "RENDER" in os.environ or "RENDER_EXTERNAL_URL" in os.environ:
     os.environ["USE_DEMO_ACCOUNT"] = "true"
     os.environ["MODO_SIMULACION"] = "true"  # Activar modo simulaci�n en Render
-    print("✅ Modo demo y simulaci�n activados (entorno Render detectado)")
+    print("Modo demo y simulacion activados (entorno Render detectado)")
 else:
     print("Modo desarrollo local (usando cuenta real)")
 
@@ -59,41 +59,34 @@ def iniciar_servidor_puerto():
     server.serve_forever()
 
 
-# --- Configuraci�n del Exchange Binance con credenciales de .env ---
-# Usar claves demo en producci�n (Render) y claves reales en desarrollo local
+# --- Configuraci�n del Exchange Binance ---
+# Render: datos publicos de mercado (OHLCV) -> NO se necesitan API keys.
+# Las operaciones se simulan localmente (paper trading).
+# Local: claves reales para datos y posibles ordenes futuras.
 if os.environ.get("USE_DEMO_ACCOUNT") == "true":
-    # Estamos en Render - usar cuenta demo
-    api_key = os.environ.get("BINANCE_API_KEY_DEMO")
-    api_secret = os.environ.get("BINANCE_SECRET_KEY_DEMO")
-    print("Usando cuenta DEMO de Binance")
+    # Sin API keys - solo lectura de datos publicos
+    exchange = ccxt.binance({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })
+    print("Modo Render: conectando a Binance Mainnet (datos publicos, paper trading)")
 else:
-    # Estamos en desarrollo local - usar cuenta real
     api_key = os.environ.get("BINANCE_API_KEY_REAL")
     api_secret = os.environ.get("BINANCE_SECRET_KEY_REAL")
-    print("Usando cuenta REAL de Binance")
-
-exchange = ccxt.binance(
-    {
+    exchange = ccxt.binance({
         "apiKey": api_key,
         "secret": api_secret,
         "enableRateLimit": True,
-        "options": {
-            "defaultType": "spot",
-        },
-    }
-)
+        "options": {"defaultType": "spot"},
+    })
+    print("Modo local: usando cuenta REAL de Binance")
 
 # Inicializar filtros cuantitativos
 filtros = FiltrosCuantitativos(exchange)
 
-# Si deseas usar Binance Testnet, define BINANCE_TESTNET=true en tu .env
-# O usar testnet autom�ticamente en modo demo
-if (
-    os.environ.get("BINANCE_TESTNET", "false").lower() == "true"
-    or os.environ.get("USE_DEMO_ACCOUNT") == "true"
-):
-    exchange.set_sandbox_mode(True)
-    print("🔧 Modo testnet/sandbox activado")
+# IMPORTANTE: NO usar sandbox/testnet en Render (HTTP 451 - bloqueo geografico).
+# El bot conecta a Binance Mainnet para leer datos de mercado publicos (OHLCV).
+# Todas las operaciones se simulan localmente con billetera virtual (paper trading).
 
 saldo_usdt = 1000.0
 saldo_btc = 0.0
@@ -197,7 +190,7 @@ def run():
             current_ema9 = df["ema_9"].iloc[-1]
             current_ema21 = df["ema_21"].iloc[-1]
             current_rsi = df["rsi"].iloc[-1]
-            current_volume = df["volume"].iloc[-1]
+            current_volume = df["volume"].iloc[-2]
             current_vol_avg = df["volumen_promedio"].iloc[-1]
             current_atr = df["atr"].iloc[-1]
             current_adx = df["adx"].iloc[-1]
