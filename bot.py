@@ -10,7 +10,6 @@ from logic import (
     calcular_rsi,
     calcular_atr,
     calcular_adx,
-    calcular_sma_atr,
     EstrategiaMultivariable,
     FiltrosCuantitativos,
     evaluar_estrategia_multivariable,
@@ -94,13 +93,13 @@ perdidas_totales = 0.0
 breakeven_activado = False  # Trailing Stop a Break-Even activado
 hora_compra = None  # Hora UTC de última compra
 
-MIN_VOLUMEN_USDT = 500
+MIN_VOLUMEN_USDT = 0  # Cambiar en modo local
 timeframe = "1m"
 csv_file = "historial_trading.csv"
 
 
 def validar_filtros_cuantitativos(df: pd.DataFrame, df_mtf: pd.DataFrame) -> tuple:
-    """Valida todos los filtros cuantitativos antes de permitir entrada."""
+    """Valida los filtros cuantitativos antes de permitir entrada."""
     try:
         # 1. Filtro ADX > 25
         adx_valido = filtros.validar_adx_tendencia(
@@ -110,17 +109,14 @@ def validar_filtros_cuantitativos(df: pd.DataFrame, df_mtf: pd.DataFrame) -> tup
         # 2. Confirmación MTF EMA 200
         ema_mtf_valido = filtros.confirmar_ema_200_mtf(df_mtf)
 
-        # 3. Filtro de volatilidad relativa
-        atr_valido = filtros.validar_volatilidad_relativa(df["atr"], period=20)
+        # 3. Filtro horario de mercado - Desactivado para pruebas
+        horario_valido = True
 
-        # 4. Filtro horario de mercado (20:00-24:00 UTC) - EXTENDIDO PARA PRUEBAS
-        horario_valido = True  # Desactivar filtro horario
-
-        return adx_valido, ema_mtf_valido, atr_valido, horario_valido
+        return adx_valido, ema_mtf_valido, horario_valido
 
     except Exception as e:
         print(f"Error validando filtros: {e}")
-        return False, False, False, False
+        return False, False, False
 
 
 def obtener_saldo_real():
@@ -154,9 +150,7 @@ def run():
         hora_compra
 
     print("Bot iniciado con credenciales autenticadas de Binance (.env)...")
-    print(
-        "Estrategia: EMA 9/21 con filtros RSI y Volumen + ADX + MTF + Volatilidad + Trailing Stop"
-    )
+    print("Estrategia: EMA 9/21 con filtros RSI y Volumen + ADX + MTF + Trailing Stop")
 
     # Para obtener automáticamente los saldos reales de Binance al iniciar:
     # real_usdt, real_btc = obtener_saldo_real()
@@ -183,7 +177,6 @@ def run():
             df["volumen_promedio"] = df["volume"].rolling(window=20).mean()
             df["volumen_promedio_usdt"] = df["volume_usdt"].rolling(window=20).mean()
             df["adx"] = calcular_adx(df["high"], df["low"], df["close"], period=14)
-            df["sma_atr"] = calcular_sma_atr(df["atr"], period=20)
 
             current_price = df["close"].iloc[-1]
             current_ema9 = df["ema_9"].iloc[-1]
@@ -195,15 +188,14 @@ def run():
             current_vol_avg_usdt = df["volumen_promedio_usdt"].iloc[-1]
             current_atr = df["atr"].iloc[-1]
             current_adx = df["adx"].iloc[-1]
-            current_sma_atr = df["sma_atr"].iloc[-1]
 
             prev_price = df["close"].iloc[-2]
             prev_ema9 = df["ema_9"].iloc[-2]
             prev_ema21 = df["ema_21"].iloc[-2]
 
             # Validar filtros cuantitativos
-            adx_valido, ema_mtf_valido, atr_valido, horario_valido = (
-                validar_filtros_cuantitativos(df, df_mtf)
+            adx_valido, ema_mtf_valido, horario_valido = validar_filtros_cuantitativos(
+                df, df_mtf
             )
 
             vol_liquidez_ok = current_volume_usdt >= MIN_VOLUMEN_USDT
@@ -215,12 +207,9 @@ def run():
             print(
                 f"RSI: {current_rsi:.1f} | ATR: ${current_atr:.2f} | ADX: {current_adx:.1f} | Volumen: ${current_volume_usdt:,.0f} USDT (Minimo: ${MIN_VOLUMEN_USDT:,.0f}) -> {vol_liquidez_ok}"
             )
-            print(
-                f"ATR > SMA(ATR): {current_atr:.2f} > {current_sma_atr:.2f} = {current_atr > current_sma_atr}"
-            )
             print(f"Billetera: ${saldo_usdt:.2f} USDT | {saldo_btc:.4f} BTC")
             print(
-                f"Filtros: ADX>{current_adx:.1f}>25={adx_valido}, MTF={ema_mtf_valido}, Vol={atr_valido}, Horario={horario_valido}, Liquidez={vol_liquidez_ok}"
+                f"Filtros: ADX>{current_adx:.1f}>25={adx_valido}, MTF={ema_mtf_valido}, Horario={horario_valido}, Liquidez={vol_liquidez_ok}"
             )
             print(
                 f"Profit Factor: {calcular_profit_factor(ganancias_totales, perdidas_totales):.2f}"
@@ -256,13 +245,12 @@ def run():
                     [
                         adx_valido,
                         ema_mtf_valido,
-                        atr_valido,
                         horario_valido,
                         vol_liquidez_ok,
                     ]
                 ):
                     print(
-                        f"❌ Señal de COMPRA BLOQUEADA por filtros: ADX={adx_valido}, MTF={ema_mtf_valido}, Vol={atr_valido}, Horario={horario_valido}, Liquidez={vol_liquidez_ok}"
+                        f"❌ Señal de COMPRA BLOQUEADA por filtros: ADX={adx_valido}, MTF={ema_mtf_valido}, Horario={horario_valido}, Liquidez={vol_liquidez_ok}"
                     )
                     time.sleep(60)
                     continue
@@ -274,7 +262,7 @@ def run():
                     f"Condiciones: EMA 9 > EMA 21, RSI={current_rsi:.1f}, Volumen=${current_volume_usdt:,.0f} > ${current_vol_avg_usdt:,.0f} USDT"
                 )
                 print(
-                    f"Filtros: ADX={current_adx:.1f}>25, MTF OK, ATR>{current_sma_atr:.2f}, Horario OK"
+                    f"Filtros: ADX={current_adx:.1f}>25, MTF OK, Horario OK"
                 )
 
                 monto_usdt = saldo_usdt
@@ -296,7 +284,6 @@ def run():
                     f"• *Filtros aplicados:*\n"
                     f"  - ADX {current_adx:.1f} > 25.0 ✓\n"
                     f"  - MTF EMA 200 1h ✓\n"
-                    f"  - Volatilidad ATR {current_atr:.2f} > SMA {current_sma_atr:.2f} ✓\n"
                     f"  - Horario 13-21 UTC ✓"
                 )
                 enviar_notificacion_telegram(mensaje)
