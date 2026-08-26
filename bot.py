@@ -363,7 +363,7 @@ def run():
 
             # Validar filtros cuantitativos
             adx_valido = ema_mtf_valido = horario_valido = True
-            vol_liquidez_ok = current_volume_usdt >= MIN_VOLUMEN_USDT
+            vol_liquidez_ok = True
 
             print(f"\n[INFO] {time.strftime('%H:%M:%S UTC')}")
             print(
