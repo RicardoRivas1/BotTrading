@@ -84,7 +84,7 @@ else:
 # Inicializar filtros cuantitativos
 filtros = FiltrosCuantitativos(exchange, symbol=symbol)
 
-saldo_usdt = 9.96
+saldo_usdt = 10.00
 saldo_btc = 0.0
 precio_compra = 0.0
 atr_compra = 0.0
@@ -96,8 +96,20 @@ stop_loss = 0.0  # Precio exacto de stop-loss activo
 hora_compra = None  # Hora UTC de última compra
 
 MIN_VOLUMEN_USDT = 0  # Cambiar en modo local
+MIN_ORDER_USDT = 10.0  # Default: $10 USDT mínimo de Binance
 timeframe = "1m"
 csv_file = "historial_trading.csv"
+
+# Obtener mínimo de orden del exchange
+try:
+    market = exchange.market(symbol)
+    if market and "limits" in market and "cost" in market["limits"]:
+        min_cost = market["limits"]["cost"].get("min")
+        if min_cost is not None:
+            MIN_ORDER_USDT = float(min_cost)
+            print(f"Mínimo de orden del exchange: ${MIN_ORDER_USDT:.2f} USDT")
+except Exception as e:
+    print(f"No se pudo obtener mínimo de orden del exchange, usando default ${MIN_ORDER_USDT:.2f}: {e}")
 
 
 def validar_filtros_cuantitativos(df: pd.DataFrame, df_mtf: pd.DataFrame) -> tuple:
@@ -111,8 +123,8 @@ def validar_filtros_cuantitativos(df: pd.DataFrame, df_mtf: pd.DataFrame) -> tup
         # 2. Confirmación MTF EMA 200
         ema_mtf_valido = filtros.confirmar_ema_200_mtf(df_mtf)
 
-        # 3. Filtro horario de mercado - Desactivado para pruebas
-        horario_valido = True
+        # 3. Filtro horario de mercado
+        horario_valido = filtros.validar_horario_mercado(13, 21)
 
         return adx_valido, ema_mtf_valido, horario_valido
 
@@ -287,7 +299,8 @@ def run():
         hora_compra
 
     print("Bot iniciado con credenciales autenticadas de Binance (.env)...")
-    print("Estrategia: EMA 9/21 con filtros RSI y Volumen + ADX + MTF + Trailing Stop")
+    print("Estrategia: Cruce EMA 9/21 + RSI 30-70 + Volumen + ADX + MTF + Trailing Stop")
+    print(f"Mínimo de orden del exchange: ${MIN_ORDER_USDT:.2f} USDT")
 
     # Para obtener automáticamente los saldos reales de Binance al iniciar:
     # real_usdt, real_btc = obtener_saldo_real()
@@ -380,22 +393,25 @@ def run():
                     volumen_promedio=current_vol_avg_usdt,
                     prev_precio=prev_price,
                     prev_ema_9=prev_ema9,
+                    prev_ema_21=prev_ema21,
                 )
             )
 
             if senial == "COMPRA" and saldo_usdt > 0:
-                # Aplicar TODOS los filtros cuantitativos antes de comprar
-                if not all(
-                    [
-                        adx_valido,
-                        ema_mtf_valido,
-                        horario_valido,
-                        vol_liquidez_ok,
-                    ]
-                ):
-                    print(
-                        f"❌ Señal de COMPRA BLOQUEADA por filtros: ADX={adx_valido}, MTF={ema_mtf_valido}, Horario={horario_valido}, Liquidez={vol_liquidez_ok}"
-                    )
+                # Debug detallado de cada filtro
+                saldo_suficiente = saldo_usdt >= MIN_ORDER_USDT
+                print(f"\n🔍 EVALUANDO FILTROS PARA COMPRA:")
+                print(f"  • ADX > 25:     {'✅' if adx_valido else '❌'} (actual: {current_adx:.1f})")
+                print(f"  • MTF EMA 200:  {'✅' if ema_mtf_valido else '❌'}")
+                print(f"  • Horario:      {'✅' if horario_valido else '❌'}")
+                print(f"  • Liquidez:     {'✅' if vol_liquidez_ok else '❌'} (volumen: ${current_volume_usdt:,.0f} vs mínimo: ${MIN_VOLUMEN_USDT:,.0f})")
+                print(f"  • Saldo mínimo: {'✅' if saldo_suficiente else '❌'} (${saldo_usdt:.2f} vs mínimo ${MIN_ORDER_USDT:.2f})")
+
+                if not saldo_suficiente:
+                    print(f"  ⚠️ Saldo insuficiente para orden mínima del exchange (${MIN_ORDER_USDT:.2f} USDT)")
+
+                if not all([adx_valido, ema_mtf_valido, horario_valido, vol_liquidez_ok, saldo_suficiente]):
+                    print(f"  ❌ COMPRA BLOQUEADA — Ver filtros arriba")
                     time.sleep(60)
                     continue
 
@@ -403,7 +419,7 @@ def run():
                     "✅ SEÑAL DE COMPRA MULTIVARIABLE CONFIRMADA (todos los filtros OK)"
                 )
                 print(
-                    f"Condiciones: EMA 9 > EMA 21, RSI={current_rsi:.1f}, Volumen=${current_volume_usdt:,.0f} > ${current_vol_avg_usdt:,.0f} USDT"
+                    f"Condiciones: Cruce EMA 9/21 alcista, RSI={current_rsi:.1f}, Volumen=${current_volume_usdt:,.0f} > ${current_vol_avg_usdt:,.0f} USDT"
                 )
                 print(f"Filtros: ADX={current_adx:.1f}>25, MTF OK, Horario OK")
 
@@ -428,6 +444,7 @@ def run():
                     f"• *Total USDT:* ${monto_usdt:,.2f}\n"
                     f"• *Stop-Loss inicial:* ${stop_loss:,.2f}\n"
                     f"• *Filtros aplicados:*\n"
+                    f"  - Cruce EMA 9/21 ✓\n"
                     f"  - ADX {current_adx:.1f} > 25.0 ✓\n"
                     f"  - MTF EMA 200 1h ✓\n"
                     f"  - Horario 13-21 UTC ✓"
@@ -442,7 +459,24 @@ def run():
                 )
 
             else:
-                print("Monitoreando mercado...")
+                # Diagnóstico de por qué la señal es NEUTRAL
+                if senial == "NEUTRAL":
+                    print("Monitoreando mercado... (SEÑAL NEUTRAL)")
+                    ema_cruce_ok = (
+                        prev_ema21 is not None
+                        and prev_ema9 <= prev_ema21
+                        and current_ema9 > current_ema21
+                    )
+                    if not ema_cruce_ok:
+                        print(f"  → No hay cruce alcista EMA 9/21 (prev: EMA9={prev_ema9:.2f} vs EMA21={prev_ema21:.2f} | actual: EMA9={current_ema9:.2f} vs EMA21={current_ema21:.2f})")
+                    if not (30 < current_rsi < 70):
+                        print(f"  → RSI fuera de rango: {current_rsi:.1f} (necesario: 30-70)")
+                    if current_volume_usdt <= current_vol_avg_usdt:
+                        print(f"  → Volumen bajo: ${current_volume_usdt:,.0f} <= promedio ${current_vol_avg_usdt:,.0f}")
+                elif senial == "COMPRA" and saldo_usdt <= 0:
+                    print("Monitoreando mercado... (SEÑAL COMPRA pero sin saldo USDT)")
+                else:
+                    print("Monitoreando mercado...")
 
             time.sleep(60)
 

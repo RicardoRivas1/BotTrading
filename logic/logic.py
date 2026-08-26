@@ -124,6 +124,7 @@ class EstrategiaMultivariable:
         volumen_promedio,
         prev_precio,
         prev_ema_9,
+        prev_ema_21=None,
     ):
         self.precio_actual = precio_actual
         self.ema_9 = ema_9
@@ -133,6 +134,7 @@ class EstrategiaMultivariable:
         self.volumen_promedio = volumen_promedio
         self.prev_precio = prev_precio
         self.prev_ema_9 = prev_ema_9
+        self.prev_ema_21 = prev_ema_21
 
 
 class FiltrosCuantitativos:
@@ -190,29 +192,36 @@ class FiltrosCuantitativos:
 
 
 def evaluar_estrategia_multivariable(estrategia: EstrategiaMultivariable) -> str:
-    """Evalúa estrategia multivariable con EMA 9/21, RSI y filtro de volumen."""
-    # Condiciones de COMPRA
-    compra_ema = (
-        estrategia.prev_precio <= estrategia.prev_ema_9
-        and estrategia.precio_actual > estrategia.ema_9
+    """Evalúa estrategia multivariable con cruce EMA 9/21, RSI y filtro de volumen."""
+    # Detección de cruce EMA 9 sobre EMA 21 (señal alcista)
+    cruce_alcista = (
+        estrategia.prev_ema_21 is not None
+        and estrategia.prev_ema_9 <= estrategia.prev_ema_21
+        and estrategia.ema_9 > estrategia.ema_21
     )
-    compra_tendencia = estrategia.ema_9 > estrategia.ema_21
-    compra_rsi = 35 < estrategia.rsi < 65  # Más estricto: 35-65 en lugar de 30-70
-    compra_volumen = estrategia.volumen > estrategia.volumen_promedio * 1.2
+    tendencia_alcista = estrategia.ema_9 > estrategia.ema_21
+    precio_sobre_ema9 = estrategia.precio_actual > estrategia.ema_9
+    rsi_ok = 30 < estrategia.rsi < 70
+    volumen_ok = estrategia.volumen > estrategia.volumen_promedio
 
-    # Condiciones de VENTA
-    venta_ema = (
-        estrategia.prev_precio >= estrategia.prev_ema_9
-        and estrategia.precio_actual < estrategia.ema_9
+    # Detección de cruce bajista EMA 9 bajo EMA 21 (señal de salida)
+    cruce_bajista = (
+        estrategia.prev_ema_21 is not None
+        and estrategia.prev_ema_9 >= estrategia.prev_ema_21
+        and estrategia.ema_9 < estrategia.ema_21
     )
-    venta_tendencia = estrategia.ema_9 < estrategia.ema_21
-    venta_rsi = estrategia.rsi > 40  # Más estricto: RSI > 40 para venta (antes > 30)
-    venta_volumen = estrategia.volumen > estrategia.volumen_promedio * 0.8
+    tendencia_bajista = estrategia.ema_9 < estrategia.ema_21
+    precio_bajo_ema9 = estrategia.precio_actual < estrategia.ema_9
+    volumen_ok_venta = estrategia.volumen > estrategia.volumen_promedio * 0.8
 
-    if compra_ema and compra_tendencia and compra_rsi and compra_volumen:
+    # COMPRA: Cruce alcista EMA 9/21 + precio sobre EMA 9 + RSI + volumen
+    if cruce_alcista and tendencia_alcista and precio_sobre_ema9 and rsi_ok and volumen_ok:
         return "COMPRA"
-    if venta_ema and venta_tendencia and venta_rsi and venta_volumen:
+
+    # VENTA: Cruce bajista EMA 9/21 + precio bajo EMA 9 + volumen
+    if cruce_bajista and tendencia_bajista and precio_bajo_ema9 and volumen_ok_venta:
         return "VENTA"
+
     return "NEUTRAL"
 
 
