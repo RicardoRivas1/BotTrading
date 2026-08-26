@@ -27,12 +27,11 @@ class TestIntegracionBot:
         })
         
         # Mock de filtros (simplificado para prueba)
-        adx_valido, ema_mtf_valido, atr_valido, horario_valido = validar_filtros_cuantitativos(df, df_mtf)
+        adx_valido, ema_mtf_valido, horario_valido = validar_filtros_cuantitativos(df, df_mtf)
         
         # Verificar que retorna tupla booleana
         assert isinstance(adx_valido, bool)
         assert isinstance(ema_mtf_valido, bool)
-        assert isinstance(atr_valido, bool)
         assert isinstance(horario_valido, bool)
 
 
