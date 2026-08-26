@@ -114,10 +114,9 @@ except Exception as e:
     )
 
 
-def validar_filtros_cuantitativos(df: pd.DataFrame, df_mtf: pd.DataFrame) -> tuple:
-    """Valida los filtros cuantitativos antes de permitir entrada."""
+def validar_filtros_cuantitativos(df, df_mtf):
     try:
-        # 1. Filtro ADX > 25
+        # 1. Filtro ADX > 25 (evaluación dinámica)
         adx_valido = filtros.validar_adx_tendencia(
             df["high"], df["low"], df["close"], threshold=25.0
         )
@@ -125,8 +124,8 @@ def validar_filtros_cuantitativos(df: pd.DataFrame, df_mtf: pd.DataFrame) -> tup
         # 2. Confirmación MTF EMA 200
         ema_mtf_valido = filtros.confirmar_ema_200_mtf(df_mtf)
 
-        # 3. Filtro horario de mercado
-        horario_valido = filtros.validar_horario_mercado(13, 21)
+        # 3. Filtro de horario desactivado (operar 24/7)
+        horario_valido = True
 
         return adx_valido, ema_mtf_valido, horario_valido
 
@@ -362,7 +361,9 @@ def run():
                     continue  # Posición cerrada, saltar evaluación de entrada
 
             # Validar filtros cuantitativos
-            adx_valido = ema_mtf_valido = horario_valido = True
+            adx_valido, ema_mtf_valido, horario_valido = validar_filtros_cuantitativos(
+                df, df_mtf
+            )
             vol_liquidez_ok = True
 
             print(f"\n[INFO] {time.strftime('%H:%M:%S UTC')}")
