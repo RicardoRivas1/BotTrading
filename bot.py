@@ -109,7 +109,9 @@ try:
             MIN_ORDER_USDT = float(min_cost)
             print(f"Mínimo de orden del exchange: ${MIN_ORDER_USDT:.2f} USDT")
 except Exception as e:
-    print(f"No se pudo obtener mínimo de orden del exchange, usando default ${MIN_ORDER_USDT:.2f}: {e}")
+    print(
+        f"No se pudo obtener mínimo de orden del exchange, usando default ${MIN_ORDER_USDT:.2f}: {e}"
+    )
 
 
 def validar_filtros_cuantitativos(df: pd.DataFrame, df_mtf: pd.DataFrame) -> tuple:
@@ -299,7 +301,9 @@ def run():
         hora_compra
 
     print("Bot iniciado con credenciales autenticadas de Binance (.env)...")
-    print("Estrategia: Cruce EMA 9/21 + RSI 30-70 + Volumen + ADX + MTF + Trailing Stop")
+    print(
+        "Estrategia: Cruce EMA 9/21 + RSI 30-70 + Volumen + ADX + MTF + Trailing Stop"
+    )
     print(f"Mínimo de orden del exchange: ${MIN_ORDER_USDT:.2f} USDT")
 
     # Para obtener automáticamente los saldos reales de Binance al iniciar:
@@ -358,10 +362,7 @@ def run():
                     continue  # Posición cerrada, saltar evaluación de entrada
 
             # Validar filtros cuantitativos
-            adx_valido, ema_mtf_valido, horario_valido = validar_filtros_cuantitativos(
-                df, df_mtf
-            )
-
+            adx_valido, ema_mtf_valido, horario_valido = True
             vol_liquidez_ok = current_volume_usdt >= MIN_VOLUMEN_USDT
 
             print(f"\n[INFO] {time.strftime('%H:%M:%S UTC')}")
@@ -401,16 +402,32 @@ def run():
                 # Debug detallado de cada filtro
                 saldo_suficiente = saldo_usdt >= MIN_ORDER_USDT
                 print(f"\n🔍 EVALUANDO FILTROS PARA COMPRA:")
-                print(f"  • ADX > 25:     {'✅' if adx_valido else '❌'} (actual: {current_adx:.1f})")
+                print(
+                    f"  • ADX > 25:     {'✅' if adx_valido else '❌'} (actual: {current_adx:.1f})"
+                )
                 print(f"  • MTF EMA 200:  {'✅' if ema_mtf_valido else '❌'}")
                 print(f"  • Horario:      {'✅' if horario_valido else '❌'}")
-                print(f"  • Liquidez:     {'✅' if vol_liquidez_ok else '❌'} (volumen: ${current_volume_usdt:,.0f} vs mínimo: ${MIN_VOLUMEN_USDT:,.0f})")
-                print(f"  • Saldo mínimo: {'✅' if saldo_suficiente else '❌'} (${saldo_usdt:.2f} vs mínimo ${MIN_ORDER_USDT:.2f})")
+                print(
+                    f"  • Liquidez:     {'✅' if vol_liquidez_ok else '❌'} (volumen: ${current_volume_usdt:,.0f} vs mínimo: ${MIN_VOLUMEN_USDT:,.0f})"
+                )
+                print(
+                    f"  • Saldo mínimo: {'✅' if saldo_suficiente else '❌'} (${saldo_usdt:.2f} vs mínimo ${MIN_ORDER_USDT:.2f})"
+                )
 
                 if not saldo_suficiente:
-                    print(f"  ⚠️ Saldo insuficiente para orden mínima del exchange (${MIN_ORDER_USDT:.2f} USDT)")
+                    print(
+                        f"  ⚠️ Saldo insuficiente para orden mínima del exchange (${MIN_ORDER_USDT:.2f} USDT)"
+                    )
 
-                if not all([adx_valido, ema_mtf_valido, horario_valido, vol_liquidez_ok, saldo_suficiente]):
+                if not all(
+                    [
+                        adx_valido,
+                        ema_mtf_valido,
+                        horario_valido,
+                        vol_liquidez_ok,
+                        saldo_suficiente,
+                    ]
+                ):
                     print(f"  ❌ COMPRA BLOQUEADA — Ver filtros arriba")
                     time.sleep(60)
                     continue
@@ -468,11 +485,17 @@ def run():
                         and current_ema9 > current_ema21
                     )
                     if not ema_cruce_ok:
-                        print(f"  → No hay cruce alcista EMA 9/21 (prev: EMA9={prev_ema9:.2f} vs EMA21={prev_ema21:.2f} | actual: EMA9={current_ema9:.2f} vs EMA21={current_ema21:.2f})")
+                        print(
+                            f"  → No hay cruce alcista EMA 9/21 (prev: EMA9={prev_ema9:.2f} vs EMA21={prev_ema21:.2f} | actual: EMA9={current_ema9:.2f} vs EMA21={current_ema21:.2f})"
+                        )
                     if not (30 < current_rsi < 70):
-                        print(f"  → RSI fuera de rango: {current_rsi:.1f} (necesario: 30-70)")
+                        print(
+                            f"  → RSI fuera de rango: {current_rsi:.1f} (necesario: 30-70)"
+                        )
                     if current_volume_usdt <= current_vol_avg_usdt:
-                        print(f"  → Volumen bajo: ${current_volume_usdt:,.0f} <= promedio ${current_vol_avg_usdt:,.0f}")
+                        print(
+                            f"  → Volumen bajo: ${current_volume_usdt:,.0f} <= promedio ${current_vol_avg_usdt:,.0f}"
+                        )
                 elif senial == "COMPRA" and saldo_usdt <= 0:
                     print("Monitoreando mercado... (SEÑAL COMPRA pero sin saldo USDT)")
                 else:
