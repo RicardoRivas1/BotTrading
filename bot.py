@@ -362,7 +362,7 @@ def run():
                     continue  # Posición cerrada, saltar evaluación de entrada
 
             # Validar filtros cuantitativos
-            adx_valido, ema_mtf_valido, horario_valido = True
+            adx_valido = ema_mtf_valido = horario_valido = True
             vol_liquidez_ok = current_volume_usdt >= MIN_VOLUMEN_USDT
 
             print(f"\n[INFO] {time.strftime('%H:%M:%S UTC')}")
