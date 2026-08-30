@@ -1,519 +1,510 @@
+"""Bot de Trading - Orquestador principal.
+
+Responsabilidades exclusivas:
+1. Leer datos del exchange
+2. Calcular indicadores en logic/
+3. Evaluar filtros cuantitativos
+4. Ejecutar órdenes
+5. Registrar logs y notificaciones
+
+NO contiene lógica de negocio pura ni acceso directo a la API.
+"""
+
+import logging
 import os
-import time
+import signal
+import sys
 import threading
+import time
+from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import ccxt
+from typing import Optional
+
 import pandas as pd
-from dotenv import load_dotenv
+
+from config import AppConfig, load_config
+from data import ExchangeClient
 from logic import (
-    calcular_ema,
-    calcular_rsi,
-    calcular_atr,
-    calcular_adx,
     EstrategiaMultivariable,
-    FiltrosCuantitativos,
-    evaluar_estrategia_multivariable,
+    ResultadoFiltros,
+    calcular_adx,
+    calcular_atr,
+    calcular_ema,
     calcular_ganancia_con_stoploss,
     calcular_profit_factor,
-    validar_profit_factor_minimo,
     crear_registro_csv,
-    notificar_operacion_telegram,
-    enviar_notificacion_telegram,
+    evaluar_estrategia_multivariable,
+    validar_filtros_cuantitativos,
 )
+from notifications import enviar_notificacion_telegram, notificar_operacion
 
-# Detectar si estamos en Render (para usar claves demo)
-# Render establece autom�ticamente estas variables de entorno
-print(f"Variables de entorno RENDER: {os.environ.get('RENDER')}")
-print(
-    f"Variables de entorno RENDER_EXTERNAL_URL: {os.environ.get('RENDER_EXTERNAL_URL')}"
-)
+# ---------------------------------------------------------------------------
+# Configuración de logging
+# ---------------------------------------------------------------------------
 
-if "RENDER" in os.environ or "RENDER_EXTERNAL_URL" in os.environ:
-    os.environ["USE_DEMO_ACCOUNT"] = "true"
-    os.environ["MODO_SIMULACION"] = "true"  # Activar modo simulaci�n en Render
-    print("Modo demo y simulacion activados (entorno Render detectado)")
-else:
-    print("Modo desarrollo local (usando cuenta real)")
+def setup_logging(log_level: str = "INFO") -> None:
+    """Configura logging estructurado con rotación de archivos."""
+    from logging.handlers import RotatingFileHandler
 
-# Cargar variables del archivo .env
-load_dotenv()
+    log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    date_format = "%Y-%m-%d %H:%M:%S"
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
+    root_logger.addHandler(console_handler)
+
+    file_handler = RotatingFileHandler(
+        "bot_trading.log",
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
+    root_logger.addHandler(file_handler)
 
 
-# --- Servidor de Salud para Render (Escucha en el puerto requerido) ---
-class DummyHealthCheck(BaseHTTPRequestHandler):
-    def do_GET(self):
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Servidor de salud para Render
+# ---------------------------------------------------------------------------
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    """Handler para el endpoint de salud de Render."""
+
+    def do_GET(self) -> None:
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot de Trading Activo en Render")
+        self.wfile.write(b"Bot de Trading Activo")
 
-    def log_message(self, format, *args):
-        # Silenciar logs HTTP en consola para mantener limpios los logs del bot
+    def log_message(self, format: str, *args: object) -> None:
         return
 
 
-def iniciar_servidor_puerto():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), DummyHealthCheck)
-    print(f"Servidor HTTP activo escuchando en el puerto {port} para Render.")
+def start_health_server(port: int) -> None:
+    """Inicia el servidor HTTP de salud en un hilo daemon."""
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    logger.info("Servidor HTTP de salud activo en puerto %d", port)
     server.serve_forever()
 
 
-# --- Configuraci�n del Exchange ---
-# Render: Kraken (sin bloqueo geografico en EE. UU.) + datos publicos, NO API keys.
-# Local: Binance con API keys reales para datos y posibles ordenes futuras.
-# Todas las operaciones se simulan localmente (paper trading).
+# ---------------------------------------------------------------------------
+# Estado del bot (sin variables globales)
+# ---------------------------------------------------------------------------
 
-if os.environ.get("USE_DEMO_ACCOUNT") == "true":
-    exchange = ccxt.kraken({"enableRateLimit": True})
-    symbol = "BTC/USDT"
-    print("Modo Render: Kraken Mainnet (datos publicos, paper trading)")
-else:
-    api_key = os.environ.get("BINANCE_API_KEY_REAL")
-    api_secret = os.environ.get("BINANCE_SECRET_KEY_REAL")
-    exchange = ccxt.binance(
-        {
-            "apiKey": api_key,
-            "secret": api_secret,
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
-        }
-    )
-    symbol = "BTC/USDT"
-    print("Modo local: Binance Mainnet (cuenta REAL)")
-
-# Inicializar filtros cuantitativos
-filtros = FiltrosCuantitativos(exchange, symbol=symbol)
-
-saldo_usdt = 10.00
-saldo_btc = 0.0
-precio_compra = 0.0
-atr_compra = 0.0
-ganancias_totales = 0.0
-perdidas_totales = 0.0
-breakeven_activado = False  # Trailing Stop a Break-Even activado
-break_even_notificado = False  # Evita re-notificar BE en Telegram cada iteración
-stop_loss = 0.0  # Precio exacto de stop-loss activo
-hora_compra = None  # Hora UTC de última compra
-
-MIN_VOLUMEN_USDT = 0  # Cambiar en modo local
-MIN_ORDER_USDT = 10.0  # Default: $10 USDT mínimo de Binance
-timeframe = "1m"
-csv_file = "historial_trading.csv"
-
-# Obtener mínimo de orden del exchange
-try:
-    market = exchange.market(symbol)
-    if market and "limits" in market and "cost" in market["limits"]:
-        min_cost = market["limits"]["cost"].get("min")
-        if min_cost is not None:
-            MIN_ORDER_USDT = float(min_cost)
-            print(f"Mínimo de orden del exchange: ${MIN_ORDER_USDT:.2f} USDT")
-except Exception as e:
-    print(
-        f"No se pudo obtener mínimo de orden del exchange, usando default ${MIN_ORDER_USDT:.2f}: {e}"
-    )
+@dataclass
+class BotState:
+    """Estado mutable del bot de trading."""
+    saldo_usdt: float = 10.00
+    saldo_btc: float = 0.0
+    precio_compra: float = 0.0
+    atr_compra: float = 0.0
+    ganancias_totales: float = 0.0
+    perdidas_totales: float = 0.0
+    breakeven_activado: bool = False
+    break_even_notificado: bool = False
+    stop_loss: float = 0.0
+    hora_compra: Optional[str] = None
+    min_order_usdt: float = 10.0
 
 
-def validar_filtros_cuantitativos(df, df_mtf):
-    try:
-        # 1. Filtro ADX > 25 (evaluación dinámica)
-        adx_valido = filtros.validar_adx_tendencia(
-            df["high"], df["low"], df["close"], threshold=25.0
-        )
+# ---------------------------------------------------------------------------
+# Funciones auxiliares del orquestador
+# ---------------------------------------------------------------------------
 
-        # 2. Confirmación MTF EMA 200
-        ema_mtf_valido = filtros.confirmar_ema_200_mtf(df_mtf)
-
-        # 3. Filtro de horario desactivado (operar 24/7)
-        horario_valido = True
-
-        return adx_valido, ema_mtf_valido, horario_valido
-
-    except Exception as e:
-        print(f"Error validando filtros: {e}")
-        return False, False, False
+def fetch_market_min_order(client: ExchangeClient, symbol: str, default: float = 10.0) -> float:
+    """Obtiene el mínimo de orden del exchange."""
+    market_info = client.get_market_info(symbol)
+    if market_info and "min_order_usdt" in market_info:
+        min_order = market_info["min_order_usdt"]
+        logger.info("Mínimo de orden del exchange: $%.2f USDT", min_order)
+        return min_order
+    logger.info("Usando mínimo de orden default: $%.2f USDT", default)
+    return default
 
 
-def obtener_saldo_real():
-    """Consulta los saldos disponibles directamente desde tu cuenta de Binance."""
-    try:
-        balance = exchange.fetch_balance()
-        usdt = balance["free"].get("USDT", 0.0)
-        btc = balance["free"].get("BTC", 0.0)
-        return usdt, btc
-    except Exception as e:
-        print(f"Error consultando saldo en Binance: {e}")
-        return None, None
-
-
-def guardar_csv(registro: dict):
-    df = pd.DataFrame([registro])
-    header = not os.path.exists(csv_file)
-    df.to_csv(csv_file, mode="a", header=header, index=False)
-    print(f"Operacion registrada en '{csv_file}'")
-
-
-def evaluar_salida_posicion(precio_actual_real: float) -> bool:
-    """Evalúa salida de posición por Stop-Loss / Break-Even. PRIORIDAD ABSOLUTA.
-
-    Se ejecuta al inicio de CADA iteración del bucle principal, antes de
-    evaluar indicadores o señales de entrada. Si el precio toca o cruza
-    el stop_loss, vende inmediatamente.
+def evaluar_salida_posicion(
+    state: BotState,
+    precio_actual: float,
+    symbol: str,
+    client: ExchangeClient,
+    config: AppConfig,
+) -> bool:
+    """Evalúa salida de posición por Stop-Loss / Break-Even.
 
     Returns:
-        True  → posición cerrada (se debe saltar evaluación de entrada)
-        False → posición sigue abierta (continuar con loop normal)
+        True si la posición se cerró, False si sigue abierta.
     """
-    global \
-        saldo_usdt, \
-        saldo_btc, \
-        precio_compra, \
-        atr_compra, \
-        ganancias_totales, \
-        perdidas_totales, \
-        breakeven_activado, \
-        break_even_notificado, \
-        stop_loss, \
-        hora_compra
-
-    if saldo_btc <= 0:
+    if state.saldo_btc <= 0:
         return False
 
-    # --- 1. Calcular stop_loss dinámico según estado ---
-    if breakeven_activado:
-        stop_loss = precio_compra
+    if state.breakeven_activado:
+        state.stop_loss = state.precio_compra
     else:
-        stop_loss = precio_compra - (atr_compra * 1.2)
+        state.stop_loss = state.precio_compra - (state.atr_compra * config.strategy.atr_sl_multiplier)
 
-    # --- 2. Activar Break-Even si se alcanza umbral de ganancia ATR ---
-    if not breakeven_activado and atr_compra > 0:
-        ganancia_flotante_atr = (precio_actual_real - precio_compra) / atr_compra
-        if ganancia_flotante_atr >= 0.5:
-            breakeven_activado = True
-            stop_loss = precio_compra
-            if not break_even_notificado:
-                break_even_notificado = True
-                pnl_pct = ((precio_actual_real - precio_compra) / precio_compra) * 100
+    if not state.breakeven_activado and state.atr_compra > 0:
+        ganancia_flotante_atr = (precio_actual - state.precio_compra) / state.atr_compra
+        if ganancia_flotante_atr >= config.strategy.trailing_be_threshold_atr:
+            state.breakeven_activado = True
+            state.stop_loss = state.precio_compra
+            if not state.break_even_notificado:
+                state.break_even_notificado = True
+                pnl_pct = ((precio_actual - state.precio_compra) / state.precio_compra) * 100
                 mensaje = (
                     f"🚨 *TRAILING STOP BREAK-EVEN ACTIVADO*\n\n"
-                    f"• Precio Entrada: ${precio_compra:.2f}\n"
-                    f"• Precio Actual: ${precio_actual_real:.2f}\n"
+                    f"• Precio Entrada: ${state.precio_compra:.2f}\n"
+                    f"• Precio Actual: ${precio_actual:.2f}\n"
                     f"• Ganancia: +{pnl_pct:.2f}% (+{ganancia_flotante_atr:.1f} ATR)\n"
-                    f"• Stop-Loss movido al punto de entrada (${precio_compra:.2f})"
+                    f"• Stop-Loss movido al punto de entrada (${state.precio_compra:.2f})"
                 )
-                enviar_notificacion_telegram(mensaje)
-                print(
-                    f"✅ Trailing Stop activado: Stop-Loss movido a Break-Even (${precio_compra:.2f})"
+                enviar_notificacion_telegram(mensaje, config.telegram)
+                logger.info(
+                    "Trailing Stop activado: SL movido a Break-Even ($%.2f)",
+                    state.precio_compra,
                 )
 
-    # --- 3. PRIORIDAD ABSOLUTA: Verificar si precio触碰 SL ---
-    if precio_actual_real <= stop_loss:
-        tipo_salida = "BE" if breakeven_activado else "SL"
-        print(
-            f"\n{'🔒' if breakeven_activado else '🔴'} EJECUTANDO VENTA POR {tipo_salida}: "
-            f"${precio_actual_real:.2f} <= ${stop_loss:.2f}"
+    if precio_actual <= state.stop_loss:
+        tipo_salida = "BE" if state.breakeven_activado else "SL"
+        logger.info(
+            "Ejecutando venta por %s: $%.2f <= $%.2f",
+            tipo_salida,
+            precio_actual,
+            state.stop_loss,
         )
 
-        # Ejecutar orden de venta en el exchange (si no es simulación)
-        orden_ejecutada = False
-        if os.environ.get("MODO_SIMULACION") != "true":
+        if not config.trading.simulation_mode:
             try:
-                orden = exchange.create_market_sell_order(symbol, saldo_btc)
-                print(f"✅ Orden de venta ejecutada en exchange: {orden['id']}")
-                orden_ejecutada = True
+                orden = client.create_market_sell_order(symbol, state.saldo_btc)
+                logger.info("Orden de venta ejecutada: %s", orden.get("id", "N/A"))
             except Exception as e:
-                print(f"❌ ERROR CRÍTICO ejecutando venta en exchange: {e}")
+                logger.error("ERROR CRÍTICO ejecutando venta: %s", e)
                 enviar_notificacion_telegram(
-                    f"❌ ERROR CRÍTICO: No se pudo vender BTC: {e}"
+                    f"❌ ERROR CRÍTICO: No se pudo vender BTC: {e}",
+                    config.telegram,
                 )
                 return False
         else:
-            print(
-                f"[SIMULACIÓN] Venta de {saldo_btc:.6f} BTC a ${precio_actual_real:.2f}"
+            logger.info(
+                "[SIMULACIÓN] Venta de %.6f BTC a $%.2f",
+                state.saldo_btc,
+                precio_actual,
             )
 
-        # Calcular P&L
-        saldo_usdt = saldo_btc * precio_actual_real
+        state.saldo_usdt = state.saldo_btc * precio_actual
         ganancia_usdt, ganancia_pct = calcular_ganancia_con_stoploss(
-            precio_actual_real, precio_compra, saldo_btc, atr_compra, tipo_salida
+            precio_actual, state.precio_compra, state.saldo_btc, state.atr_compra, tipo_salida
         )
 
-        # Actualizar métricas de Profit Factor
         if ganancia_usdt >= 0:
-            ganancias_totales += ganancia_usdt
+            state.ganancias_totales += ganancia_usdt
         else:
-            perdidas_totales += abs(ganancia_usdt)
+            state.perdidas_totales += abs(ganancia_usdt)
 
-        # Registrar en CSV
         reg = crear_registro_csv(
             "VENTA",
-            precio_actual_real,
-            saldo_btc,
-            saldo_usdt,
+            precio_actual,
+            state.saldo_btc,
+            state.saldo_usdt,
             ganancias=(ganancia_usdt, ganancia_pct),
         )
-        guardar_csv(reg)
+        _guardar_csv(reg, config.csv_file)
 
-        # Notificación Telegram
-        trailing_msg = " (Break-Even)" if breakeven_activado else ""
+        trailing_msg = " (Break-Even)" if state.breakeven_activado else ""
         mensaje = (
             f"🔴 *VENTA{tipo_salida} EJECUTADA{trailing_msg}*\n\n"
-            f"• *Precio Venta:* ${precio_actual_real:,.2f}\n"
-            f"• *Precio Compra:* ${precio_compra:,.2f}\n"
-            f"• *Stop-Loss:* ${stop_loss:,.2f}\n"
-            f"• *Monto BTC:* {saldo_btc:.6f}\n"
-            f"• *Total USDT:* ${saldo_usdt:,.2f}\n"
+            f"• *Precio Venta:* ${precio_actual:,.2f}\n"
+            f"• *Precio Compra:* ${state.precio_compra:,.2f}\n"
+            f"• *Stop-Loss:* ${state.stop_loss:,.2f}\n"
+            f"• *Monto BTC:* {state.saldo_btc:.6f}\n"
+            f"• *Total USDT:* ${state.saldo_usdt:,.2f}\n"
             f"• *Ganancia:* ${ganancia_usdt:,.2f} ({ganancia_pct:.2f}%)\n"
             f"• *Tipo:* {tipo_salida}\n"
-            f"• *Trailing Stop:* {'✅ Break-Even' if breakeven_activado else '❌ Inactivo'}"
+            f"• *Trailing Stop:* {'✅ Break-Even' if state.breakeven_activado else '❌ Inactivo'}"
         )
-        enviar_notificacion_telegram(mensaje)
+        enviar_notificacion_telegram(mensaje, config.telegram)
 
-        # Resetear estado de posición
-        saldo_btc = 0.0
-        breakeven_activado = False
-        break_even_notificado = False
-        stop_loss = 0.0
+        state.saldo_btc = 0.0
+        state.breakeven_activado = False
+        state.break_even_notificado = False
+        state.stop_loss = 0.0
 
         return True
 
-    # Log del stop-loss vigente para debug
-    distancia_sl = precio_actual_real - stop_loss
-    print(
-        f"Stop-Loss vigente: ${stop_loss:.2f} | Distancia: ${distancia_sl:.2f} ({(distancia_sl / stop_loss) * 100:.3f}%)"
+    distancia_sl = precio_actual - state.stop_loss
+    logger.debug(
+        "Stop-Loss vigente: $%.2f | Distancia: $%.2f (%.3f%%)",
+        state.stop_loss,
+        distancia_sl,
+        (distancia_sl / state.stop_loss) * 100 if state.stop_loss > 0 else 0,
     )
-
     return False
 
 
-def run():
-    global \
-        saldo_usdt, \
-        saldo_btc, \
-        precio_compra, \
-        atr_compra, \
-        ganancias_totales, \
-        perdidas_totales, \
-        breakeven_activado, \
-        break_even_notificado, \
-        stop_loss, \
-        hora_compra
+def _guardar_csv(registro: dict, csv_file: str) -> None:
+    """Guarda un registro en el archivo CSV."""
+    df = pd.DataFrame([registro])
+    header = not os.path.exists(csv_file)
+    df.to_csv(csv_file, mode="a", header=header, index=False)
+    logger.debug("Operación registrada en '%s'", csv_file)
 
-    print("Bot iniciado con credenciales autenticadas de Binance (.env)...")
-    print(
-        "Estrategia: Cruce EMA 9/21 + RSI 30-70 + Volumen + ADX + MTF + Trailing Stop"
+
+# ---------------------------------------------------------------------------
+# Bucle principal del bot
+# ---------------------------------------------------------------------------
+
+def run_bot() -> None:
+    """Bucle principal del bot de trading."""
+    config = load_config()
+    state = BotState(saldo_usdt=config.trading.initial_balance_usdt)
+    client = ExchangeClient(config)
+
+    state.min_order_usdt = fetch_market_min_order(
+        client, config.trading.symbol, config.trading.min_order_usdt
     )
-    print(f"Mínimo de orden del exchange: ${MIN_ORDER_USDT:.2f} USDT")
 
-    # Para obtener automáticamente los saldos reales de Binance al iniciar:
-    # real_usdt, real_btc = obtener_saldo_real()
-    # if real_usdt is not None:
-    #     saldo_usdt, saldo_btc = real_usdt, real_btc
+    logger.info("Bot iniciado correctamente")
+    logger.info(
+        "Estrategia: Cruce EMA %d/%d + RSI + Volumen + ADX + MTF + Trailing Stop",
+        config.strategy.ema_fast,
+        config.strategy.ema_slow,
+    )
+    logger.info("Mínimo de orden: $%.2f USDT", state.min_order_usdt)
 
-    while True:
+    running = True
+
+    def shutdown_handler(signum: int, frame: object) -> None:
+        nonlocal running
+        logger.info("Señal %d recibida. Cerrando bot de forma segura...", signum)
+        running = False
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+    while running:
         try:
-            # 1. Fetch datos de velas + indicadores (para señales de entrada)
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-            df = pd.DataFrame(
-                ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"]
+            df = client.fetch_ohlcv(
+                config.trading.symbol,
+                config.trading.timeframe,
+                limit=config.trading.limit_ohlcv,
             )
 
-            # Obtener datos del timeframe superior (1h) para confirmación MTF
-            df_mtf = filtros.obtener_datos_mtf("1h", limit=200)
+            df_mtf = client.fetch_ohlcv(
+                config.trading.symbol,
+                config.trading.timeframe_mtf,
+                limit=config.trading.limit_mtf,
+            )
 
-            # Calcular indicadores técnicos avanzados
-            df["ema_9"] = calcular_ema(df["close"], period=9)
-            df["ema_21"] = calcular_ema(df["close"], period=21)
-            df["rsi"] = calcular_rsi(df["close"], period=14)
-            df["atr"] = calcular_atr(df["high"], df["low"], df["close"], period=14)
+            df["ema_fast"] = calcular_ema(df["close"], period=config.strategy.ema_fast)
+            df["ema_slow"] = calcular_ema(df["close"], period=config.strategy.ema_slow)
+            df["rsi"] = calcular_rsi(df["close"], period=config.strategy.rsi_period)
+            df["atr"] = calcular_atr(
+                df["high"], df["low"], df["close"], period=config.strategy.atr_period
+            )
             df["volume_usdt"] = df["volume"] * df["close"]
-            df["volumen_promedio"] = df["volume"].rolling(window=20).mean()
-            df["volumen_promedio_usdt"] = df["volume_usdt"].rolling(window=20).mean()
-            df["adx"] = calcular_adx(df["high"], df["low"], df["close"], period=14)
+            df["volumen_promedio"] = df["volume"].rolling(
+                window=config.strategy.volume_avg_window
+            ).mean()
+            df["volumen_promedio_usdt"] = df["volume_usdt"].rolling(
+                window=config.strategy.volume_avg_window
+            ).mean()
+            df["adx"] = calcular_adx(
+                df["high"], df["low"], df["close"], period=config.strategy.adx_period
+            )
 
-            current_price = df["close"].iloc[-1]
-            current_ema9 = df["ema_9"].iloc[-1]
-            current_ema21 = df["ema_21"].iloc[-1]
-            current_rsi = df["rsi"].iloc[-1]
-            current_volume = df["volume"].iloc[-2]
-            current_volume_usdt = df["volume_usdt"].iloc[-2]
-            current_vol_avg = df["volumen_promedio"].iloc[-1]
-            current_vol_avg_usdt = df["volumen_promedio_usdt"].iloc[-1]
-            current_atr = df["atr"].iloc[-1]
-            current_adx = df["adx"].iloc[-1]
+            current_price = float(df["close"].iloc[-1])
+            current_ema_fast = float(df["ema_fast"].iloc[-1])
+            current_ema_slow = float(df["ema_slow"].iloc[-1])
+            current_rsi = float(df["rsi"].iloc[-1])
+            current_volume_usdt = float(df["volume_usdt"].iloc[-2])
+            current_vol_avg_usdt = float(df["volumen_promedio_usdt"].iloc[-1])
+            current_atr = float(df["atr"].iloc[-1])
+            current_adx = float(df["adx"].iloc[-1])
 
-            prev_price = df["close"].iloc[-2]
-            prev_ema9 = df["ema_9"].iloc[-2]
-            prev_ema21 = df["ema_21"].iloc[-2]
+            prev_price = float(df["close"].iloc[-2])
+            prev_ema_fast = float(df["ema_fast"].iloc[-2])
+            prev_ema_slow = float(df["ema_slow"].iloc[-2])
 
-            # 2. Fetch precio REAL-TIME para evaluación de salida
             try:
-                ticker = exchange.fetch_ticker(symbol)
-                precio_real = ticker["last"]
+                ticker = client.fetch_ticker(config.trading.symbol)
+                precio_real = float(ticker["last"])
             except Exception as e:
-                print(f"⚠️ Error fetch_ticker, usando precio de vela: {e}")
+                logger.warning("Error fetch_ticker, usando precio de vela: %s", e)
                 precio_real = current_price
 
-            # 3. PRIORIDAD ABSOLUTA: Evaluar salida de posición (SL / Break-Even)
-            if saldo_btc > 0:
-                if evaluar_salida_posicion(precio_real):
-                    time.sleep(60)
-                    continue  # Posición cerrada, saltar evaluación de entrada
+            if state.saldo_btc > 0:
+                if evaluar_salida_posicion(
+                    state, precio_real, config.trading.symbol, client, config
+                ):
+                    time.sleep(config.trading.loop_interval_seconds)
+                    continue
 
-            # Validar filtros cuantitativos
-            adx_valido, ema_mtf_valido, horario_valido = validar_filtros_cuantitativos(
-                df, df_mtf
+            filtros = validar_filtros_cuantitativos(
+                high=df["high"],
+                low=df["low"],
+                close=df["close"],
+                df_mtf=df_mtf,
+                atr_series=df["atr"],
+                adx_threshold=config.strategy.adx_threshold,
             )
-            vol_liquidez_ok = True
 
-            print(f"\n[INFO] {time.strftime('%H:%M:%S UTC')}")
-            print(
-                f"Precio BTC: ${current_price:.2f} (real: ${precio_real:.2f}) | EMA 9: ${current_ema9:.2f} | EMA 21: ${current_ema21:.2f}"
+            logger.info("--- Estado del mercado ---")
+            logger.info(
+                "Precio: $%.2f (real: $%.2f) | EMA %d: $%.2f | EMA %d: $%.2f",
+                current_price,
+                precio_real,
+                config.strategy.ema_fast,
+                current_ema_fast,
+                config.strategy.ema_slow,
+                current_ema_slow,
             )
-            print(
-                f"RSI: {current_rsi:.1f} | ATR: ${current_atr:.2f} | ADX: ${current_adx:.1f} | Volumen: ${current_volume_usdt:,.0f} USDT (Minimo: ${MIN_VOLUMEN_USDT:,.0f}) -> {vol_liquidez_ok}"
+            logger.info(
+                "RSI: %.1f | ATR: $%.2f | ADX: %.1f | Vol: $%.0f",
+                current_rsi,
+                current_atr,
+                current_adx,
+                current_volume_usdt,
             )
-            print(f"Billetera: ${saldo_usdt:.2f} USDT | {saldo_btc:.4f} BTC")
-            print(
-                f"Filtros: ADX>{current_adx:.1f}>25={adx_valido}, MTF={ema_mtf_valido}, Horario={horario_valido}, Liquidez={vol_liquidez_ok}"
+            logger.info(
+                "Billetera: $%.2f USDT | %.4f BTC",
+                state.saldo_usdt,
+                state.saldo_btc,
             )
-            print(
-                f"Profit Factor: {calcular_profit_factor(ganancias_totales, perdidas_totales):.2f}"
+            logger.info(
+                "Filtros: ADX=%s, MTF=%s, Horario=%s, Volatilidad=%s",
+                filtros.adx_valido,
+                filtros.ema_mtf_valido,
+                filtros.horario_valido,
+                filtros.volatilidad_valida,
             )
-            if saldo_btc > 0:
-                print(
-                    f"Posición abierta: Entrada=${precio_compra:.2f} | SL=${stop_loss:.2f} | BE={'SÍ' if breakeven_activado else 'NO'}"
-                )
+            logger.info(
+                "Profit Factor: %.2f",
+                calcular_profit_factor(state.ganancias_totales, state.perdidas_totales),
+            )
 
             senial = evaluar_estrategia_multivariable(
                 EstrategiaMultivariable(
                     precio_actual=current_price,
-                    ema_9=current_ema9,
-                    ema_21=current_ema21,
+                    ema_9=current_ema_fast,
+                    ema_21=current_ema_slow,
                     rsi=current_rsi,
                     volumen=current_volume_usdt,
                     volumen_promedio=current_vol_avg_usdt,
                     prev_precio=prev_price,
-                    prev_ema_9=prev_ema9,
-                    prev_ema_21=prev_ema21,
+                    prev_ema_9=prev_ema_fast,
+                    prev_ema_21=prev_ema_slow,
                 )
             )
 
-            if senial == "COMPRA" and saldo_usdt > 0:
-                # Debug detallado de cada filtro
-                saldo_suficiente = saldo_usdt >= MIN_ORDER_USDT
-                print(f"\n🔍 EVALUANDO FILTROS PARA COMPRA:")
-                print(
-                    f"  • ADX > 25:     {'✅' if adx_valido else '❌'} (actual: {current_adx:.1f})"
-                )
-                print(f"  • MTF EMA 200:  {'✅' if ema_mtf_valido else '❌'}")
-                print(f"  • Horario:      {'✅' if horario_valido else '❌'}")
-                print(
-                    f"  • Liquidez:     {'✅' if vol_liquidez_ok else '❌'} (volumen: ${current_volume_usdt:,.0f} vs mínimo: ${MIN_VOLUMEN_USDT:,.0f})"
-                )
-                print(
-                    f"  • Saldo mínimo: {'✅' if saldo_suficiente else '❌'} (${saldo_usdt:.2f} vs mínimo ${MIN_ORDER_USDT:.2f})"
+            if senial == "COMPRA" and state.saldo_usdt > 0:
+                saldo_suficiente = state.saldo_usdt >= state.min_order_usdt
+
+                logger.info("Evaluando filtros para COMPRA:")
+                logger.info("  ADX > %.1f: %s", config.strategy.adx_threshold, filtros.adx_valido)
+                logger.info("  MTF EMA 200: %s", filtros.ema_mtf_valido)
+                logger.info("  Horario: %s", filtros.horario_valido)
+                logger.info("  Volatilidad: %s", filtros.volatilidad_valida)
+                logger.info(
+                    "  Saldo mínimo: %s ($%.2f vs $%.2f)",
+                    saldo_suficiente,
+                    state.saldo_usdt,
+                    state.min_order_usdt,
                 )
 
                 if not saldo_suficiente:
-                    print(
-                        f"  ⚠️ Saldo insuficiente para orden mínima del exchange (${MIN_ORDER_USDT:.2f} USDT)"
+                    logger.warning(
+                        "Saldo insuficiente para orden mínima ($%.2f USDT)",
+                        state.min_order_usdt,
                     )
 
-                if not all(
-                    [
-                        adx_valido,
-                        ema_mtf_valido,
-                        horario_valido,
-                        vol_liquidez_ok,
-                        saldo_suficiente,
-                    ]
-                ):
-                    print(f"  ❌ COMPRA BLOQUEADA — Ver filtros arriba")
-                    time.sleep(60)
+                if not saldo_suficiente or not filtros.todos_validos:
+                    logger.info("COMPRA BLOQUEADA — filtros no cumplidos")
+                    time.sleep(config.trading.loop_interval_seconds)
                     continue
 
-                print(
-                    "✅ SEÑAL DE COMPRA MULTIVARIABLE CONFIRMADA (todos los filtros OK)"
-                )
-                print(
-                    f"Condiciones: Cruce EMA 9/21 alcista, RSI={current_rsi:.1f}, Volumen=${current_volume_usdt:,.0f} > ${current_vol_avg_usdt:,.0f} USDT"
-                )
-                print(f"Filtros: ADX={current_adx:.1f}>25, MTF OK, Horario OK")
-
-                monto_usdt = saldo_usdt
-                saldo_btc = saldo_usdt / current_price
-                precio_compra = current_price
-                atr_compra = current_atr
-                saldo_usdt = 0.0
-                breakeven_activado = False
-                break_even_notificado = False
-                stop_loss = current_price - (current_atr * 1.2)
-                hora_compra = time.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-                reg = crear_registro_csv("COMPRA", current_price, saldo_btc, monto_usdt)
-                guardar_csv(reg)
-
-                # Notificación Telegram detallada con filtros
-                mensaje = (
-                    f"🟢 *COMPRA CONFIRMADA*\n\n"
-                    f"• *Precio:* ${current_price:,.2f}\n"
-                    f"• *Monto BTC:* {saldo_btc:.6f}\n"
-                    f"• *Total USDT:* ${monto_usdt:,.2f}\n"
-                    f"• *Stop-Loss inicial:* ${stop_loss:,.2f}\n"
-                    f"• *Filtros aplicados:*\n"
-                    f"  - Cruce EMA 9/21 ✓\n"
-                    f"  - ADX {current_adx:.1f} > 25.0 ✓\n"
-                    f"  - MTF EMA 200 1h ✓\n"
-                    f"  - Horario 13-21 UTC ✓"
-                )
-                enviar_notificacion_telegram(mensaje)
-
-            elif senial == "VENTA" and saldo_btc > 0:
-                # La evaluación de SL/BE/TP se maneja en evaluar_salida_posicion().
-                # Aquí solo se registra si la estrategia pide venta por señal pura.
-                print(
-                    "ℹ️ Señal VENTA detectada pero SL/BE ya evaluado en prioridad. Posición mantenida."
+                logger.info(
+                    "SEÑAL DE COMPRA CONFIRMADA: Cruce EMA %d/%d, RSI=%.1f, Vol=$%.0f",
+                    config.strategy.ema_fast,
+                    config.strategy.ema_slow,
+                    current_rsi,
+                    current_volume_usdt,
                 )
 
+                monto_usdt = state.saldo_usdt
+                state.saldo_btc = state.saldo_usdt / current_price
+                state.precio_compra = current_price
+                state.atr_compra = current_atr
+                state.saldo_usdt = 0.0
+                state.breakeven_activado = False
+                state.break_even_notificado = False
+                state.stop_loss = current_price - (current_atr * config.strategy.atr_sl_multiplier)
+                state.hora_compra = time.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+                reg = crear_registro_csv("COMPRA", current_price, state.saldo_btc, monto_usdt)
+                _guardar_csv(reg, config.csv_file)
+
+                notificar_operacion(
+                    "COMPRA",
+                    current_price,
+                    state.saldo_btc,
+                    monto_usdt,
+                    config=config.telegram,
+                )
+
+            elif senial == "VENTA" and state.saldo_btc > 0:
+                logger.info(
+                    "Señal VENTA detectada pero SL/BE ya evaluado. Posición mantenida."
+                )
             else:
-                # Diagnóstico de por qué la señal es NEUTRAL
                 if senial == "NEUTRAL":
-                    print("Monitoreando mercado... (SEÑAL NEUTRAL)")
-                    ema_cruce_ok = (
-                        prev_ema21 is not None
-                        and prev_ema9 <= prev_ema21
-                        and current_ema9 > current_ema21
-                    )
-                    if not ema_cruce_ok:
-                        print(
-                            f"  → No hay cruce alcista EMA 9/21 (prev: EMA9={prev_ema9:.2f} vs EMA21={prev_ema21:.2f} | actual: EMA9={current_ema9:.2f} vs EMA21={current_ema21:.2f})"
-                        )
-                    if not (30 < current_rsi < 70):
-                        print(
-                            f"  → RSI fuera de rango: {current_rsi:.1f} (necesario: 30-70)"
-                        )
-                    if current_volume_usdt <= current_vol_avg_usdt:
-                        print(
-                            f"  → Volumen bajo: ${current_volume_usdt:,.0f} <= promedio ${current_vol_avg_usdt:,.0f}"
-                        )
-                elif senial == "COMPRA" and saldo_usdt <= 0:
-                    print("Monitoreando mercado... (SEÑAL COMPRA pero sin saldo USDT)")
+                    logger.info("Mercado NEUTRAL - sin señal clara")
+                elif senial == "COMPRA" and state.saldo_usdt <= 0:
+                    logger.info("Señal COMPRA pero sin saldo USDT")
                 else:
-                    print("Monitoreando mercado...")
+                    logger.info("Monitoreando mercado...")
 
-            time.sleep(60)
+            time.sleep(config.trading.loop_interval_seconds)
 
+        except KeyboardInterrupt:
+            logger.info("Interrupción de teclado recibida. Cerrando bot...")
+            running = False
         except Exception as e:
-            print(f"Error en ejecucion: {e}")
-            time.sleep(10)
+            logger.error("Error en ejecución: %s", e, exc_info=True)
+            time.sleep(config.trading.error_interval_seconds)
+
+    logger.info("Bot cerrado de forma segura")
+
+
+# ---------------------------------------------------------------------------
+# Punto de entrada
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Punto de entrada principal del bot."""
+    config = load_config()
+    setup_logging(config.log_level)
+
+    logger.info("Detectando entorno...")
+    import os
+    if "RENDER" in os.environ or "RENDER_EXTERNAL_URL" in os.environ:
+        os.environ["USE_DEMO_ACCOUNT"] = "true"
+        os.environ["MODO_SIMULACION"] = "true"
+        logger.info("Modo demo activado (entorno Render)")
+
+    server_thread = threading.Thread(
+        target=start_health_server,
+        args=(config.health_check_port,),
+        daemon=True,
+    )
+    server_thread.start()
+
+    logger.info("Iniciando bot de trading...")
+    run_bot()
 
 
 if __name__ == "__main__":
-    # Iniciar servidor HTTP en un hilo separado para Render
-    server_thread = threading.Thread(target=iniciar_servidor_puerto, daemon=True)
-    server_thread.start()
-
-    # Iniciar el bot de trading
-    print("Iniciando bot de trading...")
-    run()
+    main()

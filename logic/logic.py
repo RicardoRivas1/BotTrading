@@ -1,11 +1,19 @@
-"""Módulo con la lógica pura de negocio para el bot de trading."""
+"""Módulo con la lógica pura de negocio para el bot de trading.
 
-from datetime import datetime
-import os
+Todas las funciones son puras: reciben datos y devuelven resultados sin
+efectos secundarios (sin llamadas a API, sin E/S, sin estado global).
+"""
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional, Tuple
+
 import pandas as pd
-import requests
-import ccxt
 
+
+# ---------------------------------------------------------------------------
+# Indicadores técnicos (funciones puras)
+# ---------------------------------------------------------------------------
 
 def calcular_sma(precios: pd.Series, period: int = 20) -> pd.Series:
     """Calcula la Media Móvil Simple (SMA)."""
@@ -54,18 +62,32 @@ def calcular_atr(
     return atr
 
 
-def calcular_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+def _rma(series: pd.Series, length: int) -> pd.Series:
+    """Suavizado Wilder (RMA) auxiliar."""
+    result = series.copy()
+    first_valid = series.first_valid_index()
+    if first_valid is None:
+        return result
+    first_pos = series.index.get_loc(first_valid)
+    result.iloc[: first_pos + length] = float("nan")
+    result.iloc[first_pos + length - 1] = series.iloc[first_pos : first_pos + length].mean()
+    for i in range(first_pos + length, len(series)):
+        result.iloc[i] = (result.iloc[i - 1] * (length - 1) + series.iloc[i]) / length
+    return result
+
+
+def calcular_adx(
+    high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14
+) -> pd.Series:
     """Calcula el Average Directional Index (ADX) con suavizado Wilder, rango 0-100."""
     if len(high) < period * 2 + 1:
         raise ValueError("Datos insuficientes para el período solicitado")
 
-    # True Range
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    # +DM y -DM
     up_move = high - high.shift(1)
     down_move = low.shift(1) - low
     plus_dm = pd.Series(
@@ -77,32 +99,17 @@ def calcular_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int 
         index=high.index,
     )
 
-    # Wilder smoothing (RMA): valor anterior * (period-1) + actual / period
-    def rma(series, length):
-        result = series.copy()
-        first_valid = series.first_valid_index()
-        first_pos = series.index.get_loc(first_valid)
-        result.iloc[:first_pos + length] = float('nan')
-        result.iloc[first_pos + length - 1] = series.iloc[first_pos:first_pos + length].mean()
-        for i in range(first_pos + length, len(series)):
-            result.iloc[i] = (result.iloc[i - 1] * (length - 1) + series.iloc[i]) / length
-        return result
+    smoothed_tr = _rma(tr, period)
+    smoothed_plus_dm = _rma(plus_dm, period)
+    smoothed_minus_dm = _rma(minus_dm, period)
 
-    smoothed_tr = rma(tr, period)
-    smoothed_plus_dm = rma(plus_dm, period)
-    smoothed_minus_dm = rma(minus_dm, period)
-
-    # +DI y -DI
     plus_di = 100 * smoothed_plus_dm / smoothed_tr
     minus_di = 100 * smoothed_minus_dm / smoothed_tr
 
-    # DX
     di_sum = plus_di + minus_di
     dx = (100 * (plus_di - minus_di).abs() / di_sum).fillna(0)
 
-    # ADX = Wilder smoothing de DX
-    adx = rma(dx, period)
-
+    adx = _rma(dx, period)
     return adx.clip(0, 100)
 
 
@@ -111,89 +118,30 @@ def calcular_sma_atr(atr_series: pd.Series, period: int = 20) -> pd.Series:
     return calcular_sma(atr_series, period)
 
 
+# ---------------------------------------------------------------------------
+# Estrategia multivariable (funciones puras)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
 class EstrategiaMultivariable:
-    """Contenedor para los parámetros de la estrategia multivariable."""
-
-    def __init__(
-        self,
-        precio_actual,
-        ema_9,
-        ema_21,
-        rsi,
-        volumen,
-        volumen_promedio,
-        prev_precio,
-        prev_ema_9,
-        prev_ema_21=None,
-    ):
-        self.precio_actual = precio_actual
-        self.ema_9 = ema_9
-        self.ema_21 = ema_21
-        self.rsi = rsi
-        self.volumen = volumen
-        self.volumen_promedio = volumen_promedio
-        self.prev_precio = prev_precio
-        self.prev_ema_9 = prev_ema_9
-        self.prev_ema_21 = prev_ema_21
-
-
-class FiltrosCuantitativos:
-    """Contenedor para todos los filtros cuantitativos del sistema."""
-    
-    def __init__(self, exchange: ccxt.Exchange, symbol: str = "BTC/USDT"):
-        self.exchange = exchange
-        self.symbol = symbol
-    
-    def obtener_datos_mtf(self, timeframe_superior: str = "1h", limit: int = 200) -> pd.DataFrame:
-        """Obtiene datos del timeframe superior para confirmación MTF."""
-        try:
-            ohlcv = self.exchange.fetch_ohlcv(self.symbol, timeframe_superior, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            return df
-        except Exception as e:
-            print(f"Error obteniendo datos MTF {timeframe_superior}: {e}")
-            return None
-    
-    def confirmar_ema_200_mtf(self, df_mtf: pd.DataFrame) -> bool:
-        """Valida si el precio actual está por encima de EMA 200 en timeframe superior."""
-        if df_mtf is None or len(df_mtf) < 200:
-            return False
-        
-        df_mtf["ema_200"] = calcular_ema(df_mtf["close"], period=200)
-        current_price_mtf = df_mtf["close"].iloc[-1]
-        current_ema_200_mtf = df_mtf["ema_200"].iloc[-1]
-        
-        return current_price_mtf > current_ema_200_mtf
-    
-    def validar_adx_tendencia(self, high: pd.Series, low: pd.Series, close: pd.Series, threshold: float = 25.0) -> bool:
-        """Valida que el mercado está en tendencia (ADX > threshold)."""
-        try:
-            adx = calcular_adx(high, low, close, period=14)
-            current_adx = adx.iloc[-1]
-            return bool(current_adx > threshold) if not pd.isna(current_adx) else False
-        except Exception:
-            return False
-    
-    def validar_volatilidad_relativa(self, atr_series: pd.Series, period: int = 20) -> bool:
-        """Valida que el ATR actual es mayor que la SMA del ATR."""
-        try:
-            sma_atr = calcular_sma_atr(atr_series, period)
-            current_atr = atr_series.iloc[-1]
-            current_sma_atr = sma_atr.iloc[-1]
-            return bool(current_atr > current_sma_atr)
-        except Exception:
-            return False
-    
-    def validar_horario_mercado(self, hora_inicio: int = 13, hora_fin: int = 21) -> bool:
-        """Valida si la hora actual está dentro del rango de máxima liquidez (UTC)."""
-        from datetime import datetime
-        current_hour = datetime.utcnow().hour
-        return hora_inicio <= current_hour < hora_fin
+    """Contenedor inmutable para los parámetros de la estrategia."""
+    precio_actual: float
+    ema_9: float
+    ema_21: float
+    rsi: float
+    volumen: float
+    volumen_promedio: float
+    prev_precio: float
+    prev_ema_9: float
+    prev_ema_21: Optional[float] = None
 
 
 def evaluar_estrategia_multivariable(estrategia: EstrategiaMultivariable) -> str:
-    """Evalúa estrategia multivariable con cruce EMA 9/21, RSI y filtro de volumen."""
-    # Detección de cruce EMA 9 sobre EMA 21 (señal alcista)
+    """Evalúa estrategia multivariable con cruce EMA 9/21, RSI y filtro de volumen.
+
+    Returns:
+        "COMPRA", "VENTA" o "NEUTRAL"
+    """
     cruce_alcista = (
         estrategia.prev_ema_21 is not None
         and estrategia.prev_ema_9 <= estrategia.prev_ema_21
@@ -204,7 +152,6 @@ def evaluar_estrategia_multivariable(estrategia: EstrategiaMultivariable) -> str
     rsi_ok = 30 < estrategia.rsi < 70
     volumen_ok = estrategia.volumen > estrategia.volumen_promedio
 
-    # Detección de cruce bajista EMA 9 bajo EMA 21 (señal de salida)
     cruce_bajista = (
         estrategia.prev_ema_21 is not None
         and estrategia.prev_ema_9 >= estrategia.prev_ema_21
@@ -214,16 +161,112 @@ def evaluar_estrategia_multivariable(estrategia: EstrategiaMultivariable) -> str
     precio_bajo_ema9 = estrategia.precio_actual < estrategia.ema_9
     volumen_ok_venta = estrategia.volumen > estrategia.volumen_promedio * 0.8
 
-    # COMPRA: Cruce alcista EMA 9/21 + precio sobre EMA 9 + RSI + volumen
     if cruce_alcista and tendencia_alcista and precio_sobre_ema9 and rsi_ok and volumen_ok:
         return "COMPRA"
 
-    # VENTA: Cruce bajista EMA 9/21 + precio bajo EMA 9 + volumen
     if cruce_bajista and tendencia_bajista and precio_bajo_ema9 and volumen_ok_venta:
         return "VENTA"
 
     return "NEUTRAL"
 
+
+# ---------------------------------------------------------------------------
+# Resultado de filtros cuantitativos (tipado, sin hardcodes)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ResultadoFiltros:
+    """Resultado tipado de la validación de filtros cuantitativos."""
+    adx_valido: bool
+    ema_mtf_valido: bool
+    horario_valido: bool
+    volatilidad_valida: bool
+
+    @property
+    def todos_validos(self) -> bool:
+        return all([
+            self.adx_valido,
+            self.ema_mtf_valido,
+            self.horario_valido,
+            self.volatilidad_valida,
+        ])
+
+
+def validar_adx(
+    high: pd.Series, low: pd.Series, close: pd.Series, threshold: float = 25.0
+) -> bool:
+    """Valida que el mercado está en tendencia (ADX > threshold)."""
+    try:
+        adx = calcular_adx(high, low, close, period=14)
+        current_adx = adx.iloc[-1]
+        return bool(current_adx > threshold) if not pd.isna(current_adx) else False
+    except Exception:
+        return False
+
+
+def validar_ema_200_mtf(df_mtf: pd.DataFrame, period: int = 200) -> bool:
+    """Valida si el precio actual está por encima de EMA 200 en timeframe superior."""
+    if df_mtf is None or len(df_mtf) < period:
+        return False
+
+    ema_200 = calcular_ema(df_mtf["close"], period=period)
+    current_price_mtf = df_mtf["close"].iloc[-1]
+    current_ema_200 = ema_200.iloc[-1]
+
+    return bool(current_price_mtf > current_ema_200)
+
+
+def validar_volatilidad_relativa(atr_series: pd.Series, period: int = 20) -> bool:
+    """Valida que el ATR actual es mayor que la SMA del ATR (volatilidad alta)."""
+    try:
+        sma_atr = calcular_sma_atr(atr_series, period)
+        current_atr = atr_series.iloc[-1]
+        current_sma_atr = sma_atr.iloc[-1]
+        return bool(current_atr > current_sma_atr) if not pd.isna(current_sma_atr) else False
+    except Exception:
+        return False
+
+
+def validar_horario_mercado(hora_inicio: int = 0, hora_fin: int = 24) -> bool:
+    """Valida si la hora actual UTC está dentro del rango permitido."""
+    current_hour = datetime.now(timezone.utc).hour
+    return hora_inicio <= current_hour < hora_fin
+
+
+def validar_filtros_cuantitativos(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    df_mtf: Optional[pd.DataFrame],
+    atr_series: Optional[pd.Series] = None,
+    adx_threshold: float = 25.0,
+    hora_inicio: int = 0,
+    hora_fin: int = 24,
+) -> ResultadoFiltros:
+    """Evalúa todos los filtros cuantitativos de forma pura y dinámica.
+
+    Returns:
+        ResultadoFiltros con cada condición evaluada (sin hardcodes).
+    """
+    adx_ok = validar_adx(high, low, close, threshold=adx_threshold)
+    ema_mtf_ok = validar_ema_200_mtf(df_mtf)
+    horario_ok = validar_horario_mercado(hora_inicio, hora_fin)
+
+    volatilidad_ok = True
+    if atr_series is not None and len(atr_series) > 0:
+        volatilidad_ok = validar_volatilidad_relativa(atr_series)
+
+    return ResultadoFiltros(
+        adx_valido=adx_ok,
+        ema_mtf_valido=ema_mtf_ok,
+        horario_valido=horario_ok,
+        volatilidad_valida=volatilidad_ok,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cálculos financieros (funciones puras)
+# ---------------------------------------------------------------------------
 
 def calcular_ganancia_con_stoploss(
     precio_venta: float,
@@ -231,19 +274,19 @@ def calcular_ganancia_con_stoploss(
     saldo_btc: float,
     atr: float,
     tipo_salida: str = "TP",
-) -> tuple:
-    """Calcula la ganancia con Stop-Loss/Take-Profit dinámico basado en ATR."""
+) -> Tuple[float, float]:
+    """Calcula la ganancia con Stop-Loss/Take-Profit dinámico basado en ATR.
+
+    Returns:
+        Tupla de (ganancia_usdt, ganancia_porcentaje).
+    """
     if precio_compra <= 0 or saldo_btc <= 0 or atr <= 0:
         return 0.0, 0.0
 
-    # Definir niveles basados en ATR - MÁS CONSERVADORES
-    atr_multiplier_tp = 1.5  # Take-Profit a 1.5 ATRs (reducido de 2.0)
-    atr_multiplier_sl = 1.2  # Stop-Loss a 1.2 ATRs (aumentado de 1.0)
-
     if tipo_salida == "TP":
-        precio_venta_real = precio_compra + (atr * atr_multiplier_tp)
+        precio_venta_real = precio_compra + (atr * 1.5)
     elif tipo_salida == "SL":
-        precio_venta_real = precio_compra - (atr * atr_multiplier_sl)
+        precio_venta_real = precio_compra - (atr * 1.2)
     else:
         precio_venta_real = precio_venta
 
@@ -271,7 +314,7 @@ def validar_profit_factor_minimo(
 
 
 def crear_registro_csv(
-    tipo: str, precio: float, btc: float, usdt: float, ganancias: tuple = (0.0, 0.0)
+    tipo: str, precio: float, btc: float, usdt: float, ganancias: Tuple[float, float] = (0.0, 0.0)
 ) -> dict:
     """Estructura una fila lista para persistir en el historial CSV."""
     ganancia_usdt, ganancia_pct = ganancias
@@ -286,54 +329,3 @@ def crear_registro_csv(
         if tipo == "VENTA"
         else "N/A",
     }
-
-
-# ==========================================
-# MÓDULO DE NOTIFICACIONES TELEGRAM
-# ==========================================
-
-
-def enviar_notificacion_telegram(mensaje: str) -> bool:
-    """Envía un mensaje a Telegram utilizando las variables de entorno de Render."""
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-
-    if not token or not chat_id:
-        return False
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": mensaje, "parse_mode": "Markdown"}
-
-    try:
-        response = requests.post(url, json=payload, timeout=5)
-        return response.status_code == 200
-    except Exception:
-        return False
-
-
-def notificar_operacion_telegram(
-    tipo: str, precio: float, btc: float, usdt: float, ganancias: tuple = (0.0, 0.0)
-):
-    """Genera y envía la alerta visual a Telegram al ejecutar compra/venta."""
-    ganancia_usdt, ganancia_pct = ganancias
-
-    if tipo == "COMPRA":
-        mensaje = (
-            f"🟢 *ORDEN DE COMPRA EJECUTADA*\n\n"
-            f"• *Precio BTC:* ${precio:,.2f}\n"
-            f"• *Monto BTC:* {btc:.6f}\n"
-            f"• *Total USDT:* ${usdt:,.2f}"
-        )
-    elif tipo == "VENTA":
-        mensaje = (
-            f"🔴 *ORDEN DE VENTA EJECUTADA*\n\n"
-            f"• *Precio Venta:* ${precio:,.2f}\n"
-            f"• *Monto BTC:* {btc:.6f}\n"
-            f"• *Total USDT:* ${usdt:,.2f}\n"
-            f"• *Ganancia USDT:* ${ganancia_usdt:,.2f}\n"
-            f"• *Rendimiento:* {ganancia_pct:.2f}%"
-        )
-    else:
-        return
-
-    enviar_notificacion_telegram(mensaje)

@@ -1,4 +1,4 @@
-"""Módulo principal del bot de trading."""
+"""Módulo principal de lógica pura del bot de trading."""
 from .logic import (
     calcular_sma,
     calcular_ema,
@@ -7,12 +7,36 @@ from .logic import (
     calcular_adx,
     calcular_sma_atr,
     EstrategiaMultivariable,
-    FiltrosCuantitativos,
     evaluar_estrategia_multivariable,
+    ResultadoFiltros,
+    validar_adx,
+    validar_ema_200_mtf,
+    validar_volatilidad_relativa,
+    validar_horario_mercado,
+    validar_filtros_cuantitativos,
     calcular_ganancia_con_stoploss,
     calcular_profit_factor,
     validar_profit_factor_minimo,
     crear_registro_csv,
-    notificar_operacion_telegram,
-    enviar_notificacion_telegram,
 )
+
+__all__ = [
+    "calcular_sma",
+    "calcular_ema",
+    "calcular_rsi",
+    "calcular_atr",
+    "calcular_adx",
+    "calcular_sma_atr",
+    "EstrategiaMultivariable",
+    "evaluar_estrategia_multivariable",
+    "ResultadoFiltros",
+    "validar_adx",
+    "validar_ema_200_mtf",
+    "validar_volatilidad_relativa",
+    "validar_horario_mercado",
+    "validar_filtros_cuantitativos",
+    "calcular_ganancia_con_stoploss",
+    "calcular_profit_factor",
+    "validar_profit_factor_minimo",
+    "crear_registro_csv",
+]
