@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
+from logic.logic import calcular_rsi
+
 import pandas as pd
 
 from config import AppConfig, load_config
@@ -41,6 +43,7 @@ from notifications import enviar_notificacion_telegram, notificar_operacion
 # ---------------------------------------------------------------------------
 # Configuración de logging
 # ---------------------------------------------------------------------------
+
 
 def setup_logging(log_level: str = "INFO") -> None:
     """Configura logging estructurado con rotación de archivos."""
@@ -73,6 +76,7 @@ logger = logging.getLogger(__name__)
 # Servidor de salud para Render
 # ---------------------------------------------------------------------------
 
+
 class HealthCheckHandler(BaseHTTPRequestHandler):
     """Handler para el endpoint de salud de Render."""
 
@@ -96,9 +100,11 @@ def start_health_server(port: int) -> None:
 # Estado del bot (sin variables globales)
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class BotState:
     """Estado mutable del bot de trading."""
+
     saldo_usdt: float = 10.00
     saldo_btc: float = 0.0
     precio_compra: float = 0.0
@@ -116,7 +122,10 @@ class BotState:
 # Funciones auxiliares del orquestador
 # ---------------------------------------------------------------------------
 
-def fetch_market_min_order(client: ExchangeClient, symbol: str, default: float = 10.0) -> float:
+
+def fetch_market_min_order(
+    client: ExchangeClient, symbol: str, default: float = 10.0
+) -> float:
     """Obtiene el mínimo de orden del exchange."""
     market_info = client.get_market_info(symbol)
     if market_info and "min_order_usdt" in market_info:
@@ -145,7 +154,9 @@ def evaluar_salida_posicion(
     if state.breakeven_activado:
         state.stop_loss = state.precio_compra
     else:
-        state.stop_loss = state.precio_compra - (state.atr_compra * config.strategy.atr_sl_multiplier)
+        state.stop_loss = state.precio_compra - (
+            state.atr_compra * config.strategy.atr_sl_multiplier
+        )
 
     if not state.breakeven_activado and state.atr_compra > 0:
         ganancia_flotante_atr = (precio_actual - state.precio_compra) / state.atr_compra
@@ -154,7 +165,9 @@ def evaluar_salida_posicion(
             state.stop_loss = state.precio_compra
             if not state.break_even_notificado:
                 state.break_even_notificado = True
-                pnl_pct = ((precio_actual - state.precio_compra) / state.precio_compra) * 100
+                pnl_pct = (
+                    (precio_actual - state.precio_compra) / state.precio_compra
+                ) * 100
                 mensaje = (
                     f"🚨 *TRAILING STOP BREAK-EVEN ACTIVADO*\n\n"
                     f"• Precio Entrada: ${state.precio_compra:.2f}\n"
@@ -197,7 +210,11 @@ def evaluar_salida_posicion(
 
         state.saldo_usdt = state.saldo_btc * precio_actual
         ganancia_usdt, ganancia_pct = calcular_ganancia_con_stoploss(
-            precio_actual, state.precio_compra, state.saldo_btc, state.atr_compra, tipo_salida
+            precio_actual,
+            state.precio_compra,
+            state.saldo_btc,
+            state.atr_compra,
+            tipo_salida,
         )
 
         if ganancia_usdt >= 0:
@@ -257,6 +274,7 @@ def _guardar_csv(registro: dict, csv_file: str) -> None:
 # Bucle principal del bot
 # ---------------------------------------------------------------------------
 
+
 def run_bot() -> None:
     """Bucle principal del bot de trading."""
     config = load_config()
@@ -306,12 +324,14 @@ def run_bot() -> None:
                 df["high"], df["low"], df["close"], period=config.strategy.atr_period
             )
             df["volume_usdt"] = df["volume"] * df["close"]
-            df["volumen_promedio"] = df["volume"].rolling(
-                window=config.strategy.volume_avg_window
-            ).mean()
-            df["volumen_promedio_usdt"] = df["volume_usdt"].rolling(
-                window=config.strategy.volume_avg_window
-            ).mean()
+            df["volumen_promedio"] = (
+                df["volume"].rolling(window=config.strategy.volume_avg_window).mean()
+            )
+            df["volumen_promedio_usdt"] = (
+                df["volume_usdt"]
+                .rolling(window=config.strategy.volume_avg_window)
+                .mean()
+            )
             df["adx"] = calcular_adx(
                 df["high"], df["low"], df["close"], period=config.strategy.adx_period
             )
@@ -404,7 +424,11 @@ def run_bot() -> None:
                 saldo_suficiente = state.saldo_usdt >= state.min_order_usdt
 
                 logger.info("Evaluando filtros para COMPRA:")
-                logger.info("  ADX > %.1f: %s", config.strategy.adx_threshold, filtros.adx_valido)
+                logger.info(
+                    "  ADX > %.1f: %s",
+                    config.strategy.adx_threshold,
+                    filtros.adx_valido,
+                )
                 logger.info("  MTF EMA 200: %s", filtros.ema_mtf_valido)
                 logger.info("  Horario: %s", filtros.horario_valido)
                 logger.info("  Volatilidad: %s", filtros.volatilidad_valida)
@@ -441,10 +465,14 @@ def run_bot() -> None:
                 state.saldo_usdt = 0.0
                 state.breakeven_activado = False
                 state.break_even_notificado = False
-                state.stop_loss = current_price - (current_atr * config.strategy.atr_sl_multiplier)
+                state.stop_loss = current_price - (
+                    current_atr * config.strategy.atr_sl_multiplier
+                )
                 state.hora_compra = time.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-                reg = crear_registro_csv("COMPRA", current_price, state.saldo_btc, monto_usdt)
+                reg = crear_registro_csv(
+                    "COMPRA", current_price, state.saldo_btc, monto_usdt
+                )
                 _guardar_csv(reg, config.csv_file)
 
                 notificar_operacion(
@@ -483,6 +511,7 @@ def run_bot() -> None:
 # Punto de entrada
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     """Punto de entrada principal del bot."""
     config = load_config()
@@ -490,6 +519,7 @@ def main() -> None:
 
     logger.info("Detectando entorno...")
     import os
+
     if "RENDER" in os.environ or "RENDER_EXTERNAL_URL" in os.environ:
         os.environ["USE_DEMO_ACCOUNT"] = "true"
         os.environ["MODO_SIMULACION"] = "true"
