@@ -39,11 +39,14 @@ def _get_env_float(key: str, default: float = 0.0) -> float:
 @dataclass(frozen=True)
 class ExchangeConfig:
     """Configuración del exchange de trading."""
+
     exchange_id: str = field(default_factory=lambda: _get_env("EXCHANGE_ID", "binance"))
     api_key: str = field(default_factory=lambda: _get_env("BINANCE_API_KEY_REAL"))
     api_secret: str = field(default_factory=lambda: _get_env("BINANCE_SECRET_KEY_REAL"))
     api_key_demo: str = field(default_factory=lambda: _get_env("BINANCE_API_KEY_DEMO"))
-    api_secret_demo: str = field(default_factory=lambda: _get_env("BINANCE_SECRET_KEY_DEMO"))
+    api_secret_demo: str = field(
+        default_factory=lambda: _get_env("BINANCE_SECRET_KEY_DEMO")
+    )
     use_demo: bool = field(default_factory=lambda: _get_env_bool("USE_DEMO_ACCOUNT"))
     enable_rate_limit: bool = True
     default_type: str = "spot"
@@ -52,6 +55,8 @@ class ExchangeConfig:
 @dataclass(frozen=True)
 class TradingConfig:
     """Parámetros de trading y estrategia."""
+
+    loop_interval_seconds: int = 60
     symbol: str = "BTC/USDT"
     timeframe: str = "1m"
     timeframe_mtf: str = "1h"
@@ -59,12 +64,15 @@ class TradingConfig:
     limit_mtf: int = 200
     min_order_usdt: float = 10.0
     initial_balance_usdt: float = 10.00
-    simulation_mode: bool = field(default_factory=lambda: _get_env_bool("MODO_SIMULACION"))
+    simulation_mode: bool = field(
+        default_factory=lambda: _get_env_bool("MODO_SIMULACION")
+    )
 
 
 @dataclass(frozen=True)
 class StrategyConfig:
     """Parámetros de la estrategia multivariable."""
+
     ema_fast: int = 9
     ema_slow: int = 21
     ema_mtf_period: int = 200
@@ -83,16 +91,20 @@ class StrategyConfig:
 @dataclass(frozen=True)
 class TelegramConfig:
     """Configuración de notificaciones Telegram."""
+
     token: str = field(default_factory=lambda: _get_env("TELEGRAM_TOKEN"))
     chat_id: str = field(default_factory=lambda: _get_env("TELEGRAM_CHAT_ID"))
     enabled: bool = field(
-        default_factory=lambda: bool(_get_env("TELEGRAM_TOKEN")) and bool(_get_env("TELEGRAM_CHAT_ID"))
+        default_factory=lambda: (
+            bool(_get_env("TELEGRAM_TOKEN")) and bool(_get_env("TELEGRAM_CHAT_ID"))
+        )
     )
 
 
 @dataclass(frozen=True)
 class AppConfig:
     """Configuración general de la aplicación."""
+
     health_check_port: int = field(default_factory=lambda: _get_env_int("PORT", 10000))
     log_level: str = field(default_factory=lambda: _get_env("LOG_LEVEL", "INFO"))
     csv_file: str = "historial_trading.csv"
