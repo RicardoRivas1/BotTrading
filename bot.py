@@ -13,9 +13,11 @@ Los fallos de red se capturan por módulo y se registran con loguru.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from typing import Optional
 
+from aiohttp import web
 from loguru import logger
 
 from config import AppConfig, load_config
@@ -28,6 +30,17 @@ from core.notifier import TelegramNotifier
 logger.remove()
 logger.add(sys.stdout, level="INFO", colorize=True)
 logger.add("bot_memecoin.log", rotation="5 MB", retention=3, level="DEBUG")
+
+
+async def start_health_server() -> None:
+    """Servidor HTTP de salud para el port scan de Render."""
+    app = web.Application()
+    app.router.add_get("/", lambda _: web.Response(text="Bot running"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
 
 
 class MemecoinBot:
@@ -163,6 +176,7 @@ async def main() -> None:
     bot = MemecoinBot(config)
 
     try:
+        asyncio.create_task(start_health_server())
         await bot.run()
     except KeyboardInterrupt:
         pass
