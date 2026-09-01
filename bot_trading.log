@@ -1,0 +1,23 @@
+2026-08-29 20:09:06 | INFO     | __main__ | Detectando entorno...
+2026-08-29 20:09:06 | INFO     | __main__ | Iniciando bot de trading...
+2026-08-29 20:09:06 | INFO     | data | Exchange inicializado: Binance (cuenta real)
+2026-08-29 20:09:06 | WARNING  | data | No se pudo obtener info del mercado para BTC/USDT: binance markets not loaded
+2026-08-29 20:09:06 | INFO     | __main__ | Usando mínimo de orden default: $10.00 USDT
+2026-08-29 20:09:06 | INFO     | __main__ | Bot iniciado correctamente
+2026-08-29 20:09:06 | INFO     | __main__ | Estrategia: Cruce EMA 9/21 + RSI + Volumen + ADX + MTF + Trailing Stop
+2026-08-29 20:09:06 | INFO     | __main__ | Mínimo de orden: $10.00 USDT
+2026-08-29 20:09:06 | INFO     | __main__ | Servidor HTTP de salud activo en puerto 10000
+2026-08-29 20:09:12 | INFO     | __main__ | --- Estado del mercado ---
+2026-08-29 20:09:12 | INFO     | __main__ | Precio: $78196.00 (real: $78196.00) | EMA 9: $78206.74 | EMA 21: $78221.20
+2026-08-29 20:09:12 | INFO     | __main__ | RSI: 18.6 | ATR: $7.00 | ADX: 22.4 | Vol: $105553
+2026-08-29 20:09:12 | INFO     | __main__ | Billetera: $10.00 USDT | 0.0000 BTC
+2026-08-29 20:09:12 | INFO     | __main__ | Filtros: ADX=False, MTF=False, Horario=True, Volatilidad=False
+2026-08-29 20:09:12 | INFO     | __main__ | Profit Factor: 1.00
+2026-08-29 20:09:12 | INFO     | __main__ | Mercado NEUTRAL - sin señal clara
+2026-08-29 20:10:12 | INFO     | __main__ | --- Estado del mercado ---
+2026-08-29 20:10:12 | INFO     | __main__ | Precio: $78172.65 (real: $78172.65) | EMA 9: $78198.33 | EMA 21: $78215.96
+2026-08-29 20:10:12 | INFO     | __main__ | RSI: 14.1 | ATR: $8.67 | ADX: 24.4 | Vol: $170496
+2026-08-29 20:10:12 | INFO     | __main__ | Billetera: $10.00 USDT | 0.0000 BTC
+2026-08-29 20:10:12 | INFO     | __main__ | Filtros: ADX=False, MTF=False, Horario=True, Volatilidad=False
+2026-08-29 20:10:12 | INFO     | __main__ | Profit Factor: 1.00
+2026-08-29 20:10:12 | INFO     | __main__ | Mercado NEUTRAL - sin señal clara

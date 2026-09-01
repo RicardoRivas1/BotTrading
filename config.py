@@ -1,122 +1,104 @@
-"""Configuración centralizada del bot de trading con validación de tipos."""
+"""Configuración centralizada del bot de memecoins en Solana.
 
-from dataclasses import dataclass, field
-import os
-from dotenv import load_dotenv
+Usa Pydantic Settings para validar y cargar variables de entorno de forma
+tipada y segura. Nunca se ejecuta sin que todas las credenciales estén
+definidas.
+"""
 
-load_dotenv()
+from __future__ import annotations
 
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-def _get_env(key: str, default: str = "", required: bool = False) -> str:
-    """Obtiene una variable de entorno con validación opcional."""
-    value = os.getenv(key, default)
-    if required and not value:
-        raise ValueError(f"Variable de entorno requerida no encontrada: {key}")
-    return value
-
-
-def _get_env_bool(key: str, default: bool = False) -> bool:
-    """Obtiene una variable de entorno booleana."""
-    return os.getenv(key, str(default)).lower() in ("true", "1", "yes")
-
-
-def _get_env_int(key: str, default: int = 0) -> int:
-    """Obtiene una variable de entorno entera."""
-    try:
-        return int(os.getenv(key, str(default)))
-    except ValueError:
-        return default
+# Configuración base compartida por todas las clases de settings.
+# `extra="ignore"` permite que el .env contenga variables adicionales (p. ej.
+# de otra herramienta) sin lanzar errores de validación (extra_forbidden).
+# Con `env_prefix=""` los campos se mapean directamente por su nombre en mayúsculas.
+BASE_SETTINGS = SettingsConfigDict(
+    env_prefix="",
+    env_file=".env",
+    env_file_encoding="utf-8",
+    extra="ignore",
+)
 
 
-def _get_env_float(key: str, default: float = 0.0) -> float:
-    """Obtiene una variable de entorno flotante."""
-    try:
-        return float(os.getenv(key, str(default)))
-    except ValueError:
-        return default
+class SolanaSettings(BaseSettings):
+    """Parámetros de conexión a la red Solana."""
+
+    model_config = BASE_SETTINGS
+
+    HELIUS_RPC_URL: str = Field(..., description="URL HTTP(S) del RPC de Helius")
+    HELIUS_WS_URL: str = Field(..., description="URL WebSocket del RPC de Helius")
+    PRIVATE_KEY: str = Field(..., description="Clave privada de la wallet en Base58 o mnemonic (12/24 palabras)")
 
 
-@dataclass(frozen=True)
-class ExchangeConfig:
-    """Configuración del exchange de trading."""
+class TradingSettings(BaseSettings):
+    """Parámetros de ejecución de trades."""
 
-    exchange_id: str = field(default_factory=lambda: _get_env("EXCHANGE_ID", "binance"))
-    api_key: str = field(default_factory=lambda: _get_env("BINANCE_API_KEY_REAL"))
-    api_secret: str = field(default_factory=lambda: _get_env("BINANCE_SECRET_KEY_REAL"))
-    api_key_demo: str = field(default_factory=lambda: _get_env("BINANCE_API_KEY_DEMO"))
-    api_secret_demo: str = field(
-        default_factory=lambda: _get_env("BINANCE_SECRET_KEY_DEMO")
+    model_config = BASE_SETTINGS
+
+    BUY_AMOUNT_SOL: float = Field(default=0.05, gt=0, description="Monto fijo por compra en SOL")
+    SLIPPAGE_BPS: int = Field(default=500, ge=1, le=10000, description="Slippage máximo en basis points")
+    AUTO_SELL: bool = Field(default=True, description="Si vende automáticamente tras take-profit/stop-loss")
+    TAKE_PROFIT_PCT: float = Field(default=100.0, gt=0, description="Ganancia objetivo: +100%")
+    STOP_LOSS_PCT: float = Field(default=30.0, gt=0, description="Límite de pérdida: -30%")
+    TRAILING_STOP_ACTIVATION_PCT: float = Field(
+        default=20.0, gt=0, description="Ganancia mínima para activar el trailing stop: +20%"
     )
-    use_demo: bool = field(default_factory=lambda: _get_env_bool("USE_DEMO_ACCOUNT"))
-    enable_rate_limit: bool = True
-    default_type: str = "spot"
-
-
-@dataclass(frozen=True)
-class TradingConfig:
-    """Parámetros de trading y estrategia."""
-
-    loop_interval_seconds: int = 60
-    symbol: str = "BTC/USDT"
-    timeframe: str = "1m"
-    timeframe_mtf: str = "1h"
-    limit_ohlcv: int = 100
-    limit_mtf: int = 200
-    min_order_usdt: float = 10.0
-    initial_balance_usdt: float = 10.00
-    simulation_mode: bool = field(
-        default_factory=lambda: _get_env_bool("MODO_SIMULACION")
+    TRAILING_STOP_DISTANCE_PCT: float = Field(
+        default=15.0, gt=0, description="Distancia de retroceso tolerada desde el máximo: -15%"
     )
+    MAX_SOL_BALANCE: float = Field(default=1.0, gt=0, description="Máximo SOL a invertir por operación")
+    DRY_RUN: bool = Field(default=True, description="Si True, no ejecuta transacciones reales (simulación)")
 
 
-@dataclass(frozen=True)
-class StrategyConfig:
-    """Parámetros de la estrategia multivariable."""
+class SecuritySettings(BaseSettings):
+    """Umbrales de validación de seguridad para tokens."""
 
-    ema_fast: int = 9
-    ema_slow: int = 21
-    ema_mtf_period: int = 200
-    rsi_period: int = 14
-    rsi_buy_min: float = 30.0
-    rsi_buy_max: float = 70.0
-    atr_period: int = 14
-    atr_sl_multiplier: float = 1.2
-    atr_tp_multiplier: float = 1.5
-    adx_period: int = 14
-    adx_threshold: float = 25.0
-    volume_avg_window: int = 20
-    trailing_be_threshold_atr: float = 0.5
+    model_config = BASE_SETTINGS
+
+    RUGCHECK_MAX_SCORE: int = Field(default=1500, ge=0, description="Score máximo aceptable de RugCheck")
+    DEV_MAX_SUPPLY_PCT: float = Field(default=10.0, ge=0, le=100, description="% máximo del supply que puede tener el Dev")
+    REQUIRE_MINT_RENOUNCED: bool = Field(default=True, description="Rechazar si Mint authority no está renunciada")
+    REQUIRE_FREEZE_RENOUNCED: bool = Field(default=True, description="Rechazar si Freeze authority no está renunciada")
 
 
-@dataclass(frozen=True)
-class TelegramConfig:
-    """Configuración de notificaciones Telegram."""
+class TelegramSettings(BaseSettings):
+    """Credenciales de Telegram para alertas."""
 
-    token: str = field(default_factory=lambda: _get_env("TELEGRAM_TOKEN"))
-    chat_id: str = field(default_factory=lambda: _get_env("TELEGRAM_CHAT_ID"))
-    enabled: bool = field(
-        default_factory=lambda: (
-            bool(_get_env("TELEGRAM_TOKEN")) and bool(_get_env("TELEGRAM_CHAT_ID"))
-        )
-    )
+    model_config = BASE_SETTINGS
+
+    TELEGRAM_TOKEN: str = Field(default="", description="Token del bot de Telegram")
+    TELEGRAM_CHAT_ID: str = Field(default="", description="Chat ID de destino")
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.TELEGRAM_TOKEN) and bool(self.TELEGRAM_CHAT_ID)
 
 
-@dataclass(frozen=True)
+class BotSettings(BaseSettings):
+    """Comportamiento general del bot."""
+
+    model_config = BASE_SETTINGS
+
+    LOG_LEVEL: str = Field(default="INFO", description="Nivel de logging")
+    POLL_INTERVAL_SECONDS: float = Field(default=2.0, gt=0, description="Intervalo entre ciclos del bot")
+
+
 class AppConfig:
-    """Configuración general de la aplicación."""
+    """Contenedor de configuración agrupado.
 
-    health_check_port: int = field(default_factory=lambda: _get_env_int("PORT", 10000))
-    log_level: str = field(default_factory=lambda: _get_env("LOG_LEVEL", "INFO"))
-    csv_file: str = "historial_trading.csv"
-    loop_interval_seconds: int = 60
-    error_interval_seconds: int = 10
+    Carga todos los sub‑conjuntos desde el mismo .env de forma independiente.
+    """
 
-    exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
-    trading: TradingConfig = field(default_factory=TradingConfig)
-    strategy: StrategyConfig = field(default_factory=StrategyConfig)
-    telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    def __init__(self) -> None:
+        self.solana = SolanaSettings()
+        self.trading = TradingSettings()
+        self.security = SecuritySettings()
+        self.telegram = TelegramSettings()
+        self.bot = BotSettings()
 
 
 def load_config() -> AppConfig:
-    """Carga y valida la configuración completa desde variables de entorno."""
+    """Factory que construye y valida la configuración completa."""
     return AppConfig()

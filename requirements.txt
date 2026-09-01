@@ -3,3 +3,10 @@ python-dotenv
 pandas
 ta
 requests
+pydantic
+pydantic-settings
+aiohttp
+loguru
+solders
+solana
+base58
