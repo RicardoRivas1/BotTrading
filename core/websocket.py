@@ -22,6 +22,10 @@ PUMP_PORTAL_WS = "wss://pumpportal.fun/api/data"
 # Heartbeat: ping cada X segundos si el servidor no envía datos.
 _HEARTBEAT_SECONDS = 30.0
 
+# Timeout de recepción: si no llega ningún token en este tiempo, se considera
+# el feed inactivo y se fuerza la reconexión (watchdog).
+_RECEIVE_TIMEOUT_SECONDS = 60.0
+
 # Backoff exponencial de reconexión (segundos).
 _RECONNECT_MIN = 1.0
 _RECONNECT_MAX = 60.0
@@ -53,6 +57,7 @@ class TokenWebSocket:
             async with session.ws_connect(
                 self.uri,
                 heartbeat=_HEARTBEAT_SECONDS,
+                receive_timeout=_RECEIVE_TIMEOUT_SECONDS,
                 ssl=False,
                 max_msg_size=8 * 1024 * 1024,
             ) as ws:
@@ -62,6 +67,10 @@ class TokenWebSocket:
                 # Suscripción a eventos de creación de nuevos tokens.
                 await ws.send_str(json.dumps({"op": "subscribeNewToken"}))
                 logger.info("Suscrito exitosamente al feed de nuevos tokens (subscribeNewToken).")
+
+                # Watchdog: si no llega ningún token en _RECEIVE_TIMEOUT_SECONDS,
+                # la conexión se considera inactiva y se fuerza la reconexión.
+                last_token_at: float = asyncio.get_event_loop().time()
 
                 async for raw in ws:
                     if not self.running:
@@ -74,10 +83,17 @@ class TokenWebSocket:
 
                     mint = payload.get("mint") or payload.get("token", {}).get("mint")
                     if payload.get("type") in ("tokenCreation", "create"):
-                        # Log breve en tiempo real para confirmar la recepción.
-                        logger.debug(f"Nuevo token detectado: {mint}")
+                        # Log en tiempo real para confirmar la recepción de cada token.
+                        logger.info(f"📥 Token detectado: {mint}")
+                        last_token_at = asyncio.get_event_loop().time()
                         # No bloquea: la cola es interna e ilimitada.
                         self._queue.put_nowait(payload)
+
+                    # Watchdog: si han pasado más de 60s desde el último token,
+                    # cerrar la conexión para forzar una reconexión y re-suscripción.
+                    if asyncio.get_event_loop().time() - last_token_at >= _RECEIVE_TIMEOUT_SECONDS:
+                        logger.warning("⚠️ WebSocket inactivo por 60s. Reconectando...")
+                        break
 
     async def run(self) -> None:
         """Bucle principal con reconexión automática infinita."""

@@ -10,6 +10,7 @@ asíncrona: nunca se bloquea el event loop de asyncio.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import Any, Optional
 
@@ -138,29 +139,29 @@ class TokenSecurityValidator:
 
         # 1) Score RugCheck mayor al umbral -> rechazar.
         if score > self.security.RUGCHECK_MAX_SCORE:
-            raise SecurityValidationError(
-                f"RugCheck score {score} > max {self.security.RUGCHECK_MAX_SCORE}"
-            )
+            reason = f"RugCheck score {score} > max {self.security.RUGCHECK_MAX_SCORE}"
+            logger.info(f"❌ Token {mint} DESCARTADO (Score: {score} | Razón: {reason})")
+            raise SecurityValidationError(reason)
 
         # 2) Mint authority no renunciada -> rechazar.
         if self.security.REQUIRE_MINT_RENOUNCED and mint_auth is not None:
-            raise SecurityValidationError(
-                f"Mint authority no renunciada: {mint_auth}"
-            )
+            reason = f"Mint authority no renunciada: {mint_auth}"
+            logger.info(f"❌ Token {mint} DESCARTADO (Score: {score} | Razón: {reason})")
+            raise SecurityValidationError(reason)
 
         # 3) Freeze authority no renunciada -> rechazar.
         if self.security.REQUIRE_FREEZE_RENOUNCED and freeze_auth is not None:
-            raise SecurityValidationError(
-                f"Freeze authority no renunciada: {freeze_auth}"
-            )
+            reason = f"Freeze authority no renunciada: {freeze_auth}"
+            logger.info(f"❌ Token {mint} DESCARTADO (Score: {score} | Razón: {reason})")
+            raise SecurityValidationError(reason)
 
         # 4) Dev con más del umbral de supply -> rechazar.
         if dev_pct > self.security.DEV_MAX_SUPPLY_PCT:
-            raise SecurityValidationError(
-                f"Dev posee {dev_pct:.1f}% del supply (> {self.security.DEV_MAX_SUPPLY_PCT:.0f}%)"
-            )
+            reason = f"Dev posee {dev_pct:.1f}% del supply (> {self.security.DEV_MAX_SUPPLY_PCT:.0f}%)"
+            logger.info(f"❌ Token {mint} DESCARTADO (Score: {score} | Razón: {reason})")
+            raise SecurityValidationError(reason)
 
-        logger.success("Token {} es seguro (score={}, dev={:.1f}%)", mint, score, dev_pct)
+        logger.info(f"✅ Token {mint} APROBADO (Score: {score})")
         return True
 
 
