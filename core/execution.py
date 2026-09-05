@@ -229,17 +229,29 @@ class JupiterExecutor:
         raise SwapExecutionError(f"Formato de transacción no soportado: {type(raw_tx)}")
 
     # ------------------------------------------------------------ Public
-    async def buy_token(self, token_mint: str) -> Signature:
+    async def buy_token(self, token_mint: str, dry_run: Optional[bool] = None) -> Signature | str:
         """Compra un token usando BUY_AMOUNT_SOL de SOL.
+
+        Si `dry_run` es True (o si el executor está en simulación), no envía
+        ninguna transacción real: solo obtiene la cotización de Jupiter, registra
+        la posición simulada y devuelve la cadena "DRY_RUN" como firma sintética.
 
         Registra la posición abierta con su precio de entrada y el peak inicial.
         """
+        simulate = self.dry_run if dry_run is None else dry_run
         amount_lamports = int(self.buy_amount_sol * 1_000_000_000)
         async with aiohttp.ClientSession() as session:
             quote = await self._get_quote(
                 session, SOL_MINT, token_mint, amount_lamports
             )
-            sig = await self._build_and_send_swap(session, quote)
+            if simulate:
+                logger.info(
+                    "[DRY_RUN] Compra simulada de {} | Monto: {} SOL",
+                    token_mint, self.buy_amount_sol,
+                )
+                sig: Signature | str = "DRY_RUN"
+            else:
+                sig = await self._build_and_send_swap(session, quote)
 
         # Estimamos precio de entrada: 1 SOL / cantidad de tokens recibidos.
         out_amount = float(

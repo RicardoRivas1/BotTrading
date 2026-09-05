@@ -81,19 +81,35 @@ class TokenSecurityValidator:
 
     # -------------------------------------------------------------- RugCheck
     async def _fetch_rugcheck(self, session: aiohttp.ClientSession, mint: str) -> Optional[dict[str, Any]]:
-        """Obtiene el reporte de riesgo completo de RugCheck."""
+        """Obtiene el reporte de riesgo completo de RugCheck.
+
+        Cualquier fallo de la API (timeout, rate limit 429, HTTP != 200 o una
+        excepción de red) se registra con el mensaje estandarizado de error y
+        se devuelve None para que el token se trate de forma conservadora.
+        """
         url = f"{RUGCHECK_API}/{mint}/report"
+        timeout = aiohttp.ClientTimeout(total=15)
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, timeout=timeout) as resp:
+                if resp.status == 429:
+                    logger.error(
+                        f"⚠️ Error al consultar RugCheck para {mint}: rate limit (HTTP 429)"
+                    )
+                    return None
                 if resp.status == 404:
                     logger.warning("RugCheck no encontró reporte para {}", mint)
                     return None
                 if resp.status != 200:
-                    logger.warning("RugCheck status {} para {}", resp.status, mint)
+                    logger.error(
+                        f"⚠️ Error al consultar RugCheck para {mint}: HTTP {resp.status}"
+                    )
                     return None
                 return await resp.json()
+        except asyncio.TimeoutError:
+            logger.error(f"⚠️ Error al consultar RugCheck para {mint}: timeout")
+            return None
         except aiohttp.ClientError as exc:
-            logger.error("Error HTTP en RugCheck para {}: {}", mint, exc)
+            logger.error(f"⚠️ Error al consultar RugCheck para {mint}: {exc}")
             return None
 
     def _rugcheck_score(self, report: Optional[dict[str, Any]]) -> int:
@@ -139,8 +155,11 @@ class TokenSecurityValidator:
 
         # 1) Score RugCheck mayor al umbral -> rechazar.
         if score > self.security.RUGCHECK_MAX_SCORE:
+            logger.info(
+                f"❌ Token {mint} rechazado por RugCheck | "
+                f"Score actual: {score} (Máximo permitido: {self.security.RUGCHECK_MAX_SCORE})"
+            )
             reason = f"RugCheck score {score} > max {self.security.RUGCHECK_MAX_SCORE}"
-            logger.info(f"❌ Token {mint} DESCARTADO (Score: {score} | Razón: {reason})")
             raise SecurityValidationError(reason)
 
         # 2) Mint authority no renunciada -> rechazar.

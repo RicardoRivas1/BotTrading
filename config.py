@@ -50,6 +50,14 @@ class TradingSettings(BaseSettings):
     )
     MAX_SOL_BALANCE: float = Field(default=1.0, gt=0, description="Máximo SOL a invertir por operación")
     DRY_RUN: bool = Field(default=True, description="Si True, no ejecuta transacciones reales (simulación)")
+    FORCE_TEST_BUY: bool = Field(
+        default=False,
+        description=(
+            "Modo diagnóstico (TEST_MODE): si True, el PRIMER token que llegue por "
+            "el WebSocket omite la validación de RugCheck, ejecuta una compra simulada "
+            "en Jupiter y envía la alerta a Telegram. Después vuelve a False."
+        ),
+    )
 
 
 class SecuritySettings(BaseSettings):

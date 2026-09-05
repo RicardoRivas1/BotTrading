@@ -76,6 +76,32 @@ class MemecoinBot:
         """Flujo completo: validar -> comprar si es seguro."""
         logger.info("Procesando nuevo token: {}", mint)
 
+        # Modo diagnóstico (TEST_MODE): si FORCE_TEST_BUY está activo, el primer
+        # token que llegue por el WebSocket omite la validación de RugCheck,
+        # ejecuta una compra simulada en Jupiter, notifica a Telegram y resetea
+        # el flag. Se limpia de forma síncrona para que ningún otro token
+        # concurrente pueda volver a dispararlo.
+        if self.config.trading.FORCE_TEST_BUY:
+            self.config.trading.FORCE_TEST_BUY = False
+            logger.warning(
+                "🧪 TEST_MODE activo: comprando {} saltando la validación de RugCheck. "
+                "FORCE_TEST_BUY vuelto a False.",
+                mint,
+            )
+            try:
+                sig = await self.executor.buy_token(mint, dry_run=True)
+            except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
+                logger.error("Error comprando {} (TEST_MODE): {}", mint, exc)
+                await self.notifier.send_error(f"No se pudo comprar {mint}: {exc}")
+                return
+
+            await self.notifier.send_buy(
+                mint,
+                self.config.trading.BUY_AMOUNT_SOL,
+            )
+            logger.success("Compra de prueba (TEST_MODE) de {} ejecutada: {}", mint, sig)
+            return
+
         # Paso 1: Seguridad. Cualquier rechazo se registra y se descarta.
         try:
             is_safe = await self.validator.is_token_safe(mint)
