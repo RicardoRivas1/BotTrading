@@ -31,6 +31,14 @@ _RECEIVE_TIMEOUT_SECONDS = 30.0
 # no saturar la red y evitar que el upstream nos banea por reintentos en ráfaga.
 _ERROR_502_RETRY_SECONDS = 10.0
 
+# Espera antes de reintentar la suscripción cuando el servidor responde con un
+# mensaje de error (clave 'errors') dentro de una conexión ya establecida.
+_ERROR_RESUBSCRIBE_SECONDS = 5.0
+
+# Payload oficial de suscripción al feed de nuevos tokens de PumpPortal.
+# Solo se usa la clave soportada 'method' (sin 'op' ni 'action').
+_SUBSCRIBE_PAYLOAD = {"method": "subscribeNewToken"}
+
 # User-Agent de navegador para eludir bloqueos básicos de Cloudflare.
 _USER_AGENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -78,8 +86,8 @@ class TokenWebSocket:
                 logger.info("Conectado al WebSocket: {}", self.uri)
                 self.retry_delay = _RECONNECT_MIN
 
-                # Suscripción a eventos de creación de nuevos tokens.
-                await ws.send_json({"op": "subscribeNewToken"})
+                # Suscripción a eventos de creación de nuevos tokens (payload oficial).
+                await ws.send_json(_SUBSCRIBE_PAYLOAD)
                 logger.info("Suscrito exitosamente al feed de nuevos tokens (subscribeNewToken).")
 
                 # Watchdog: si no llega ningún token en _RECEIVE_TIMEOUT_SECONDS,
@@ -98,8 +106,26 @@ class TokenWebSocket:
                         logger.warning("Mensaje JSON inválido recibido, ignorando.")
                         continue
 
+                    # Control de errores en respuestas raw: si el servidor responde
+                    # con la clave 'errors' (p. ej. {"errors": "..."}), lo registramos
+                    # y reintentamos la suscripción tras _ERROR_RESUBSCRIBE_SECONDS.
+                    if "errors" in payload:
+                        logger.error(
+                            "⚠️ Error del WebSocket de PumpPortal: {}", payload.get("errors")
+                        )
+                        logger.warning(
+                            f"Reintentando suscripción en {_ERROR_RESUBSCRIBE_SECONDS:.0f}s..."
+                        )
+                        await asyncio.sleep(_ERROR_RESUBSCRIBE_SECONDS)
+                        await ws.send_json(_SUBSCRIBE_PAYLOAD)
+                        logger.info("Suscrito nuevamente al feed de nuevos tokens (subscribeNewToken).")
+                        last_token_at = asyncio.get_event_loop().time()
+                        continue
+
                     mint = payload.get("mint") or payload.get("token", {}).get("mint")
                     if payload.get("type") in ("tokenCreation", "create"):
+                        # Información válida de token: se encola para que el bot
+                        # continúe con la evaluación de RugCheck y filtros de seguridad.
                         # Log en tiempo real para confirmar la recepción de cada token.
                         logger.info(f"📥 Token detectado: {mint}")
                         last_token_at = asyncio.get_event_loop().time()
