@@ -9,7 +9,6 @@ sin detener el bucle de eventos de asyncio.
 from __future__ import annotations
 
 import asyncio
-import json
 from typing import Any, AsyncIterator, Optional
 
 import aiohttp
@@ -19,12 +18,21 @@ from loguru import logger
 # Endpoint público de PumpPortal para escuchar tokens/liquidez nuevos.
 PUMP_PORTAL_WS = "wss://pumpportal.fun/api/data"
 
-# Heartbeat: ping cada X segundos si el servidor no envía datos.
-_HEARTBEAT_SECONDS = 30.0
+# Heartbeat: ping cada X segundos si el servidor no envía datos. Mantiene la
+# tubería abierta a través de proxies (Cloudflare/Render) que cierran
+# conexiones consideradas ociosas.
+_HEARTBEAT_SECONDS = 15.0
 
 # Timeout de recepción: si no llega ningún token en este tiempo, se considera
 # el feed inactivo y se fuerza la reconexión (watchdog).
-_RECEIVE_TIMEOUT_SECONDS = 60.0
+_RECEIVE_TIMEOUT_SECONDS = 30.0
+
+# Reintento fijo para errores 502/503 (proxy/Cloudflare): espera prudente para
+# no saturar la red y evitar que el upstream nos banea por reintentos en ráfaga.
+_ERROR_502_RETRY_SECONDS = 10.0
+
+# User-Agent de navegador para eludir bloqueos básicos de Cloudflare.
+_USER_AGENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 # Backoff exponencial de reconexión (segundos).
 _RECONNECT_MIN = 1.0
@@ -56,8 +64,14 @@ class TokenWebSocket:
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(
                 self.uri,
+                # Keep-alive: pings cada 15s para mantener la tubería abierta
+                # de forma activa en el proxy de Render/Cloudflare.
                 heartbeat=_HEARTBEAT_SECONDS,
+                # Si en 30s no llega ningún dato, aiohttp fuerza TimeoutError y
+                # gatea la reconexión sin esperar al watchdog.
                 receive_timeout=_RECEIVE_TIMEOUT_SECONDS,
+                # User-Agent de navegador para evitar bloqueos básicos.
+                headers=_USER_AGENT_HEADERS,
                 ssl=False,
                 max_msg_size=8 * 1024 * 1024,
             ) as ws:
@@ -65,7 +79,7 @@ class TokenWebSocket:
                 self.retry_delay = _RECONNECT_MIN
 
                 # Suscripción a eventos de creación de nuevos tokens.
-                await ws.send_str(json.dumps({"op": "subscribeNewToken"}))
+                await ws.send_json({"op": "subscribeNewToken"})
                 logger.info("Suscrito exitosamente al feed de nuevos tokens (subscribeNewToken).")
 
                 # Watchdog: si no llega ningún token en _RECEIVE_TIMEOUT_SECONDS,
@@ -75,6 +89,9 @@ class TokenWebSocket:
                 async for raw in ws:
                     if not self.running:
                         break
+                    # Log de depuración: muestra CUALQUIER paquete recibido para
+                    # confirmar que el feed sigue fluyendo en tiempo real (msg.data[:100]).
+                    logger.info("📩 Evento raw recibido: {}", raw.data[:100])
                     try:
                         payload: dict[str, Any] = raw.json()
                     except (TypeError, ValueError):
@@ -89,10 +106,13 @@ class TokenWebSocket:
                         # No bloquea: la cola es interna e ilimitada.
                         self._queue.put_nowait(payload)
 
-                    # Watchdog: si han pasado más de 60s desde el último token,
-                    # cerrar la conexión para forzar una reconexión y re-suscripción.
+                    # Watchdog: si han pasado más de _RECEIVE_TIMEOUT_SECONDS desde
+                    # el último token, cerrar la conexión para forzar una reconexión
+                    # y re-suscripción.
                     if asyncio.get_event_loop().time() - last_token_at >= _RECEIVE_TIMEOUT_SECONDS:
-                        logger.warning("⚠️ WebSocket inactivo por 60s. Reconectando...")
+                        logger.warning(
+                            f"⚠️ WebSocket inactivo por {_RECEIVE_TIMEOUT_SECONDS:.0f}s. Reconectando..."
+                        )
                         break
 
     async def run(self) -> None:
@@ -103,6 +123,17 @@ class TokenWebSocket:
             except asyncio.CancelledError:
                 logger.info("Listener cancelado.")
                 break
+            except aiohttp.WSServerHandshakeError as exc:
+                # Handshakes HTTP erróneos (típicos 502/503 de proxies/Cloudflare
+                # tras un deploy en Render). Reintentar en ráfaga solo empeora el
+                # bloqueo del upstream, así que esperamos 10s fijos.
+                logger.error("Handshake HTTP {} fallido: {}", exc.status, exc)
+                if exc.status in (502, 503):
+                    self.retry_delay = _ERROR_502_RETRY_SECONDS
+                    logger.warning(
+                        "⚠️ HTTP {} detectado: reintentando en {:.0f}s para no saturar la red.",
+                        exc.status, self.retry_delay,
+                    )
             except Exception as exc:  # noqa: BLE001 - fallo de red manejado aquí
                 logger.error("Error en WebSocket: {}", exc)
 
