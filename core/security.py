@@ -88,28 +88,32 @@ class TokenSecurityValidator:
         se devuelve None para que el token se trate de forma conservadora.
         """
         url = f"{RUGCHECK_API}/{mint}/report"
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=5)
         try:
             async with session.get(url, timeout=timeout) as resp:
                 if resp.status == 429:
-                    logger.error(
-                        f"⚠️ Error al consultar RugCheck para {mint}: rate limit (HTTP 429)"
+                    logger.warning(
+                        f"⚠️ RugCheck bloqueado o inaccesible (HTTP 429). Saltando token {mint}."
                     )
                     return None
                 if resp.status == 404:
                     logger.warning("RugCheck no encontró reporte para {}", mint)
                     return None
                 if resp.status != 200:
-                    logger.error(
-                        f"⚠️ Error al consultar RugCheck para {mint}: HTTP {resp.status}"
+                    logger.warning(
+                        f"⚠️ RugCheck bloqueado o inaccesible (HTTP {resp.status}). Saltando token {mint}."
                     )
                     return None
                 return await resp.json()
         except asyncio.TimeoutError:
-            logger.error(f"⚠️ Error al consultar RugCheck para {mint}: timeout")
+            logger.warning(
+                f"⚠️ RugCheck inaccesible o sin respuesta (timeout). Saltando token {mint}."
+            )
             return None
         except aiohttp.ClientError as exc:
-            logger.error(f"⚠️ Error al consultar RugCheck para {mint}: {exc}")
+            logger.warning(
+                f"⚠️ Error de red consultando RugCheck: {exc}. Saltando token {mint}."
+            )
             return None
 
     def _rugcheck_score(self, report: Optional[dict[str, Any]]) -> int:
@@ -153,8 +157,16 @@ class TokenSecurityValidator:
         score = self._rugcheck_score(report)
         dev_pct = self._rugcheck_dev_pct(report)
 
+        max_score = self.security.RUGCHECK_MAX_SCORE
+        logger.info(
+            "📊 Token: {} | Score RugCheck: {} | Estado: {}",
+            mint,
+            score,
+            "APROBADO" if score <= max_score else "DESCARTADO",
+        )
+
         # 1) Score RugCheck mayor al umbral -> rechazar.
-        if score > self.security.RUGCHECK_MAX_SCORE:
+        if score > max_score:
             logger.info(
                 f"❌ Token {mint} rechazado por RugCheck | "
                 f"Score actual: {score} (Máximo permitido: {self.security.RUGCHECK_MAX_SCORE})"

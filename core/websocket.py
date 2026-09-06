@@ -123,6 +123,12 @@ class TokenWebSocket:
                         continue
 
                     mint = payload.get("mint") or payload.get("token", {}).get("mint")
+                    if mint:
+                        logger.info(
+                            "🔎 Analizando mint: {} | Ticker: {}",
+                            mint,
+                            payload.get("symbol") or payload.get("token", {}).get("symbol", "N/A"),
+                        )
                     if payload.get("type") in ("tokenCreation", "create"):
                         # Información válida de token: se encola para que el bot
                         # continúe con la evaluación de RugCheck y filtros de seguridad.
