@@ -89,6 +89,9 @@ class TokenSecurityValidator:
         """
         url = f"{RUGCHECK_API}/{mint}/report"
         timeout = aiohttp.ClientTimeout(total=5)
+        # Retardo de indexación: da tiempo a que RugCheck procese el contrato
+        # recién creado antes de consultarlo.
+        await asyncio.sleep(2.0)
         try:
             async with session.get(url, timeout=timeout) as resp:
                 if resp.status == 429:
@@ -97,7 +100,9 @@ class TokenSecurityValidator:
                     )
                     return None
                 if resp.status == 404:
-                    logger.warning("RugCheck no encontró reporte para {}", mint)
+                    logger.error(
+                        f"⚠️ Error evaluando {mint} en RugCheck: 404 not found (contrato no indexado)"
+                    )
                     return None
                 if resp.status != 200:
                     logger.warning(
@@ -106,14 +111,10 @@ class TokenSecurityValidator:
                     return None
                 return await resp.json()
         except asyncio.TimeoutError:
-            logger.warning(
-                f"⚠️ RugCheck inaccesible o sin respuesta (timeout). Saltando token {mint}."
-            )
+            logger.error(f"⚠️ Error evaluando {mint} en RugCheck: timeout")
             return None
-        except aiohttp.ClientError as exc:
-            logger.warning(
-                f"⚠️ Error de red consultando RugCheck: {exc}. Saltando token {mint}."
-            )
+        except Exception as exc:  # noqa: BLE001 - nunca silenciar fallos de API/red
+            logger.error(f"⚠️ Error evaluando {mint} en RugCheck: {exc}")
             return None
 
     def _rugcheck_score(self, report: Optional[dict[str, Any]]) -> int:
@@ -138,13 +139,17 @@ class TokenSecurityValidator:
         return float(holders[0].get("pct", 0.0))
 
     # ---------------------------------------------------------------- Public
-    async def is_token_safe(self, mint: str) -> bool:
+    async def is_token_safe(self, mint: str, ticker: str = "N/A") -> bool:
         """Evalúa todos los controles de seguridad sobre un token.
+
+        Args:
+            mint: Dirección del token a validar.
+            ticker: Símbolo/ticker del token (para logs más legibles).
 
         Returns:
             True si el token es seguro; lanza SecurityValidationError si no.
         """
-        logger.info("Validando seguridad del token {}", mint)
+        logger.info("Validando seguridad del token {} ({})", mint, ticker)
 
         async with aiohttp.ClientSession() as session:
             # Ejecución concurrente (no bloquea el loop) de RPC y RugCheck.
@@ -159,10 +164,12 @@ class TokenSecurityValidator:
 
         max_score = self.security.RUGCHECK_MAX_SCORE
         logger.info(
-            "📊 Token: {} | Score RugCheck: {} | Estado: {}",
-            mint,
+            "📊 {} ({}...) | Score: {} | Max: {} | {}",
+            ticker,
+            mint[:6],
             score,
-            "APROBADO" if score <= max_score else "DESCARTADO",
+            max_score,
+            "APROBADO" if score <= max_score else "RECHAZADO",
         )
 
         # 1) Score RugCheck mayor al umbral -> rechazar.

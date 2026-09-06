@@ -72,9 +72,9 @@ class MemecoinBot:
         )
 
     # ------------------------------------------------------------ Trading
-    async def _process_new_token(self, mint: str) -> None:
+    async def _process_new_token(self, mint: str, ticker: str = "N/A") -> None:
         """Flujo completo: validar -> comprar si es seguro."""
-        logger.info("Procesando nuevo token: {}", mint)
+        logger.info("Procesando nuevo token: {} ({})", mint, ticker)
 
         # Modo diagnóstico (TEST_MODE): si FORCE_TEST_BUY está activo, el primer
         # token que llegue por el WebSocket omite la validación de RugCheck,
@@ -104,7 +104,7 @@ class MemecoinBot:
 
         # Paso 1: Seguridad. Cualquier rechazo se registra y se descarta.
         try:
-            is_safe = await self.validator.is_token_safe(mint)
+            is_safe = await self.validator.is_token_safe(mint, ticker)
         except SecurityValidationError as exc:
             logger.warning("Token {} rechazado: {}", mint, exc)
             return
@@ -179,9 +179,17 @@ class MemecoinBot:
                     logger.debug("Evento sin mint, ignorado: {}", event)
                     continue
 
+                ticker = (
+                    event.get("symbol")
+                    or event.get("ticker")
+                    or event.get("token", {}).get("symbol")
+                    or event.get("token", {}).get("ticker")
+                    or "N/A"
+                )
+
                 # Procesamiento concurrente: permite varios tokens en paralelo
                 # mientras seguimos escuchando (no bloquea el loop).
-                asyncio.create_task(self._process_new_token(mint))
+                asyncio.create_task(self._process_new_token(mint, ticker))
         finally:
             self.listener.stop()
             for task in (listener_task, heartbeat_task, monitor_task):
