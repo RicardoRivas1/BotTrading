@@ -9,10 +9,13 @@ sin detener el bucle de eventos de asyncio.
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, AsyncIterator, Optional
 
 import aiohttp
 from loguru import logger
+
+import config
 
 # -- Constantes ---------------------------------------------------------------
 # Endpoint público de PumpPortal para escuchar tokens/liquidez nuevos.
@@ -45,6 +48,52 @@ _USER_AGENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 # Backoff exponencial de reconexión (segundos).
 _RECONNECT_MIN = 1.0
 _RECONNECT_MAX = 60.0
+
+
+async def check_rugcheck(mint: str) -> int:
+    """Consulta el score de riesgo de RugCheck para un mint."""
+    from core.security import TokenSecurityValidator
+
+    cfg = config.load_config()
+    validator = TokenSecurityValidator(
+        rpc_url=cfg.solana.HELIUS_RPC_URL,
+        security=cfg.security,
+    )
+    async with aiohttp.ClientSession() as session:
+        report = await validator._fetch_rugcheck(session, mint)
+    return validator._rugcheck_score(report)
+
+
+async def process_buy_and_notify(mint: str, symbol: str = "N/A") -> None:
+    """Ejecuta una compra de prueba (simulada) y notifica a Telegram."""
+    from core.execution import JupiterExecutor
+    from core.notifier import TelegramNotifier
+
+    cfg = config.load_config()
+    executor = JupiterExecutor(
+        private_key=cfg.solana.PRIVATE_KEY,
+        rpc_url=cfg.solana.HELIUS_RPC_URL,
+        slippage_bps=cfg.trading.SLIPPAGE_BPS,
+        buy_amount_sol=cfg.trading.BUY_AMOUNT_SOL,
+        take_profit_pct=cfg.trading.TAKE_PROFIT_PCT,
+        stop_loss_pct=cfg.trading.STOP_LOSS_PCT,
+        trailing_activation_pct=cfg.trading.TRAILING_STOP_ACTIVATION_PCT,
+        trailing_distance_pct=cfg.trading.TRAILING_STOP_DISTANCE_PCT,
+        dry_run=cfg.trading.DRY_RUN,
+    )
+    notifier = TelegramNotifier(
+        token=cfg.telegram.TELEGRAM_TOKEN,
+        chat_id=cfg.telegram.TELEGRAM_CHAT_ID,
+    )
+    try:
+        sig = await executor.buy_token(mint, dry_run=True)
+    except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
+        logger.error("Error comprando {} (FORCE_TEST_BUY): {}", mint, exc)
+        await notifier.send_error(f"No se pudo comprar {mint}: {exc}")
+        return
+
+    await notifier.send_buy(mint, cfg.trading.BUY_AMOUNT_SOL)
+    logger.success("Compra de prueba (FORCE_TEST_BUY) de {} ejecutada: {}", mint, sig)
 
 
 class TokenWebSocket:
@@ -123,12 +172,27 @@ class TokenWebSocket:
                         continue
 
                     mint = payload.get("mint") or payload.get("token", {}).get("mint")
+                    symbol = payload.get("symbol") or payload.get("token", {}).get("symbol", "N/A")
                     if mint:
                         logger.info(
                             "🔎 Analizando mint: {} | Ticker: {}",
                             mint,
-                            payload.get("symbol") or payload.get("token", {}).get("symbol", "N/A"),
+                            symbol,
                         )
+
+                        # FORCE_TEST_BUY: disparo único de compra de prueba (modo diagnóstico).
+                        if os.getenv("FORCE_TEST_BUY", "False").lower() == "true":
+                            logger.info(f"🚀 [FORCE_TEST_BUY ACTIVADO] Forzando compra de prueba para {mint} ({symbol})")
+                            await process_buy_and_notify(mint, symbol)  # Llama a tu función de simulación/Jupiter y Telegram
+                            os.environ["FORCE_TEST_BUY"] = "False"
+                            continue
+
+                        # Evaluación de seguridad: consulta a RugCheck con captura de errores.
+                        try:
+                            score = await check_rugcheck(mint)
+                            logger.info(f"📊 Score RugCheck para {mint}: {score}")
+                        except Exception as e:
+                            logger.error(f"❌ Error al evaluar RugCheck para {mint}: {e}")
                     if payload.get("type") in ("tokenCreation", "create"):
                         # Información válida de token: se encola para que el bot
                         # continúe con la evaluación de RugCheck y filtros de seguridad.
