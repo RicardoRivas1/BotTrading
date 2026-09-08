@@ -7,6 +7,7 @@ y al RPC usan `aiohttp` para no bloquear el event loop.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -170,12 +171,18 @@ class JupiterExecutor:
         input_mint: str,
         output_mint: str,
         amount_lamports: int,
+        simulate: bool = False,
     ) -> dict[str, Any]:
         """Solicita una cotización de precios y rutas a Jupiter.
 
         Si el endpoint principal falla por DNS o error de conexión
         (`aiohttp.ClientConnectorError`), reintenta automáticamente contra la
         URL de fallback antes de registrar el error.
+
+        Si la consulta falla por 404 de Jupiter (token recién creado en
+        Pump.fun sin ruta), error de red o timeout, y `simulate` es True,
+        genera una cotización simulada en lugar de abortar el flujo de test
+        (DRY_RUN / FORCE_TEST_BUY).
         """
         params = {
             "inputMint": input_mint,
@@ -185,13 +192,43 @@ class JupiterExecutor:
             "onlyDirectRoutes": "false",
         }
         try:
-            return await self._request_quote(session, JUPITER_QUOTE_URL, params)
-        except (aiohttp.ClientConnectorError, OSError) as exc:
-            logger.warning(
-                "Jupiter principal {} falló por red ({}); reintentando con fallback {}",
-                JUPITER_QUOTE_URL, exc, JUPITER_FALLBACK_URL,
-            )
-            return await self._request_quote(session, JUPITER_FALLBACK_URL, params)
+            try:
+                return await self._request_quote(session, JUPITER_QUOTE_URL, params)
+            except (aiohttp.ClientConnectorError, OSError, asyncio.TimeoutError) as exc:
+                logger.warning(
+                    "Jupiter principal {} falló por red ({}); reintentando con fallback {}",
+                    JUPITER_QUOTE_URL, exc, JUPITER_FALLBACK_URL,
+                )
+                return await self._request_quote(session, JUPITER_FALLBACK_URL, params)
+        except (SwapExecutionError, aiohttp.ClientConnectorError, OSError, asyncio.TimeoutError) as exc:
+            if simulate:
+                logger.warning(
+                    "⚠️ Token sin ruta en Jupiter (Pump.fun reciente). "
+                    "Generando cotización simulada para test. ({})",
+                    exc,
+                )
+                return self._simulated_quote(input_mint, output_mint, amount_lamports)
+            raise
+
+    def _simulated_quote(
+        self,
+        input_mint: str,
+        output_mint: str,
+        amount_lamports: int,
+    ) -> dict[str, Any]:
+        """Genera una cotización simulada para flujos de test (DRY_RUN/FORCE_TEST_BUY).
+
+        Modela un precio de entrada de 1:1 (1 lamport de token por 1 lamport
+        de SOL) para que el flujo de simulación no se aborte.
+        """
+        return {
+            "inputMint": input_mint,
+            "outputMint": output_mint,
+            "amount": str(amount_lamports),
+            "outAmount": str(amount_lamports),
+            "routePlan": [{"outAmount": str(amount_lamports)}],
+            "simulated": True,
+        }
 
     async def _request_quote(
         self,
@@ -274,7 +311,8 @@ class JupiterExecutor:
         amount_lamports = int(self.buy_amount_sol * 1_000_000_000)
         async with aiohttp.ClientSession() as session:
             quote = await self._get_quote(
-                session, SOL_MINT, token_mint, amount_lamports
+                session, SOL_MINT, token_mint, amount_lamports,
+                simulate=simulate,
             )
             if simulate:
                 logger.info(

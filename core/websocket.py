@@ -183,7 +183,10 @@ class TokenWebSocket:
                         # FORCE_TEST_BUY: disparo único de compra de prueba (modo diagnóstico).
                         if os.getenv("FORCE_TEST_BUY", "False").lower() == "true":
                             logger.info(f"🚀 [FORCE_TEST_BUY ACTIVADO] Forzando compra de prueba para {mint} ({symbol})")
-                            await process_buy_and_notify(mint, symbol)  # Llama a tu función de simulación/Jupiter y Telegram
+                            try:
+                                await process_buy_and_notify(mint, symbol)  # Llama a tu función de simulación/Jupiter y Telegram
+                            except Exception as exc:  # noqa: BLE001 - nunca colgar el listener
+                                logger.error(f"❌ Error al forzar compra de prueba para {mint}: {exc}")
                             os.environ["FORCE_TEST_BUY"] = "False"
                             continue
 
