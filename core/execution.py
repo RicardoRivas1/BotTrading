@@ -20,10 +20,17 @@ from solders.signature import Signature
 from solana.rpc.async_api import AsyncClient
 from solders.pubkey import Pubkey
 
+from config import TradingSettings
+
 # -- Constantes ---------------------------------------------------------------
-# Endpoint público de la Swap API de Jupiter v6.
-JUPITER_QUOTE = "https://quote-api.jup.ag/v6/quote"
+# Endpoint público de la Swap API de Jupiter v6 (configurable por .env).
+_trading_settings = TradingSettings()
+JUPITER_QUOTE_URL = _trading_settings.JUPITER_QUOTE_URL
+JUPITER_FALLBACK_URL = _trading_settings.JUPITER_FALLBACK_URL
 JUPITER_SWAP = "https://quote-api.jup.ag/v6/swap"
+
+# User-Agent de navegador para eludir bloqueos básicos de Cloudflare.
+_USER_AGENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 # SPL Token (USDC / WSOL) y el token de referencia (SOL).
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -164,7 +171,12 @@ class JupiterExecutor:
         output_mint: str,
         amount_lamports: int,
     ) -> dict[str, Any]:
-        """Solicita una cotización de precios y rutas a Jupiter."""
+        """Solicita una cotización de precios y rutas a Jupiter.
+
+        Si el endpoint principal falla por DNS o error de conexión
+        (`aiohttp.ClientConnectorError`), reintenta automáticamente contra la
+        URL de fallback antes de registrar el error.
+        """
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
@@ -172,10 +184,28 @@ class JupiterExecutor:
             "slippageBps": self.slippage_bps,
             "onlyDirectRoutes": "false",
         }
-        async with session.get(JUPITER_QUOTE, params=params) as resp:
+        try:
+            return await self._request_quote(session, JUPITER_QUOTE_URL, params)
+        except (aiohttp.ClientConnectorError, OSError) as exc:
+            logger.warning(
+                "Jupiter principal {} falló por red ({}); reintentando con fallback {}",
+                JUPITER_QUOTE_URL, exc, JUPITER_FALLBACK_URL,
+            )
+            return await self._request_quote(session, JUPITER_FALLBACK_URL, params)
+
+    async def _request_quote(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """GET de cotización a Jupiter con User-Agent de navegador."""
+        async with session.get(url, params=params, headers=_USER_AGENT_HEADERS) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                raise SwapExecutionError(f"Jupiter quote falló ({resp.status}): {text[:200]}")
+                raise SwapExecutionError(
+                    f"Jupiter quote falló en {url} ({resp.status}): {text[:200]}"
+                )
             return await resp.json()
 
     # ------------------------------------------------------------ Swap
@@ -192,7 +222,9 @@ class JupiterExecutor:
             "computeUnitLimit": None,
             "computeUnitPriceMicroLamports": None,
         }
-        async with session.post(JUPITER_SWAP, json=swap_payload) as resp:
+        async with session.post(
+            JUPITER_SWAP, json=swap_payload, headers=_USER_AGENT_HEADERS
+        ) as resp:
             if resp.status != 200:
                 text = await resp.text()
                 raise SwapExecutionError(f"Jupiter swap falló ({resp.status}): {text[:200]}")
