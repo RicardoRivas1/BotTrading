@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import aiohttp
 import base58
@@ -172,6 +172,7 @@ class JupiterExecutor:
         output_mint: str,
         amount_lamports: int,
         simulate: bool = False,
+        slippage_bps: Optional[int] = None,
     ) -> dict[str, Any]:
         """Solicita una cotización de precios y rutas a Jupiter.
 
@@ -183,12 +184,15 @@ class JupiterExecutor:
         Pump.fun sin ruta), error de red o timeout, y `simulate` es True,
         genera una cotización simulada en lugar de abortar el flujo de test
         (DRY_RUN / FORCE_TEST_BUY).
+
+        `slippage_bps` permite aumentar el slippage puntualmente (p. ej.
+        ventas de emergencia en stop-loss).
         """
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
             "amount": str(amount_lamports),
-            "slippageBps": self.slippage_bps,
+            "slippageBps": self.slippage_bps if slippage_bps is None else slippage_bps,
             "onlyDirectRoutes": "false",
         }
         try:
@@ -342,15 +346,25 @@ class JupiterExecutor:
         logger.info("Posición registrada para {} @ entry={:.10g}", token_mint, entry_price)
         return sig
 
-    async def sell_token(self, token_mint: str, token_balance_ui: float) -> Signature:
-        """Vende la totalidad del balance de un token."""
+    async def sell_token(
+        self,
+        token_mint: str,
+        token_balance_ui: float,
+        slippage_bps: Optional[int] = None,
+    ) -> Signature:
+        """Vende la totalidad del balance de un token.
+
+        `slippage_bps` permite usar un slippage distinto del configurado
+        (p. ej. 15-20% en ventas de emergencia por stop-loss).
+        """
         # El balance del token suele venir en unidades decimales UI.
         decimals = await self._get_token_decimals(token_mint)
         raw_amount = int(token_balance_ui * (10 ** decimals))
 
         async with aiohttp.ClientSession() as session:
             quote = await self._get_quote(
-                session, token_mint, SOL_MINT, raw_amount
+                session, token_mint, SOL_MINT, raw_amount,
+                slippage_bps=slippage_bps,
             )
             return await self._build_and_send_swap(session, quote)
 
@@ -396,12 +410,12 @@ class JupiterExecutor:
 
         # Regla 1: Stop-Loss inicial fijo (-30%).
         if pnl_pct <= -self.stop_loss_pct:
-            await self._close_position(token_mint, "STOP_LOSS", pnl_pct)
+            await self.close_position(token_mint, "STOP_LOSS", pnl_pct)
             return "STOP_LOSS", pnl_pct
 
         # Regla 2: Take-Profit fijo (+100%).
         if pnl_pct >= self.take_profit_pct:
-            await self._close_position(token_mint, "TAKE_PROFIT", pnl_pct)
+            await self.close_position(token_mint, "TAKE_PROFIT", pnl_pct)
             return "TAKE_PROFIT", pnl_pct
 
         # Regla 3: Trailing Stop tras ganancia >= +20%.
@@ -414,13 +428,24 @@ class JupiterExecutor:
                 (position.peak_price - current_price) / position.peak_price * 100
             ) if position.peak_price else 0.0
             if drawdown >= self.trailing_distance_pct:
-                await self._close_position(token_mint, "TRAILING_STOP", pnl_pct)
+                await self.close_position(token_mint, "TRAILING_STOP", pnl_pct)
                 return "TRAILING_STOP", pnl_pct
 
         return "", 0.0
 
-    async def _close_position(self, token_mint: str, reason: str, pnl_pct: float) -> None:
-        """Cierra una posición vendiendo el total (real o simulado)."""
+    async def close_position(
+        self,
+        token_mint: str,
+        reason: str,
+        pnl_pct: float,
+        slippage_bps: Optional[int] = None,
+    ) -> None:
+        """Cierra una posición vendiendo el total (real o simulado).
+
+        Con `DRY_RUN=False`, la transacción de venta se firma localmente con
+        la `PRIVATE_KEY` (`self.keypair`) y se envía a la red de Solana.
+        `slippage_bps` permite forzar slippage alto en ventas de emergencia.
+        """
         position = self.positions.get(token_mint)
         if position is None:
             return
@@ -435,7 +460,10 @@ class JupiterExecutor:
             return
 
         try:
-            sig = await self.sell_token(token_mint, position.token_amount_ui)
+            sig = await self.sell_token(
+                token_mint, position.token_amount_ui,
+                slippage_bps=slippage_bps,
+            )
         except Exception as exc:  # noqa: BLE001 - persistimos la posición en fallo
             logger.error("Error vendiendo {} ({}): {}", token_mint, reason, exc)
             return

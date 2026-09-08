@@ -25,6 +25,7 @@ from core.websocket import TokenWebSocket, create_listener
 from core.security import TokenSecurityValidator, SecurityValidationError
 from core.execution import JupiterExecutor
 from core.notifier import TelegramNotifier
+from core.tracker import PositionTracker
 
 # -- Configuración inicial de loguru ------------------------------------------
 logger.remove()
@@ -69,6 +70,11 @@ class MemecoinBot:
         self.notifier = TelegramNotifier(
             token=config.telegram.TELEGRAM_TOKEN,
             chat_id=config.telegram.TELEGRAM_CHAT_ID,
+        )
+        self.tracker = PositionTracker(
+            executor=self.executor,
+            notifier=self.notifier,
+            config=config,
         )
 
     # ------------------------------------------------------------ Trading
@@ -128,28 +134,21 @@ class MemecoinBot:
 
     # ------------------------------------------------- Positions monitor
     async def _monitor_positions(self, interval_seconds: float) -> None:
-        """Revisa periódicamente las posiciones abiertas (TP/SL/trailing).
+        """Revisa periódicamente las posiciones abiertas (TP/SL).
 
-        Corre en segundo plano tras cada compra. Una salida detectada por el
-        motor (`executor.monitor_position`) se notifica a Telegram según el
-        motivo acompañado del PnL real calculado.
+        Corre en segundo plano tras cada compra. El `PositionTracker` consulta
+        la cotización vía Jupiter v6, dispara la venta (con slippage alto en
+        stop-loss) y notifica a Telegram.
         """
         while True:
             await asyncio.sleep(interval_seconds)
             opens = list(self.executor.positions.keys())
             for mint in opens:
                 try:
-                    reason, pnl = await self.executor.monitor_position(mint)
+                    await self.tracker.check_position(mint)
                 except Exception as exc:  # noqa: BLE001 - nunca detener el bot
                     logger.warning("Error monitoreando {}: {}", mint, exc)
                     continue
-
-                if reason == "TAKE_PROFIT":
-                    await self.notifier.send_take_profit(mint, pnl)
-                elif reason == "STOP_LOSS":
-                    await self.notifier.send_stop_loss(mint, pnl)
-                elif reason == "TRAILING_STOP":
-                    await self.notifier.send_trailing_stop(mint, pnl)
 
     # ------------------------------------------------------------ Loop
     async def run(self) -> None:

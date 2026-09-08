@@ -117,19 +117,17 @@ class TelegramNotifier:
         """Notifica un take-profit ejecutado."""
         pnl_txt = f"+{pnl_pct:.2f}%"
         html_text = (
-            "<b>🟢 TAKE PROFIT EJECUTADO</b>\n\n"
-            f"<b>Token:</b> <code>{html.escape(str(mint))}</code>\n"
-            f"<b>Ganancia:</b> {html.escape(pnl_txt)}"
+            f"<b>🎯 TAKE PROFIT ({html.escape(pnl_txt)})</b>\n\n"
+            f"<b>Token:</b> <code>{html.escape(str(mint))}</code>"
         )
         return await self.send(html_text)
 
     async def send_stop_loss(self, mint: str, pnl_pct: float) -> bool:
         """Notifica un stop-loss ejecutado."""
-        pnl_txt = f"{pnl_pct:.2f}%"
+        pnl_txt = f"-{abs(pnl_pct):.2f}%"
         html_text = (
-            "<b>🔴 STOP LOSS EJECUTADO</b>\n\n"
-            f"<b>Token:</b> <code>{html.escape(str(mint))}</code>\n"
-            f"<b>Pérdida:</b> {html.escape(pnl_txt)}"
+            f"<b>🛑 STOP LOSS ({html.escape(pnl_txt)})</b>\n\n"
+            f"<b>Token:</b> <code>{html.escape(str(mint))}</code>"
         )
         return await self.send(html_text)
 

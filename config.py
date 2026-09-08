@@ -7,6 +7,8 @@ definidas.
 
 from __future__ import annotations
 
+import os
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -48,8 +50,21 @@ class TradingSettings(BaseSettings):
         description="Endpoint secundario (fallback) de Jupiter ante fallos de DNS/red",
     )
     AUTO_SELL: bool = Field(default=True, description="Si vende automáticamente tras take-profit/stop-loss")
-    TAKE_PROFIT_PCT: float = Field(default=100.0, gt=0, description="Ganancia objetivo: +100%")
-    STOP_LOSS_PCT: float = Field(default=30.0, gt=0, description="Límite de pérdida: -30%")
+    TAKE_PROFIT_PCT: float = Field(
+        default=float(os.getenv("TAKE_PROFIT_PCT", "100.0")),
+        gt=0,
+        description="Ganancia objetivo: +100%",
+    )
+    STOP_LOSS_PCT: float = Field(
+        default=float(os.getenv("STOP_LOSS_PCT", "30.0")),
+        gt=0,
+        description="Límite de pérdida: -30%",
+    )
+    TRAILING_STOP_PCT: float = Field(
+        default=float(os.getenv("TRAILING_STOP_PCT", "0.0")),
+        ge=0,
+        description="Ganancia que activa el trailing stop (0 = desactivado)",
+    )
     TRAILING_STOP_ACTIVATION_PCT: float = Field(
         default=20.0, gt=0, description="Ganancia mínima para activar el trailing stop: +20%"
     )
