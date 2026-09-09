@@ -38,7 +38,9 @@ class TokenSecurityValidator:
         self.security = security
 
     # ------------------------------------------------------------------ RPC
-    async def _get_mint_account_info(self, session: aiohttp.ClientSession, mint: str) -> Optional[dict[str, Any]]:
+    async def _get_mint_account_info(
+        self, session: aiohttp.ClientSession, mint: str
+    ) -> Optional[dict[str, Any]]:
         """Consulta el estado del mint del token vía JSON‑RPC de Solana."""
         payload = {
             "jsonrpc": "2.0",
@@ -51,19 +53,21 @@ class TokenSecurityValidator:
         }
         async with session.post(self.rpc_url, json=payload) as resp:
             if resp.status != 200:
-                logger.warning("RPC getAccountInfo status {} para {}", resp.status, mint)
+                logger.warning(f"RPC getAccountInfo status {resp.status} para {mint}")
                 return None
             data = await resp.json()
             return data.get("result", {}).get("value")
 
-    def _parse_auth_from_mint(self, account_info: Optional[dict[str, Any]]) -> tuple[Optional[str], Optional[str], Optional[float]]:
+    def _parse_auth_from_mint(
+        self, account_info: Optional[dict[str, Any]]
+    ) -> tuple[Optional[str], Optional[str], float]:
         """Extrae mint/freeze authority y % de supply del Dev del mint.
 
         Devuelve (mint_authority, freeze_authority, dev_pct).
-        Ambos authorities 'None' en jsonParsed significa que están renunciadas.
+        Ambos authorities `None` en jsonParsed significa que están renunciadas.
         """
         if not account_info:
-            return None, None, None
+            return None, None, 0.0
 
         parsed = account_info.get("data", {}).get("parsed", {})
         info = parsed.get("info", {})
@@ -71,13 +75,15 @@ class TokenSecurityValidator:
         mint_authority = info.get("mintAuthority")
         freeze_authority = info.get("freezeAuthority")
 
-        # estimateDevPct no se puede derivar del mint directamente; RugCheck
+        # dev_pct no se puede derivar del mint directamente; RugCheck
         # entrega en 'risks'. Aquí devolvemos 0.0 y delegamos a RugCheck.
         dev_pct = 0.0
         return mint_authority, freeze_authority, dev_pct
 
     # -------------------------------------------------------------- RugCheck
-    async def _fetch_rugcheck(self, session: aiohttp.ClientSession, mint: str) -> Optional[dict[str, Any]]:
+    async def _fetch_rugcheck(
+        self, session: aiohttp.ClientSession, mint: str
+    ) -> Optional[dict[str, Any]]:
         """Obtiene el reporte de riesgo completo de RugCheck.
 
         Cualquier fallo de la API (timeout, rate limit 429, HTTP != 200 o una
@@ -86,45 +92,7 @@ class TokenSecurityValidator:
         """
         url = f"{RUGCHECK_API}/{mint}/report"
         timeout = aiohttp.ClientTimeout(total=5)
-      # Retardo de indexación: da tiempo a que RugCheck procese el contrato
-        # recién creado antes de consultarlo.
-        await asyncio.sleep(2.0)
-        try:
-            async with session.post(self.rpc_url, json=payload) as resp:
-                if resp.status != 200:
-                    logger.warning(f"RPC getAccountInfo status {resp.status} para {mint}")
-        except Exception as e:
-            logger.error(f"Error en consulta RPC: {e}")
-    def _parse_auth_from_mint(self, account_info: Optional[dict[str, Any]]) -> tuple[Optional[str], Optional[str], float]:
-        """Extrae mint/freeze authority y % de supply del Dev del mint.
-        
-        Devuelve (mint_authority, freeze_authority, dev_pct).
-        Ambos authorities `None` en jsonParsed significa que están renunciadas.
-        """
-        if not account_info:
-            return None, None, 0.0
-            
-        parsed = account_info.get("data", {}).get("parsed", {})
-        info = parsed.get("info", {})
-        
-        mint_authority = info.get("mintAuthority")
-        freeze_authority = info.get("freezeAuthority")
-        
-        # estimadoDevPct no se puede extraer del API directamente. RugCheck
-        # entrega en 'risks'. Aquí devolvemos 0.0 y delegamos a RugCheck
-        dev_pct = 0.0
-        return mint_authority, freeze_authority, dev_pct
-
-    async def _fetch_rugcheck(self, session: aiohttp.ClientSession, mint: str) -> Optional[dict[str, Any]]:
-        """Obtiene el reporte de riesgo completo de RugCheck.
-        
-        Cualquier fallo de la API (timeout, rate limit 429, HTTP != 200 o una 
-        excepción de red) se registra con el mensaje estandarizado de error y
-        se devuelve None para que el token se trate de forma conservadora.
-        """
-        url = f"{RUGCHECK_API}/tokens/{mint}/report"
-        timeout = aiohttp.ClientTimeout(total=5)
-        # Estado de indexación: da tiempo a que RugCheck procese el contrato
+        # Retardo de indexación: da tiempo a que RugCheck procese el contrato
         # recién creado antes de consultarlo.
         await asyncio.sleep(2.0)
         try:
@@ -168,21 +136,6 @@ class TokenSecurityValidator:
             return 0.0
         holders = report.get("topHolders", [])
         if not holders:
-
-            # Un reporte no evaluable es de alto riesgo para ser conservadores
-            return self.security.RUGCHECK_MAX_SCORE + 1
-        if "risks" in report:
-            total = sum(int(risk.get("score", 0)) for risk in report.get("risks", []))
-            return total
-        return 0
-
-    def _rugcheck_dev_pct(self, report: Optional[dict[str, Any]]) -> float:
-        """Extrae el % del supply en manos del Dev desde RugCheck."""
-        if not report:
-            return 0.0
-        holders = report.get("topHolders", [])
-        if not holders:
-
             return 0.0
         # El primer top-holder suele ser el Dev/creador del token.
         return float(holders[0].get("pct", 0.0))
@@ -198,7 +151,7 @@ class TokenSecurityValidator:
         Returns:
             True si el token es seguro; lanza SecurityValidationError si no.
         """
-        logger.info("Validando seguridad del token {} ({})", mint, ticker)
+        logger.info(f"Validando seguridad del token {mint} ({ticker})")
 
         async with aiohttp.ClientSession() as session:
             # Ejecución concurrente (no bloquea el loop) de RPC y RugCheck.
@@ -213,12 +166,8 @@ class TokenSecurityValidator:
 
         max_score = self.security.RUGCHECK_MAX_SCORE
         logger.info(
-            "📊 {} ({}...) | Score: {} | Max: {} | {}",
-            ticker,
-            mint[:6],
-            score,
-            max_score,
-            "APROBADO" if score <= max_score else "RECHAZADO",
+            f"📊 {ticker} ({mint[:6]}...) | Score: {score} | Max: {max_score} | "
+            f"{'APROBADO' if score <= max_score else 'RECHAZADO'}"
         )
 
         # 1) Score RugCheck mayor al umbral -> rechazar.
