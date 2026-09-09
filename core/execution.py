@@ -327,32 +327,35 @@ class JupiterExecutor:
             else:
                 sig = await self._build_and_send_swap(session, quote)
 
-        # Estimamos precio de entrada: 1 SOL / cantidad de tokens recibidos.
+        # Precio de entrada por token en SOL calculado desde la bonding curve:
+        # entry_price_sol = amount_sol / tokens_out.
         out_amount = float(
             quote.get("outAmount", quote.get("routePlan", [{}])[0].get("outAmount", 0))
             or 0
         )
         decimals = await self._get_token_decimals(token_mint)
         token_qty_ui = out_amount / (10 ** decimals) if decimals else 0.0
-        entry_price = self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
+        entry_price_sol = (
+            self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
+        )
 
-        # Si no pudimos estimar un precio válido, consultamos el precio base vía
-        # Jupiter para asegurar que entry_price sea un float positivo.
-        if not entry_price or entry_price <= 0:
+        # Último recurso (sin inventar precio): si la curva no entregó tokens,
+        # se consulta la cotización actual vía Jupiter.
+        if not entry_price_sol or entry_price_sol <= 0:
             try:
-                entry_price = await self.get_token_price(token_mint)
+                entry_price_sol = await self.get_token_price(token_mint)
             except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
                 logger.warning("No se pudo obtener precio base de {}: {}", token_mint, exc)
-        entry_price = max(entry_price, 0.0)
+        entry_price_sol = max(entry_price_sol, 0.0)
 
         self.positions[token_mint] = Position(
             mint=token_mint,
             token_amount_ui=token_qty_ui,
-            entry_price=entry_price,
-            peak_price=entry_price,
+            entry_price=entry_price_sol,
+            peak_price=entry_price_sol,
             sol_invested=self.buy_amount_sol,
         )
-        logger.info("Posición registrada para {} @ entry={:.10g}", token_mint, entry_price)
+        logger.info("Posición registrada para {} @ entry={:.9f} SOL", token_mint, entry_price_sol)
         return sig
 
     async def sell_token(

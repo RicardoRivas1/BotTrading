@@ -79,14 +79,25 @@ class TelegramNotifier:
                 return resp.status, body
 
     # ------------------------------------------------------- Mensajes útiles
-    async def send_buy(self, mint: str, amount_sol: float, price: Optional[float] = None) -> bool:
-        """Notifica una compra de token ejecutada."""
+    async def send_buy(
+        self,
+        mint: str,
+        amount_sol: float,
+        price: Optional[float] = None,
+        price_unit: str = "SOL",
+    ) -> bool:
+        """Notifica una compra de token ejecutada.
+
+        `price_unit` admite "SOL" (por defecto) o "USD":
+            - SOL: "0.000000042 SOL" ({price:.9f} SOL)
+            - USD: "$0.00000004"    (${price:.8f})
+        """
         amount_txt = f"{amount_sol:.4f}"
         if price and price > 0:
-            if price < 1:
-                price_txt = f"${price:.10f}"
+            if price_unit.upper() == "USD":
+                price_txt = f"${price:.8f}"
             else:
-                price_txt = f"${price:,.6f} SOL"
+                price_txt = f"{price:.9f} SOL"
         else:
             price_txt = "N/D"
         html_text = (
