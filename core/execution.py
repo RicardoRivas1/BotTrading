@@ -25,20 +25,16 @@ from solders.transaction import VersionedTransaction
 from config import TradingSettings
 
 # -- Constantes ---------------------------------------------------------------
-# Endpoint público de la Swap API de Jupiter v6 (configurable por .env).
 _trading_settings = TradingSettings()
 JUPITER_QUOTE_URL = _trading_settings.JUPITER_QUOTE_URL
 JUPITER_FALLBACK_URL = _trading_settings.JUPITER_FALLBACK_URL
 JUPITER_SWAP = "https://lite-api.jup.ag/v6/swap"
 
-# User-Agent de navegador para eludir bloqueos básicos de Cloudflare.
 _USER_AGENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-# SPL Token (USDC / WSOL) y el token de referencia (SOL).
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
-# Palabras mínimas que delatan una frase de recuperación (mnemonic).
 WORD_COUNT_THRESHOLD = 11
 
 
@@ -47,28 +43,18 @@ class SwapExecutionError(Exception):
 
 
 def cargar_keypair(key_str: str) -> Keypair:
-    """Carga una wallet de Solana desde una clave Base58 o una frase mnemonic.
-
-    Soporta dos formatos de entrada:
-    - Private key Base58 estándar de 64 bytes.
-    - Frase de recuperación de 12/24 palabras separadas por espacios.
-
-    Si la cadena no coincide con ninguno de los formatos, registra un error
-    crítico con loguru y lanza SwapExecutionError (detiene el arranque).
-    """
+    """Carga una wallet de Solana desde una clave Base58 o una frase mnemonic."""
     key_str = key_str.strip()
     if not key_str:
         logger.critical("PRIVATE_KEY vacío en configuración.")
         raise SwapExecutionError("PRIVATE_KEY vacío en configuración.")
 
-    # Detección por cantidad de palabras separadas por espacios.
     words = key_str.split()
     if len(words) > WORD_COUNT_THRESHOLD:
         return _cargar_desde_mnemonic(key_str)
     if len(words) == 1:
         return _cargar_desde_base58(key_str)
 
-    # Formato desconocido (p. ej. 2-11 palabras sin ser clave ni frase válida).
     logger.critical(
         "Formato de PRIVATE_KEY no reconocido: "
         "se esperaba Base58 (1 palabra) o mnemonic (12/24 palabras), "
@@ -78,17 +64,10 @@ def cargar_keypair(key_str: str) -> Keypair:
 
 
 def _cargar_desde_mnemonic(mnemonic: str) -> Keypair:
-    """Deriva el Keypair desde una frase de 12/24 palabras (BIP44 / SLIP-0010).
-
-    Usa `bip-utils` para generar la semilla a partir de la frase y derivar la
-    cuenta de Solana en el path estándar de Phantom (m/44'/501'/0'/0').
-    """
+    """Deriva el Keypair desde una frase de 12/24 palabras (BIP44 / SLIP-0010)."""
     try:
         seed = Bip39SeedGenerator(mnemonic).Generate()
         bip44_ctx = Bip44.FromSeed(seed, Bip44Coins.SOLANA)
-        # Deriva la cuenta en el path estándar de Phantom (m/44'/501'/0'/0').
-        # Se usa Bip44Changes.CHAIN_EXT (cadena externa, index 0) porque la
-        # cadena interna (CHANGE) espera '.Change(1)' y rompería la derivación.
         private_bytes = (
             bip44_ctx.Purpose()
             .Coin()
@@ -105,14 +84,18 @@ def _cargar_desde_mnemonic(mnemonic: str) -> Keypair:
         raise SwapExecutionError(f"Mnemonic inválido: {exc}") from exc
 
 
-@staticmethod
-    def _decode_transaction(raw_tx: Any) -> bytes:
-        """Decodifica la transacción devuelta por Jupiter (str o lista)."""
-        if isinstance(raw_tx, str):
-            return bytes.fromhex(raw_tx[2:]) if raw_tx.startswith("0x") else base58.b58decode(raw_tx)
-        elif isinstance(raw_tx, list):
-            return bytes(raw_tx)
-        raise SwapExecutionError("Formato de transacción no soportado")
+def _cargar_desde_base58(key_str: str) -> Keypair:
+    """Carga el Keypair desde una clave privada codificada en Base58."""
+    try:
+        secret_key = base58.b58decode(key_str)
+        if len(secret_key) == 32:
+            return Keypair.from_seed(secret_key)
+        elif len(secret_key) == 64:
+            return Keypair.from_bytes(secret_key)
+        raise ValueError(f"Longitud de clave inesperada: {len(secret_key)} bytes")
+    except Exception as exc:
+        logger.critical("Error al decodificar PRIVATE_KEY Base58: {}", exc)
+        raise SwapExecutionError(f"Clave Base58 inválida: {exc}") from exc
 
 
 @dataclass
@@ -120,12 +103,12 @@ class Position:
     """Estado mutable de una posición abierta en un token."""
 
     mint: str
-    token_amount_ui: float = 0.0          # Cantidad de tokens comprados (UI).
-    entry_price: float = 0.0              # Precio de entrada del token vs SOL.
-    peak_price: float = 0.0               # Precio máximo alcanzado desde la compra.
-    sol_invested: float = 0.0             # SOL invertidos inicialmente.
-    trailing_active: bool = False         # True una vez que se activó la protección trailing.
-    created_at: float = field(default_factory=time.time)  # Timestamp de creación.
+    token_amount_ui: float = 0.0
+    entry_price: float = 0.0
+    peak_price: float = 0.0
+    sol_invested: float = 0.0
+    trailing_active: bool = False
+    created_at: float = field(default_factory=time.time)
 
 
 class JupiterExecutor:
@@ -143,24 +126,28 @@ class JupiterExecutor:
         trailing_distance_pct: float = 15.0,
         dry_run: bool = True,
     ) -> None:
-        # Carga la wallet desde Base58 o mnemonic (lanza SwapExecutionError
-        # crítico y detiene el arranque si el formato es inválido).
         self.keypair: Keypair = cargar_keypair(private_key)
         self.rpc_url = rpc_url
         self.slippage_bps = slippage_bps
         self.buy_amount_sol = buy_amount_sol
         self.wallet_pubkey = str(self.keypair.pubkey())
 
-        # Parámetros del motor de salida automático.
         self.take_profit_pct = take_profit_pct
         self.stop_loss_pct = stop_loss_pct
         self.trailing_activation_pct = trailing_activation_pct
         self.trailing_distance_pct = trailing_distance_pct
-        # Si DRY_RUN es True, las ventas se simulan (no se envían transacciones).
         self.dry_run = dry_run
 
-        # Posiciones abiertas indexadas por mint.
         self.positions: dict[str, Position] = {}
+
+    @staticmethod
+    def _decode_transaction(raw_tx: Any) -> bytes:
+        """Decodifica la transacción devuelta por Jupiter (str o lista)."""
+        if isinstance(raw_tx, str):
+            return bytes.fromhex(raw_tx[2:]) if raw_tx.startswith("0x") else base58.b58decode(raw_tx)
+        elif isinstance(raw_tx, list):
+            return bytes(raw_tx)
+        raise SwapExecutionError("Formato de transacción no soportado")
 
     # ------------------------------------------------------------ Quote
     async def _get_quote(
@@ -172,20 +159,6 @@ class JupiterExecutor:
         simulate: bool = False,
         slippage_bps: Optional[int] = None,
     ) -> dict[str, Any]:
-        """Solicita una cotización de precios y rutas a Jupiter.
-
-        Si el endpoint principal falla por DNS o error de conexión
-        (`aiohttp.ClientConnectorError`), reintenta automáticamente contra la
-        URL de fallback antes de registrar el error.
-
-        Si la consulta falla por 404 de Jupiter (token recién creado en
-        Pump.fun sin ruta), error de red o timeout, y `simulate` es True,
-        genera una cotización simulada en lugar de abortar el flujo de test
-        (DRY_RUN / FORCE_TEST_BUY).
-
-        `slippage_bps` permite aumentar el slippage puntualmente (p. ej.
-        ventas de emergencia en stop-loss).
-        """
         params = {
             "inputMint": input_mint,
             "outputMint": output_mint,
@@ -206,8 +179,7 @@ class JupiterExecutor:
             if simulate:
                 logger.warning(
                     "⚠️ Token sin ruta en Jupiter (Pump.fun reciente). "
-                    "Generando cotización simulada para test. ({})",
-                    exc,
+                    "Generando cotización simulada para test. ({})", exc,
                 )
                 return self._simulated_quote(input_mint, output_mint, amount_lamports)
             raise
@@ -218,11 +190,6 @@ class JupiterExecutor:
         output_mint: str,
         amount_lamports: int,
     ) -> dict[str, Any]:
-        """Genera una cotización simulada para flujos de test (DRY_RUN/FORCE_TEST_BUY).
-
-        Modela un precio de entrada de 1:1 (1 lamport de token por 1 lamport
-        de SOL) para que el flujo de simulación no se aborte.
-        """
         return {
             "inputMint": input_mint,
             "outputMint": output_mint,
@@ -238,7 +205,6 @@ class JupiterExecutor:
         url: str,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-        """GET de cotización a Jupiter con User-Agent de navegador."""
         async with session.get(url, params=params, headers=_USER_AGENT_HEADERS) as resp:
             if resp.status != 200:
                 text = await resp.text()
@@ -253,7 +219,6 @@ class JupiterExecutor:
         session: aiohttp.ClientSession,
         quote: dict[str, Any],
     ) -> Signature:
-        """Solicita la transacción instantánea, la firma y la envía."""
         swap_payload = {
             "quoteResponse": quote,
             "userPublicKey": self.wallet_pubkey,
@@ -269,16 +234,13 @@ class JupiterExecutor:
                 raise SwapExecutionError(f"Jupiter swap falló ({resp.status}): {text[:200]}")
             swap_data = await resp.json()
 
-        # La transacción llega como una lista de bytes (base64 o enteros).
         raw_tx = swap_data["transaction"]
         tx_bytes = self._decode_transaction(raw_tx)
 
-        # Firma local con solders: deserializamos la VersionedTransaction.
         tx = VersionedTransaction.from_bytes(bytes(tx_bytes))
         signature = self.keypair.sign_message(tx.message.to_bytes())
         signed_tx = VersionedTransaction.populate(tx.message, [signature])
 
-        # Envío a la red a través del RPC de Helius.
         async with AsyncClient(self.rpc_url) as client:
             res = await client.send_raw_transaction(
                 bytes(signed_tx.to_bytes()),
@@ -290,26 +252,8 @@ class JupiterExecutor:
         logger.success("Swap enviado: {}", res.value)
         return res.value
 
-    @staticmethod 
-    def _decode_transaction(raw_tx: Any) -> bytes:
-        """Decodifica la transacción devuelta por Jupiter (str o lista)."""
-        if isinstance(raw_tx, str):
-            return bytes.fromhex(raw_tx[2:]) if raw_tx.startswith("0x") else base58.b58decode(raw_tx)
-        elif isinstance(raw_tx, list):
-            return bytes(raw_tx)
-        raise ValueError("Formato de transacción no soportado")
-
-
     # ------------------------------------------------------------ Public
     async def buy_token(self, token_mint: str, dry_run: Optional[bool] = None) -> Signature | str:
-        """Compra un token usando BUY_AMOUNT_SOL de SOL.
-
-        Si `dry_run` es True (o si el executor está en simulación), no envía
-        ninguna transacción real: solo obtiene la cotización de Jupiter, registra
-        la posición simulada y devuelve la cadena "DRY_RUN" como firma sintética.
-
-        Registra la posición abierta con su precio de entrada y el peak inicial.
-        """
         simulate = self.dry_run if dry_run is None else dry_run
         amount_lamports = int(self.buy_amount_sol * 1_000_000_000)
         async with aiohttp.ClientSession() as session:
@@ -326,45 +270,30 @@ class JupiterExecutor:
             else:
                 sig = await self._build_and_send_swap(session, quote)
 
-        # Precio de entrada por token en SOL calculado desde la bonding curve:
-        # entry_price_sol = amount_sol / tokens_out.
         out_amount = float(
-            quote.get("outAmount", quote.get("routePlan", [{}])[0].get("outAmount", 0))
-            or 0
+            quote.get("outAmount", quote.get("routePlan", [{}])[0].get("outAmount", 0)) or 0
         )
         decimals = await self._get_token_decimals(token_mint)
         token_qty_ui = out_amount / (10 ** decimals) if decimals else 0.0
 
         if simulate:
-            # DRY_RUN: usar el MISMO endpoint de monitoreo (get_token_price ->
-            # Jupiter/DexScreener/Pump.fun) para que el PnL del tracker sea
-            # coherente. Nunca inventar un precio de entrada: el precio viene
-            # siempre de una fuente de mercado real vía get_token_price; si no
-            # hay precio real se deja la entrada en 0.0 (PENDIENTE) para que el
-            # tracker fije la base con el primer precio real obtenido.
             entry_price_sol = 0.0
             try:
                 entry_price_sol = await self.get_token_price(token_mint)
-            except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
-                logger.warning(
-                    "No se pudo obtener precio real de {} en DRY_RUN: {}", token_mint, exc
-                )
+            except Exception as exc:
+                logger.warning("No se pudo obtener precio real de {} en DRY_RUN: {}", token_mint, exc)
             if entry_price_sol <= 0:
                 entry_price_sol = 0.0
         else:
-            entry_price_sol = (
-                self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
-            )
-            # Último recurso (sin inventar precio): si la curva no entregó
-            # tokens, se consulta la cotización actual vía Jupiter.
+            entry_price_sol = self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
             if not entry_price_sol or entry_price_sol <= 0:
                 try:
                     entry_price_sol = await self.get_token_price(token_mint)
-                except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
+                except Exception as exc:
                     logger.warning("No se pudo obtener precio base de {}: {}", token_mint, exc)
                 if entry_price_sol <= 0:
-                    # Sin precio real en ningún endpoint: entrada PENDIENTE.
                     entry_price_sol = 0.0
+
         entry_price_sol = max(entry_price_sol, 0.0)
 
         self.positions[token_mint] = Position(
@@ -386,12 +315,6 @@ class JupiterExecutor:
         token_balance_ui: float,
         slippage_bps: Optional[int] = None,
     ) -> Signature:
-        """Vende la totalidad del balance de un token.
-
-        `slippage_bps` permite usar un slippage distinto del configurado
-        (p. ej. 15-20% en ventas de emergencia por stop-loss).
-        """
-        # El balance del token suele venir en unidades decimales UI.
         decimals = await self._get_token_decimals(token_mint)
         raw_amount = int(token_balance_ui * (10 ** decimals))
 
@@ -404,25 +327,6 @@ class JupiterExecutor:
 
     # --------------------------------------------------- Price / Monitoring
     async def get_token_price(self, token_mint: str) -> float:
-        """Consulta el precio del token contra SOL con fallback encadenado.
-
-        Orden de consulta optimizado:
-        - Tokens de Pump.fun (mint terminado en "pump", recién creados):
-          DexScreener -> Pump.fun -> Jupiter (último recurso para tokens ya
-          migrados a Raydium). Se evita golpear Jupiter primero, que devolvería
-          404 seguro.
-        - Resto de tokens: Jupiter v6 -> DexScreener -> Pump.fun.
-        - Pump.fun como último recurso para tokens < 30s sin listing.
-
-        Todas las fuentes devuelven SOL (priceNative de DexScreener / reservas de
-        Pump.fun), de forma que `current_price` y `entry_price` quedan en la misma
-        unidad para que el PnL del tracker sea coherente. Si la posición activa
-        no tiene un precio de entrada previo, el primer precio real obtenido se
-        adopta como `entry_price` base de la posición.
-        """
-        # Los mints de Pump.fun siempre terminan en "pump": su cotización aún
-        # no está en Jupiter (404 seguro), así que no tiene sentido consultarlo
-        # primero para tokens recién creados.
         is_pump_mint = str(token_mint).lower().endswith("pump")
         try_sequence = (
             ("dexscreener", "pumpfun", "jupiter")
@@ -444,11 +348,10 @@ class JupiterExecutor:
                             session, token_mint, SOL_MINT, amount_lamports
                         )
                     out = float(quote.get("outAmount") or 0)
-                    price_sol = out / 1_000_000_000  # lamports -> SOL
+                    price_sol = out / 1_000_000_000
                     if price_sol > 0:
                         logger.info("Precio de {} vía Jupiter (SOL): {:.10g}", token_mint, price_sol)
-                except Exception as exc:  # noqa: BLE001
-                    # Silencioso: 404 de Jupiter es lo esperado para tokens nuevos.
+                except Exception as exc:
                     logger.debug("Jupiter sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
 
             elif source == "dexscreener":
@@ -456,7 +359,7 @@ class JupiterExecutor:
                     price_sol = await self._get_price_from_dexscreener(token_mint)
                     if price_sol > 0:
                         logger.info("Precio de {} vía DexScreener (SOL): {:.10g}", token_mint, price_sol)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning("DexScreener sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
 
             elif source == "pumpfun":
@@ -464,14 +367,12 @@ class JupiterExecutor:
                     price_sol = await self._get_price_from_pumpfun(token_mint)
                     if price_sol > 0:
                         logger.info("Precio de {} vía Pump.fun (SOL): {:.10g}", token_mint, price_sol)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.error("Pump.fun sin precio para {}: {}", token_mint, exc)
 
         if price_sol <= 0:
             raise SwapExecutionError(f"No se pudo obtener precio de {token_mint} desde ningún endpoint.")
 
-        # Coherencia de PnL: si no hay precio de entrada previo, el primer precio
-        # real obtenido se adopta como entry_price base (misma unidad: SOL).
         position = self.positions.get(token_mint)
         if position is not None and (not position.entry_price or position.entry_price <= 0):
             position.entry_price = price_sol
@@ -481,7 +382,6 @@ class JupiterExecutor:
         return price_sol
 
     async def _get_price_from_dexscreener(self, token_mint: str) -> float:
-        """Consulta precio vía DexScreener. Extrae priceNative (SOL) o priceUsd."""
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
@@ -495,11 +395,8 @@ class JupiterExecutor:
             logger.debug("DexScreener sin pairs para {}", token_mint)
             return 0.0
 
-        # Prioriza la pair con más liquidez.
         best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
 
-        # priceNative es el precio en SOL (ej: "0.000123"). Se extrae SIEMPRE
-        # en SOL para mantener la misma unidad que entry_price (coherencia PnL).
         try:
             price_native = float(best.get("priceNative", 0) or 0)
         except (ValueError, TypeError):
@@ -507,26 +404,18 @@ class JupiterExecutor:
         if price_native > 0:
             return price_native
 
-        # Fallback a priceUsd y convertir a SOL usando el precio de SOL en USD.
         price_usd = best.get("priceUsd")
         if price_usd:
             try:
                 sol_usd = await self._get_sol_usd_price()
                 if sol_usd > 0:
                     return float(price_usd) / sol_usd
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
         return 0.0
 
     async def _get_price_from_pumpfun(self, token_mint: str) -> float:
-        """Consulta precio vía Pump.fun API; calcula precio SOL desde la curva.
-
-        Prioriza las reservas virtuales de la bonding curve (Pump.fun):
-            precio_sol = virtual_sol_reserves / virtual_token_reserves
-        y cae a las reservas reales (`sol_reserves`/`token_reserves`) si las
-        virtuales no están disponibles.
-        """
         url = f"https://frontend-api.pump.fun/coins/{token_mint}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
@@ -535,8 +424,6 @@ class JupiterExecutor:
                     return 0.0
                 data = await resp.json()
 
-        # Bonding curve de Pump.fun (reservas virtuales):
-        #   precio_sol = (virtual_sol_reserves) / (virtual_token_reserves)
         virtual_sol = data.get("virtual_sol_reserves")
         virtual_tokens = data.get("virtual_token_reserves")
         if virtual_sol and virtual_tokens:
@@ -548,7 +435,6 @@ class JupiterExecutor:
             except (ValueError, TypeError):
                 pass
 
-        # Alternativa: reservas reales de la curva, si la API no expone virtual.
         sol_reserves = data.get("sol_reserves")
         token_reserves = data.get("token_reserves")
         if sol_reserves and token_reserves:
@@ -560,7 +446,6 @@ class JupiterExecutor:
             except (ValueError, TypeError):
                 pass
 
-        # Alternativa: precio en SOL directo si la API lo expone.
         sol_supply = data.get("sol_supply")
         token_supply = data.get("token_supply")
         if sol_supply and token_supply:
@@ -572,7 +457,6 @@ class JupiterExecutor:
         return 0.0
 
     async def _get_sol_usd_price(self) -> float:
-        """Obtiene el precio de SOL en USD para convertir precios de DexScreener."""
         url = "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
@@ -583,19 +467,9 @@ class JupiterExecutor:
                         price_usd = pairs[0].get("priceUsd")
                         if price_usd:
                             return float(price_usd)
-        # Valor de respaldo razonable si DexScreener falla.
         return 180.0
 
     async def get_token_symbol(self, token_mint: str) -> str:
-        """Busca el ticker real del token consultando DexScreener y Pump.fun.
-
-        Orden de consulta:
-        1. DexScreener -> `baseToken.symbol` (ej: "MET").
-        2. Pump.fun -> `symbol`.
-        3. Fallback local: primeros 6 caracteres del mint en mayúsculas (ej: "METVSV").
-
-        Nunca devuelve "N/A".
-        """
         symbol = await self._get_symbol_from_dexscreener(token_mint)
         if symbol:
             return symbol
@@ -607,7 +481,6 @@ class JupiterExecutor:
         return fallback
 
     async def _get_symbol_from_dexscreener(self, token_mint: str) -> str:
-        """Extrae el ticker desde `baseToken.symbol` de la pair con más liquidez."""
         url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
@@ -624,7 +497,6 @@ class JupiterExecutor:
         return symbol.upper()
 
     async def _get_symbol_from_pumpfun(self, token_mint: str) -> str:
-        """Extrae el ticker desde `symbol` de la API de Pump.fun."""
         url = f"https://frontend-api.pump.fun/coins/{token_mint}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
@@ -636,56 +508,41 @@ class JupiterExecutor:
         return symbol.upper()
 
     async def monitor_position(self, token_mint: str) -> tuple[str, float]:
-        """Evalúa una posición y ejecuta la salida según sea necesario.
-
-        Returns:
-            Una tupla (motivo, pnl_pct) donde `motivo` es "TAKE_PROFIT",
-            "STOP_LOSS", "TRAILING_STOP" o "" (sin salida) y `pnl_pct` es el
-            porcentaje de ganancia/pérdida en el momento de la evaluación.
-        """
         position = self.positions.get(token_mint)
         if position is None:
             return "", 0.0
 
-        # Actualiza el precio actual del token.
         try:
             current_price = await self.get_token_price(token_mint)
-        except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
+        except Exception as exc:
             logger.warning("No se pudo consultar precio de {}: {}", token_mint, exc)
             return "", 0.0
 
-        # Si falta un precio de entrada válido, se re-consulta el precio base
-        # para no ignorar la posición ni provocar una división por cero.
         if not position.entry_price or position.entry_price <= 0:
             try:
                 position.entry_price = await self.get_token_price(token_mint)
-            except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
+            except Exception as exc:
                 logger.warning("No se pudo re-consultar precio de entrada de {}: {}", token_mint, exc)
                 return "", 0.0
             logger.info("Precio de entrada re-establecido para {}: {:.10g}", token_mint, position.entry_price)
 
-        # Actualizamos el peak: el máximo alcanzado jamás puede bajar.
         position.peak_price = max(position.peak_price, current_price)
         pnl_pct = (
             (current_price - position.entry_price) / position.entry_price * 100
         ) if position.entry_price else 0.0
 
-        # Regla 1: Stop-Loss inicial fijo (-30%).
         if pnl_pct <= -self.stop_loss_pct:
             await self.close_position(token_mint, "STOP_LOSS", pnl_pct)
             return "STOP_LOSS", pnl_pct
 
-        # Regla 2: Take-Profit fijo (+100%).
         if pnl_pct >= self.take_profit_pct:
             await self.close_position(token_mint, "TAKE_PROFIT", pnl_pct)
             return "TAKE_PROFIT", pnl_pct
 
-        # Regla 3: Trailing Stop tras ganancia >= +20%.
         if pnl_pct >= self.trailing_activation_pct:
             position.trailing_active = True
 
         if position.trailing_active:
-            # Cuando el precio retrocede DISTANCIA desde el peak, cerramos.
             drawdown = (
                 (position.peak_price - current_price) / position.peak_price * 100
             ) if position.peak_price else 0.0
@@ -702,18 +559,11 @@ class JupiterExecutor:
         pnl_pct: float,
         slippage_bps: Optional[int] = None,
     ) -> None:
-        """Cierra una posición vendiendo el total (real o simulado).
-
-        Con `DRY_RUN=False`, la transacción de venta se firma localmente con
-        la `PRIVATE_KEY` (`self.keypair`) y se envía a la red de Solana.
-        `slippage_bps` permite forzar slippage alto en ventas de emergencia.
-        """
         position = self.positions.get(token_mint)
         if position is None:
             return
 
         if self.dry_run:
-            # Simulación: no se envía transacción real, solo se registra.
             logger.info(
                 "[DRY_RUN] Venta simulada de {} por {} (PnL {:.2f}%)",
                 token_mint, reason, pnl_pct,
@@ -726,7 +576,7 @@ class JupiterExecutor:
                 token_mint, position.token_amount_ui,
                 slippage_bps=slippage_bps,
             )
-        except Exception as exc:  # noqa: BLE001 - persistimos la posición en fallo
+        except Exception as exc:
             logger.error("Error vendiendo {} ({}): {}", token_mint, reason, exc)
             return
 
@@ -735,12 +585,13 @@ class JupiterExecutor:
 
     # ------------------------------------------------------------ Decimals
     async def _get_token_decimals(self, token_mint: str) -> int:
-        """Consulta los decimales del token vía RPC (usa data program info)."""
-        async with AsyncClient(self.rpc_url) as client:
-            account = await client.get_account_info_json_parsed(Pubkey.from_string(token_mint))
-        parsed = account.value.data if account.value else None
+        """Consulta los decimales del token vía RPC mediante get_token_supply."""
         try:
-            return parsed.parsed["info"]["decimals"]
-        except (AttributeError, KeyError, TypeError):
-            logger.warning("No se pudieron obtener decimals, asumiendo 9 (memecoin).")
-            return 9
+            async with AsyncClient(self.rpc_url) as client:
+                resp = await client.get_token_supply(Pubkey.from_string(token_mint))
+                if resp.value and resp.value.decimals is not None:
+                    return resp.value.decimals
+        except Exception as exc:
+            logger.warning("No se pudieron obtener decimales para {}: {}", token_mint, exc)
+
+        return 6
