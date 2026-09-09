@@ -21,7 +21,7 @@ addopts = """
 # bot de memecoins de Solana; estos ficheros romperían la colección de pytest.
 
 [tool.mutmut]
-paths_to_mutate = ["core/tracker.py", "core/execution.py"]
+source_paths = ["core/tracker.py", "core/execution.py"]
 runner = "python -m pytest tests/"
 backup = false
 
