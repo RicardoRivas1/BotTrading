@@ -57,6 +57,12 @@ def _is_route_not_found(exc: Exception) -> bool:
     return any(phrase in message for phrase in ("route not found", "no route", "404"))
 
 
+def _is_rate_limit(exc: Exception) -> bool:
+    """True si el error de Jupiter indica saturación de la API (429 / Rate limit)."""
+    message = str(exc).lower()
+    return any(phrase in message for phrase in ("429", "rate limit", "too many requests"))
+
+
 def cargar_keypair(key_str: str) -> Keypair:
     """Carga una wallet de Solana desde una clave Base58 o una frase mnemonic."""
     key_str = key_str.strip()
@@ -154,6 +160,9 @@ class JupiterExecutor:
         self.dry_run = dry_run
 
         self.positions: dict[str, Position] = {}
+        # Tokens detectados en la bonding curve de Pump.fun (sin ruta en
+        # Jupiter/Raydium): para ellos se salta Jupiter y se vende directo.
+        self.pump_bonding_tokens: set[str] = set()
 
     @staticmethod
     def _decode_transaction(raw_tx: Any) -> bytes:
@@ -256,16 +265,36 @@ class JupiterExecutor:
         signature = self.keypair.sign_message(tx.message.to_bytes())
         signed_tx = VersionedTransaction.populate(tx.message, [signature])
 
+        return await self._submit_signed_transaction(signed_tx)
+
+    async def _submit_signed_transaction(self, signed_tx: VersionedTransaction) -> Signature:
+        """Envía y confirma una transacción firmada vía RPC.
+
+        Devuelve el txid (Signature). Si la confirmación on-chain falla o tarda
+        demasiado se registra un warning; no se re-lanza para evitar reintentos
+        de venta que dupliquen la transacción.
+        """
         async with AsyncClient(self.rpc_url) as client:
             res = await client.send_raw_transaction(
                 bytes(signed_tx.to_bytes()),
                 opts={"skipPreflight": False},
             )
-        if not res.value:
-            raise SwapExecutionError("Respuesta de envío sin firma")
+            if not res.value:
+                raise SwapExecutionError("Respuesta de envío sin firma")
+            txid = res.value
 
-        logger.success("Swap enviado: {}", res.value)
-        return res.value
+            try:
+                confirmation = await client.confirm_transaction(txid, commitment="confirmed")
+                status = confirmation.value[0] if confirmation.value else None
+                if status is not None and status.err is None:
+                    logger.success("Venta confirmada on-chain: {}", txid)
+                else:
+                    logger.warning("Venta falló on-chain ({}): {}", status.err if status else "sin estado", txid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("No se pudo confirmar la transacción {}: {}", txid, exc)
+
+        logger.success("Swap enviado: {}", txid)
+        return txid
 
     # ------------------------------------------------------------ Public
     async def buy_token(self, token_mint: str, dry_run: Optional[bool] = None) -> Signature | str:
@@ -333,12 +362,21 @@ class JupiterExecutor:
         """Vende un token, con fallback directo en Pump.fun para la bonding curve.
 
         Intenta primero la cotización y el swap vía Jupiter. Si Jupiter no
-        encuentra ruta (404 / "Route not found", habitual cuando el token aún
-        no migró a Raydium) o no devuelve cotización, redirige a
-        `_sell_pumpfun_token` para una venta directa por PumpPortal.
+        encuentra ruta (404 / "Route not found", token en bonding curve) o
+        satura la API (429 / "Rate limit"), redirige a `_sell_via_pumpportal`
+        para una venta directa por PumpPortal. Los tokens ya marcados como
+        bonding curve saltan directamente a PumpPortal.
         """
         decimals = await self._get_token_decimals(token_mint)
         raw_amount = int(token_balance_ui * (10 ** decimals))
+
+        if token_mint in self.pump_bonding_tokens:
+            logger.info(
+                "{} ya marcado como bonding curve: venta directa por Pump.fun", token_mint
+            )
+            return await self._sell_via_pumpportal(
+                token_mint, token_balance_ui, slippage_bps=slippage_bps
+            )
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -350,18 +388,29 @@ class JupiterExecutor:
                     raise SwapExecutionError("Jupiter quote vacía (Route not found)")
                 return await self._build_and_send_swap(session, quote)
         except SwapExecutionError as exc:
-            if not _is_route_not_found(exc):
-                raise
-            logger.warning(
-                "Jupiter sin ruta para vender {} (aún en bonding curve): {}. "
-                "Ejecutando venta directa por Pump.fun.",
-                token_mint, exc,
-            )
-            return await self._sell_pumpfun_token(
-                token_mint, token_balance_ui, slippage_bps=slippage_bps
-            )
+            if _is_rate_limit(exc):
+                logger.warning(
+                    "Jupiter saturó la API ({}). Pausa de 1s y venta de respaldo por Pump.fun.",
+                    exc,
+                )
+                await asyncio.sleep(1.0)
+                self.pump_bonding_tokens.add(token_mint)
+                return await self._sell_via_pumpportal(
+                    token_mint, token_balance_ui, slippage_bps=slippage_bps
+                )
+            if _is_route_not_found(exc):
+                logger.warning(
+                    "Jupiter sin ruta para vender {} (bonding curve): {}. "
+                    "Ejecutando venta directa por Pump.fun.",
+                    token_mint, exc,
+                )
+                self.pump_bonding_tokens.add(token_mint)
+                return await self._sell_via_pumpportal(
+                    token_mint, token_balance_ui, slippage_bps=slippage_bps
+                )
+            raise
 
-    async def _sell_pumpfun_token(
+    async def _sell_via_pumpportal(
         self,
         mint: str,
         amount_ui: float,
@@ -369,9 +418,10 @@ class JupiterExecutor:
     ) -> Signature:
         """Venta directa en la bonding curve de Pump.fun vía PumpPortal.
 
-        Construye la transacción de venta con la API `trade-local`, la firma
-        localmente con la clave privada y la envía a la red por el RPC
-        configurado. Devuelve la firma (txid) si es exitosa.
+        Realiza el POST a `https://pumpportal.fun/api/trade-local` con el
+        payload de venta, decodifica la transacción devuelta a
+        `VersionedTransaction`, la firma localmente con la clave privada y la
+        envía/confirma por el RPC configurado. Devuelve el txid (Signature).
         """
         slippage_pct = (self.slippage_bps if slippage_bps is None else slippage_bps) / 100.0
         logger.debug("Vendiendo balance de {} (100%) para {}", amount_ui, mint)
@@ -402,16 +452,8 @@ class JupiterExecutor:
         signature = self.keypair.sign_message(tx.message.to_bytes())
         signed_tx = VersionedTransaction.populate(tx.message, [signature])
 
-        async with AsyncClient(self.rpc_url) as client:
-            res = await client.send_raw_transaction(
-                bytes(signed_tx.to_bytes()),
-                opts={"skipPreflight": False},
-            )
-        if not res.value:
-            raise SwapExecutionError("Respuesta de envío sin firma")
-
-        logger.success("Venta directa Pump.fun enviada: {}", res.value)
-        return res.value
+        logger.info("Venta directa Pump.fun de {} enviada a la red.", mint)
+        return await self._submit_signed_transaction(signed_tx)
 
     @staticmethod
     def _decode_trade_local(raw_tx: Any) -> bytes:

@@ -9,6 +9,7 @@ llamadas a la venta y a la notificación se simulan; nunca se toca la red.
 import asyncio
 import time
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -28,10 +29,12 @@ def _make_config(take_profit: float = 100.0, stop_loss: float = 30.0) -> SimpleN
 
 
 @pytest.fixture
-def tracker() -> PositionTracker:
+def tracker(monkeypatch: pytest.MonkeyPatch) -> PositionTracker:
     """Tracker con executor y notifier mocks (nunca toca la red)."""
     executor = MagicMock()
     executor.get_token_price = AsyncMock(return_value=0.001)
+    # Neutralizar la consulta directa a la bonding curve de Pump.fun: sin red.
+    monkeypatch.setattr(tracker_module, "get_pumpfun_price", AsyncMock(return_value=None))
     return PositionTracker(
         executor=executor,
         notifier=MagicMock(),
@@ -216,6 +219,84 @@ class TestPrecioReal:
         pos = tracker.get_position("MINT123ABC")
         pnl = (0.004 - pos.buy_price) / pos.buy_price * 100.0
         assert pnl == pytest.approx(100.0)
+
+
+class TestCascadaPrecio:
+    """La cotización se obtiene en cascada: Pump.fun primero, luego el executor."""
+
+    async def test_pumpfun_es_la_primera_fuente(
+        self, tracker: PositionTracker, patch_sell: AsyncMock
+    ) -> None:
+        tracker_module.get_pumpfun_price = AsyncMock(return_value=0.002)  # +100%
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+        await tracker._evaluate("MINT123ABC")
+
+        assert isinstance(tracker_module.get_pumpfun_price, AsyncMock)
+        tracker_module.get_pumpfun_price.assert_awaited_once_with("MINT123ABC")
+        tracker.executor.get_token_price.assert_not_awaited()
+        assert patch_sell.await_args.kwargs["reason"] == "TAKE_PROFIT"
+
+    async def test_fallback_al_executor_si_pumpfun_falla(
+        self, tracker: PositionTracker, patch_sell: AsyncMock
+    ) -> None:
+        tracker_module.get_pumpfun_price = AsyncMock(return_value=None)
+        tracker.executor.get_token_price.return_value = 0.002
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+        await tracker._evaluate("MINT123ABC")
+
+        tracker.executor.get_token_price.assert_awaited_once()
+        assert patch_sell.await_args.kwargs["reason"] == "TAKE_PROFIT"
+
+    async def test_sin_precio_conserva_la_ultima_cotizacion(
+        self, tracker: PositionTracker, patch_sell: AsyncMock
+    ) -> None:
+        # Ambas fuentes fallan y ya existía una cotización conocida previa.
+        tracker_module.get_pumpfun_price = AsyncMock(return_value=None)
+        tracker.executor.get_token_price.side_effect = RuntimeError("sin API")
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+        tracker.get_position("MINT123ABC").current_price = 0.0015  # últ. conocida
+
+        await tracker._evaluate("MINT123ABC")
+
+        pos = tracker.get_position("MINT123ABC")
+        assert pos is not None
+        # Se conserva el último precio válido y jamás se iguala a la entrada.
+        assert pos.current_price == pytest.approx(0.0015)
+        assert pos.current_price != pos.buy_price
+        patch_sell.assert_not_awaited()
+
+    async def test_pumpfun_precio_desde_reservas_virtuales(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_pumpfun_price calcula SOL por token con los decimales de Solana."""
+
+        class _FakeResp:
+            status = 200
+
+            async def __aenter__(self) -> "_FakeResp":
+                return self
+
+            async def __aexit__(self, *exc_info: object) -> bool:
+                return False
+
+            async def json(self, content_type: Optional[str] = None) -> dict[str, int]:
+                return {
+                    "virtual_sol_reserves": 25_125_850_000,
+                    "virtual_token_reserves": 707_770_150_000_000,
+                }
+
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.get = MagicMock(return_value=_FakeResp())
+        monkeypatch.setattr("aiohttp.ClientSession", lambda *args, **kwargs: session)
+
+        price = await tracker_module.get_pumpfun_price("MINT123ABCpump")
+
+        vsol = 25_125_850_000 / 1e9
+        vtok = 707_770_150_000_000 / 1e6
+        assert price is not None
+        assert price == pytest.approx(vsol / vtok)
 
 
 class TestLogPeriodico:

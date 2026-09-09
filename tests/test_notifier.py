@@ -5,7 +5,6 @@ la red. Cubre el envío HTML, el reintento en texto plano ante errores 400,
 los mensajes de compra/venta/error/TP/SL y el heartbeat periódico.
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -123,6 +122,56 @@ class TestMensajes:
         notifier.send = AsyncMock(return_value=True)
         assert await notifier.send_status("bot activo") is True
         assert "ESTADO" in notifier.send.await_args.args[0]
+
+    async def test_notify_position_progress_compone_reporte(
+        self, notifier: TelegramNotifier
+    ) -> None:
+        from types import SimpleNamespace
+
+        pos = SimpleNamespace(
+            symbol="MET",
+            mint="MINT123ABC",
+            buy_price=0.00100000,
+            current_price=0.00112345,
+            latest_pnl_pct=12.34,
+            highest_pnl_pct=15.50,
+            created_at=0.0,
+            max_hold_seconds=300.0,
+        )
+        notifier.send = AsyncMock(return_value=True)
+        assert await notifier.notify_position_progress(
+            pos, take_profit_pct=100.0, stop_loss_pct=30.0
+        ) is True
+        sent: str = notifier.send.await_args.args[0]
+        assert "PROGRESO DE POSICIÓN" in sent
+        assert "MET" in sent
+        assert "📈 PnL Actual: +12.34%" in sent
+        assert "Pico: +15.50%" in sent
+        assert "Entrada: 0.00100000 SOL" in sent
+        assert "Actual: 0.00112345 SOL" in sent
+        assert "TP: +100% | SL: -30%" in sent
+        assert "pump.fun/MINT123ABC" in sent
+
+    async def test_notify_position_progress_pnl_negativo_usa_emoji_rojo(
+        self, notifier: TelegramNotifier
+    ) -> None:
+        from types import SimpleNamespace
+
+        pos = SimpleNamespace(
+            symbol="MET",
+            mint="MINT123ABC",
+            buy_price=0.001,
+            current_price=0.0005,
+            latest_pnl_pct=-50.0,
+            highest_pnl_pct=5.0,
+            created_at=0.0,
+            max_hold_seconds=300.0,
+        )
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_position_progress(pos)
+        sent: str = notifier.send.await_args.args[0]
+        assert "📉 PnL Actual: -50.00%" in sent
+        assert "📈" not in sent
 
     async def test_send_buy_escapa_html(self, notifier: TelegramNotifier) -> None:
         """El ticker/mint se escapan para evitar errores 400 de Telegram."""
