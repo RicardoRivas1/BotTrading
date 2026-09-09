@@ -68,4 +68,4 @@ jobs:
       # Los paths a mutar salen de pyproject.toml ([tool.mutmut]).
       # Con CI=true, mutmut falla si deja mutantes supervivientes.
       - name: mutmut sobre tracker + execution
-      run: mutmut run --paths-to-mutate core/tracker.py
+        run: mutmut run --paths-to-mutate core/tracker.py
