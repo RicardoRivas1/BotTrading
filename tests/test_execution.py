@@ -619,10 +619,12 @@ class TestBuyPumpfun:
         assert payload["action"] == "buy"
         assert payload["mint"] == MINT_PUMP
         assert payload["amount"] == 0.05
+        assert isinstance(payload["amount"], float)
         assert payload["denominatedInSol"] == "true"
         # Slippage de compra dentro de [15, 20]% (SLIPPAGE_BPS=500 → clampa a 15).
         assert 15.0 <= payload["slippage"] <= 20.0
         assert payload["priorityFee"] >= 0.0001
+        assert payload["pool"] == "pump"
         assert len(captured["sent"]) == 1
         assert captured["sent"][0] == b"\x01" * 64
 

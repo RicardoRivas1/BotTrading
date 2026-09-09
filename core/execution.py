@@ -439,25 +439,26 @@ class JupiterExecutor:
     ) -> Signature:
         """Compra directa en la bonding curve de Pump.fun vía PumpPortal.
 
-        Payload en SOL (`denominatedInSol="true"`) con un `priorityFee` mínimo
-        de 0.0001 SOL y un `slippage` de compra dentro de [15, 20]% para no
-        fallar ante las variaciones bruscas de precio de la curva. La
-        confirmación on-chain es obligatoria (`require_confirmation=True`).
+        Payload en SOL (`denominatedInSol="true"`), con `pool: "pump"` para la
+        bonding curve, `slippage` de compra dentro de [15, 20]% y `priorityFee`
+        de 0.0001 SOL. La confirmación on-chain es obligatoria
+        (`require_confirmation=True`).
         """
-        amount_sol = self.buy_amount_sol if amount_sol is None else amount_sol
+        amount_sol = float(self.buy_amount_sol if amount_sol is None else amount_sol)
         slippage_pct = min(BUY_SLIPPAGE_MAX_PCT, max(BUY_SLIPPAGE_MIN_PCT, self.slippage_bps / 100.0))
         logger.info(
             "Comprando {} SOL de {} por PumpPortal (bonding curve, slippage {}%)",
             amount_sol, mint, slippage_pct,
         )
         payload = {
-            "publicKey": self.wallet_pubkey,
+            "publicKey": str(self.wallet_pubkey),
             "action": "buy",
-            "mint": mint,
+            "mint": str(mint),
             "amount": amount_sol,
             "denominatedInSol": "true",
             "slippage": slippage_pct,
             "priorityFee": 0.0001,
+            "pool": "pump",
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(
