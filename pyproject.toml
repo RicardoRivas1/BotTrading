@@ -2,6 +2,7 @@
 # pytest usa este archivo en lugar de pytest.ini (origen único de config).
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = """
@@ -22,7 +23,7 @@ addopts = """
 
 [tool.mutmut]
 source_paths = ["core/tracker.py", "core/execution.py"]
-runner = "python -m pytest tests/"
+runner = "python -m pytest tests/ -o addopts=''"
 backup = false
 
 [tool.ruff]
