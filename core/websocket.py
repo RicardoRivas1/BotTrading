@@ -67,14 +67,15 @@ async def check_rugcheck(mint: str) -> int:
 def resolve_symbol(symbol: Any, mint: Any = None) -> str:
     """Devuelve un ticker/símbolo válido y nunca "N/A".
 
-    Si `symbol` llega vacío, "N/A" o nulo (tokens recién creados que aún no
-    tienen ticker), deriva un ticker de respaldo desde el mint: los primeros
-    4 caracteres precedidos por "$" (ej: mint "KEJj..." -> "$KEJj").
+    Si `symbol` llega vacío, "N/A" o nulo en la señal, deriva un ticker de
+    respaldo desde el mint (primeros 6 caracteres en mayúsculas, ej: "METVSV").
+    La búsqueda por API (DexScreener/Pump.fun -> baseToken.symbol) la realiza
+    `JupiterExecutor.get_token_symbol` en el flujo de compra.
     """
     if symbol and str(symbol).strip() and str(symbol).strip().upper() != "N/A":
         return str(symbol).strip()
     if mint:
-        return f"${str(mint)[:4]}"
+        return str(mint)[:6].upper()
     return "N/A"
 
 
@@ -84,10 +85,6 @@ async def process_buy_and_notify(
     """Ejecuta una compra de prueba (simulada) y notifica a Telegram."""
     from core.execution import JupiterExecutor
     from core.notifier import TelegramNotifier
-
-    # Nunca registrar ni notificar un símbolo "N/A": si no hay ticker, se
-    # deriva uno de respaldo desde el mint (primeros 4 caracteres).
-    symbol = resolve_symbol(symbol, mint)
 
     cfg = config.load_config()
     executor = JupiterExecutor(
@@ -101,6 +98,22 @@ async def process_buy_and_notify(
         trailing_distance_pct=cfg.trading.TRAILING_STOP_DISTANCE_PCT,
         dry_run=cfg.trading.DRY_RUN,
     )
+
+    # Nunca registrar ni notificar symbol "N/A": si el ticker no viene en la
+    # señal, se consulta DexScreener/Pump.fun (baseToken.symbol -> ej: "MET")
+    # y, si falla la API, se usan los primeros 6 caracteres del mint en
+    # mayúsculas (ej: "METVSV").
+    if symbol and str(symbol).strip() and str(symbol).strip().upper() != "N/A":
+        symbol = str(symbol).strip()
+    else:
+        try:
+            symbol = await executor.get_token_symbol(mint)
+        except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
+            logger.warning(
+                f"No se pudo obtener ticker de {mint} por API: {exc}; usando fallback del mint."
+            )
+            symbol = str(mint)[:6].upper()
+
     notifier = TelegramNotifier(
         token=cfg.telegram.TELEGRAM_TOKEN,
         chat_id=cfg.telegram.TELEGRAM_CHAT_ID,

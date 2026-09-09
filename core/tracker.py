@@ -68,6 +68,13 @@ class PositionTracker:
         amount: float,
     ) -> None:
         """Registra una posición activa para que el monitor la vigile."""
+        # Nunca guardar symbol "N/A": si no hay ticker, usar los primeros 6
+        # caracteres del mint en mayúsculas (ej: "METVSV").
+        if symbol and str(symbol).strip() and str(symbol).strip().upper() != "N/A":
+            symbol = str(symbol).strip()
+        else:
+            symbol = str(mint)[:6].upper()
+
         # Dirección de la simulación determinista por mint (mitad a TP, mitad a SL).
         sim_direction = 1 if (sum(ord(ch) for ch in mint) % 2 == 0) else -1
         self.positions[mint] = TrackerPosition(

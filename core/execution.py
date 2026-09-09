@@ -337,17 +337,34 @@ class JupiterExecutor:
         )
         decimals = await self._get_token_decimals(token_mint)
         token_qty_ui = out_amount / (10 ** decimals) if decimals else 0.0
-        entry_price_sol = (
-            self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
-        )
 
-        # Último recurso (sin inventar precio): si la curva no entregó tokens,
-        # se consulta la cotización actual vía Jupiter.
-        if not entry_price_sol or entry_price_sol <= 0:
+        if simulate:
+            # DRY_RUN: usar el MISMO endpoint de monitoreo (get_token_price ->
+            # Jupiter/DexScreener/Pump.fun) para que el PnL del tracker sea
+            # coherente. Nunca inventar un precio de entrada. La cotización
+            # simulada de Jupiter (1:1) daría 0.001 SOL hardcodeado: se evita.
+            entry_price_sol = 0.0
             try:
                 entry_price_sol = await self.get_token_price(token_mint)
             except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
-                logger.warning("No se pudo obtener precio base de {}: {}", token_mint, exc)
+                logger.warning(
+                    "No se pudo obtener precio real de {} en DRY_RUN: {}", token_mint, exc
+                )
+            if entry_price_sol <= 0:
+                # Último recurso sin inventar precio: derivo de la bond curve
+                # de la cotización obtenida (p. ej. Jupiter con ruta real).
+                entry_price_sol = self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
+        else:
+            entry_price_sol = (
+                self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
+            )
+            # Último recurso (sin inventar precio): si la curva no entregó
+            # tokens, se consulta la cotización actual vía Jupiter.
+            if not entry_price_sol or entry_price_sol <= 0:
+                try:
+                    entry_price_sol = await self.get_token_price(token_mint)
+                except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
+                    logger.warning("No se pudo obtener precio base de {}: {}", token_mint, exc)
         entry_price_sol = max(entry_price_sol, 0.0)
 
         self.positions[token_mint] = Position(
@@ -391,8 +408,14 @@ class JupiterExecutor:
         2. DexScreener API (fallback si Jupiter falla por 404 o red).
         3. Pump.fun API (último recurso para tokens < 30s sin listing en DexScreener).
 
-        Devuelve el precio expresado en SOL.
+        Todas las fuentes devuelven SOL (priceNative de DexScreener / reservas de
+        Pump.fun), de forma que `current_price` y `entry_price` quedan en la misma
+        unidad para que el PnL del tracker sea coherente. Si la posición activa
+        no tiene un precio de entrada previo, el primer precio real obtenido se
+        adopta como `entry_price` base de la posición.
         """
+        price_sol = 0.0
+
         # --- 1. Jupiter v6 (principal) ---
         try:
             decimals = await self._get_token_decimals(token_mint)
@@ -402,29 +425,40 @@ class JupiterExecutor:
                     session, token_mint, SOL_MINT, amount_lamports
                 )
             out = float(quote.get("outAmount") or 0)
-            price_sol = out / 1_000_000_000
-            if price_sol > 0:
-                return price_sol
+            price_sol = out / 1_000_000_000  # lamports -> SOL
         except Exception as exc:  # noqa: BLE001
             logger.warning("Jupiter sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
 
         # --- 2. DexScreener ---
-        try:
-            price_sol = await self._get_price_from_dexscreener(token_mint)
-            if price_sol > 0:
-                return price_sol
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("DexScreener sin precio para {} ({}); intentando Pump.fun.", token_mint, exc)
+        if price_sol <= 0:
+            try:
+                price_sol = await self._get_price_from_dexscreener(token_mint)
+                if price_sol > 0:
+                    logger.info("Precio de {} vía DexScreener (SOL): {:.10g}", token_mint, price_sol)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DexScreener sin precio para {} ({}); intentando Pump.fun.", token_mint, exc)
 
         # --- 3. Pump.fun (curva de bonding) ---
-        try:
-            price_sol = await self._get_price_from_pumpfun(token_mint)
-            if price_sol > 0:
-                return price_sol
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Pump.fun sin precio para {}: {}", token_mint, exc)
+        if price_sol <= 0:
+            try:
+                price_sol = await self._get_price_from_pumpfun(token_mint)
+                if price_sol > 0:
+                    logger.info("Precio de {} vía Pump.fun (SOL): {:.10g}", token_mint, price_sol)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Pump.fun sin precio para {}: {}", token_mint, exc)
 
-        raise SwapExecutionError(f"No se pudo obtener precio de {token_mint} desde ningún endpoint.")
+        if price_sol <= 0:
+            raise SwapExecutionError(f"No se pudo obtener precio de {token_mint} desde ningún endpoint.")
+
+        # Coherencia de PnL: si no hay precio de entrada previo, el primer precio
+        # real obtenido se adopta como entry_price base (misma unidad: SOL).
+        position = self.positions.get(token_mint)
+        if position is not None and (not position.entry_price or position.entry_price <= 0):
+            position.entry_price = price_sol
+            position.peak_price = max(position.peak_price, price_sol)
+            logger.info("Entry_price base adoptado para {} @ {:.10g} SOL", token_mint, price_sol)
+
+        return price_sol
 
     async def _get_price_from_dexscreener(self, token_mint: str) -> float:
         """Consulta precio vía DexScreener. Extrae priceNative (SOL) o priceUsd."""
@@ -444,13 +478,14 @@ class JupiterExecutor:
         # Prioriza la pair con más liquidez.
         best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
 
-        # priceNative es el precio en SOL (ej: "0.000123").
-        price_native = best.get("priceNative")
-        if price_native:
-            try:
-                return float(price_native)
-            except (ValueError, TypeError):
-                pass
+        # priceNative es el precio en SOL (ej: "0.000123"). Se extrae SIEMPRE
+        # en SOL para mantener la misma unidad que entry_price (coherencia PnL).
+        try:
+            price_native = float(best.get("priceNative", 0) or 0)
+        except (ValueError, TypeError):
+            price_native = 0.0
+        if price_native > 0:
+            return price_native
 
         # Fallback a priceUsd y convertir a SOL usando el precio de SOL en USD.
         price_usd = best.get("priceUsd")
@@ -514,6 +549,55 @@ class JupiterExecutor:
                             return float(price_usd)
         # Valor de respaldo razonable si DexScreener falla.
         return 180.0
+
+    async def get_token_symbol(self, token_mint: str) -> str:
+        """Busca el ticker real del token consultando DexScreener y Pump.fun.
+
+        Orden de consulta:
+        1. DexScreener -> `baseToken.symbol` (ej: "MET").
+        2. Pump.fun -> `symbol`.
+        3. Fallback local: primeros 6 caracteres del mint en mayúsculas (ej: "METVSV").
+
+        Nunca devuelve "N/A".
+        """
+        symbol = await self._get_symbol_from_dexscreener(token_mint)
+        if symbol:
+            return symbol
+        symbol = await self._get_symbol_from_pumpfun(token_mint)
+        if symbol:
+            return symbol
+        fallback = str(token_mint)[:6].upper()
+        logger.info("Sin ticker en APIs para {}; usando fallback {}", token_mint, fallback)
+        return fallback
+
+    async def _get_symbol_from_dexscreener(self, token_mint: str) -> str:
+        """Extrae el ticker desde `baseToken.symbol` de la pair con más liquidez."""
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
+                if resp.status != 200:
+                    return ""
+                data = await resp.json()
+
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return ""
+        best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+        base_token = best.get("baseToken") or {}
+        symbol = str(base_token.get("symbol", "") or "").strip()
+        return symbol.upper()
+
+    async def _get_symbol_from_pumpfun(self, token_mint: str) -> str:
+        """Extrae el ticker desde `symbol` de la API de Pump.fun."""
+        url = f"https://frontend-api.pump.fun/coins/{token_mint}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
+                if resp.status != 200:
+                    return ""
+                data = await resp.json()
+
+        symbol = str(data.get("symbol", "") or "").strip()
+        return symbol.upper()
 
     async def monitor_position(self, token_mint: str) -> tuple[str, float]:
         """Evalúa una posición y ejecuta la salida según sea necesario.
