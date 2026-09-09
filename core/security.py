@@ -60,20 +60,24 @@ class TokenSecurityValidator:
 
     def _parse_auth_from_mint(
         self, account_info: Optional[dict[str, Any]]
-    ) -> tuple[Optional[str], Optional[str], float]:
+    ) -> tuple[Optional[str], Optional[str], Optional[float]]:
         """Extrae mint/freeze authority y % de supply del Dev del mint.
 
         Devuelve (mint_authority, freeze_authority, dev_pct).
         Ambos authorities `None` en jsonParsed significa que están renunciadas.
         """
+
         if not account_info:
-            return None, None, 0.0
+            return None, None, None
 
         parsed = account_info.get("data", {}).get("parsed", {})
         info = parsed.get("info", {})
 
         mint_authority = info.get("mintAuthority")
         freeze_authority = info.get("freezeAuthority")
+
+        dev_pct = 0.0
+        return mint_authority, freeze_authority, dev_pct
 
         # dev_pct no se puede derivar del mint directamente; RugCheck
         # entrega en 'risks'. Aquí devolvemos 0.0 y delegamos a RugCheck.
