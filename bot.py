@@ -15,17 +15,16 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from typing import Optional
 
 from aiohttp import web
 from loguru import logger
 
 from config import AppConfig, load_config
-from core.websocket import TokenWebSocket, create_listener
-from core.security import TokenSecurityValidator, SecurityValidationError
 from core.execution import JupiterExecutor
 from core.notifier import TelegramNotifier
+from core.security import SecurityValidationError, TokenSecurityValidator
 from core.tracker import PositionTracker, set_global_tracker
+from core.websocket import TokenWebSocket, create_listener
 
 # -- Configuración inicial de loguru ------------------------------------------
 logger.remove()

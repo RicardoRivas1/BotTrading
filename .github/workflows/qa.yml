@@ -1,0 +1,71 @@
+name: QA
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: Lint y tipado (ruff + mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Instalar dependencias dev
+        run: pip install -r requirements-dev.txt
+      - name: ruff (core, config y arranque)
+        run: ruff check core/ config.py bot.py --select E4,E7,E9,F,I
+      - name: mypy (core)
+        run: mypy core/
+
+  tests:
+    name: Tests unitarios + cobertura (pytest-cov)
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Instalar dependencias dev
+        run: pip install -r requirements-dev.txt
+      - name: pytest con fail-under=85% en core/
+        run: pytest tests/
+      - name: Subir cobertura como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: htmlcov
+          path: htmlcov/
+
+  mutation:
+    name: Pruebas de mutación (mutmut)
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Instalar dependencias dev
+        run: pip install -r requirements-dev.txt
+      # Los paths a mutar salen de pyproject.toml ([tool.mutmut]).
+      # Con CI=true, mutmut falla si deja mutantes supervivientes.
+      - name: mutmut sobre tracker + execution
+        run: mutmut run

@@ -16,11 +16,11 @@ import aiohttp
 import base58
 from bip_utils import Bip39SeedGenerator, Bip44, Bip44Changes, Bip44Coins
 from loguru import logger
-from solders.keypair import Keypair
-from solders.transaction import VersionedTransaction
-from solders.signature import Signature
 from solana.rpc.async_api import AsyncClient
+from solders.keypair import Keypair
 from solders.pubkey import Pubkey
+from solders.signature import Signature
+from solders.transaction import VersionedTransaction
 
 from config import TradingSettings
 
@@ -298,7 +298,8 @@ class JupiterExecutor:
     def _decode_transaction(raw_tx: Any) -> bytes:
         """Decodifica la transacción devuelta por Jupiter (str o lista)."""
         if isinstance(raw_tx, str):
-            return bytes.fromhex(raw_tx) if raw_tx.startswith("0x") else base58.b58decode(raw_tx)
+            # "0x" + hex se decodifica directamente; si no, se asume Base58.
+            return bytes.fromhex(raw_tx[2:]) if raw_tx.startswith("0x") else base58.b58decode(raw_tx)
         if isinstance(raw_tx, list):
             return bytes(raw_tx)
         raise SwapExecutionError(f"Formato de transacción no soportado: {type(raw_tx)}")
@@ -725,7 +726,7 @@ class JupiterExecutor:
             return
 
         try:
-            sig = await self.sell_token(
+            await self.sell_token(
                 token_mint, position.token_amount_ui,
                 slippage_bps=slippage_bps,
             )

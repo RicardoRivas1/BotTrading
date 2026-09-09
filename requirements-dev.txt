@@ -1,0 +1,13 @@
+# Dependencias de desarrollo (QA, pruebas y tooling).
+# Instalar junto a requirements.txt:
+#   pip install -r requirements.txt -r requirements-dev.txt
+
+pytest
+pytest-asyncio
+pytest-cov
+mutmut
+ruff
+mypy
+
+# Dependencias de la suite de tests existente (conftest.py usa pandas).
+pandas

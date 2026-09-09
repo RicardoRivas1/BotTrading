@@ -11,12 +11,10 @@ asíncrona: nunca se bloquea el event loop de asyncio.
 from __future__ import annotations
 
 import asyncio
-import base64
 from typing import Any, Optional
 
 import aiohttp
 from loguru import logger
-from solders.pubkey import Pubkey
 
 from config import SecuritySettings
 
@@ -72,7 +70,6 @@ class TokenSecurityValidator:
 
         mint_authority = info.get("mintAuthority")
         freeze_authority = info.get("freezeAuthority")
-        supply = float(info.get("supply", "0"))
 
         # estimateDevPct no se puede derivar del mint directamente; RugCheck
         # entrega en 'risks'. Aquí devolvemos 0.0 y delegamos a RugCheck.
@@ -122,7 +119,6 @@ class TokenSecurityValidator:
         if not report:
             # Sin reporte = se asume alto riesgo para ser conservadores.
             return self.security.RUGCHECK_MAX_SCORE + 1
-        scan = report.get("token", {}).get("mintAuthority")
         if "risks" in report:
             total = sum(int(risk.get("score", 0)) for risk in report.get("risks", []))
             return total

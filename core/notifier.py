@@ -37,7 +37,7 @@ class TelegramNotifier:
             return False
 
         url = TELEGRAM_API.format(token=self.token)
-        payload = {
+        payload: dict[str, object] = {
             "chat_id": self.chat_id,
             "text": html,
             "parse_mode": parse_mode,
