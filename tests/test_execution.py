@@ -312,26 +312,30 @@ class TestUtilities:
         _patch_session(monkeypatch, _FakeResponse(500, {}), lambda resp: resp)
         assert await executor._get_sol_usd_price() == 180.0
 
-    async def test_get_token_decimals_parsed(self, executor: JupiterExecutor, monkeypatch) -> None:
-        class _FakeResp:
-            class _Inner:
-                decimals = 6
+  async def test_get_token_decimals_parsed(self, executor: JupiterExecutor, monkeypatch) -> None:
+    class _FakeResp:
+        class _Inner:
+            decimals = 6
+        value = _Inner()
 
-            value = _Inner()
+    client = AsyncMock()
+    client.__aenter__.return_value = client  # <--- Asigna el contexto asíncrono
+    client.get_token_supply.return_value = _FakeResp()
+    
+    monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
+    assert await executor._get_token_decimals(MINT_RAYDIUM) == 6
 
-        client = AsyncMock()
-        client.get_token_supply.return_value = _FakeResp()
-        monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
-        assert await executor._get_token_decimals(MINT_RAYDIUM) == 6
 
-    async def test_get_token_decimals_fallback(self, executor: JupiterExecutor, monkeypatch) -> None:
-        class _FakeResp:
-            value = None
+async def test_get_token_decimals_fallback(self, executor: JupiterExecutor, monkeypatch) -> None:
+    class _FakeResp:
+        value = None
 
-        client = AsyncMock()
-        client.get_token_supply.return_value = _FakeResp()
-        monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
-        assert await executor._get_token_decimals(MINT_RAYDIUM) == 9
+    client = AsyncMock()
+    client.__aenter__.return_value = client  # <--- Asigna el contexto asíncrono
+    client.get_token_supply.return_value = _FakeResp()
+    
+    monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
+    assert await executor._get_token_decimals(MINT_RAYDIUM) == 9
 
 
 class TestCompraVenta:
