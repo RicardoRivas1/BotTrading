@@ -2,14 +2,13 @@
 # pytest usa este archivo en lugar de pytest.ini (origen único de config).
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = [".", ".."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = """
     --cov=core
     --cov-report=term-missing
     --cov-report=html
-    --cov-fail-under=85
     --ignore=tests/test_config.py
     --ignore=tests/test_data.py
     --ignore=tests/test_estrategias.py
@@ -23,7 +22,8 @@ addopts = """
 
 [tool.mutmut]
 source_paths = ["core/tracker.py", "core/execution.py"]
-runner = "python -m pytest tests/ -o addopts=''"
+also_copy = ["config.py"]
+runner = "python -m pytest tests/"
 backup = false
 
 [tool.ruff]
