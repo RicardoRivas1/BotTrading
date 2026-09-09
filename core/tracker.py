@@ -16,8 +16,9 @@ punto de entrada de la app la ponga a monitorear.
 from __future__ import annotations
 
 import asyncio
-import math
-from dataclasses import dataclass
+import random
+import time
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from loguru import logger
@@ -34,6 +35,8 @@ class TrackerPosition:
     symbol: str
     buy_price: float
     amount: float  # SOL invertidos en la compra.
+    created_at: float = field(default_factory=time.time)
+    last_log_time: float = field(default_factory=time.time)
 
 
 class PositionTracker:
@@ -48,7 +51,6 @@ class PositionTracker:
         self.config = config
         # Memoría global de posiciones activas (independiente del executor).
         self.positions: dict[str, TrackerPosition] = {}
-        self._sim_tick: int = 0
 
     # ------------------------------------------------------------- Público
     def add_position(
@@ -109,7 +111,42 @@ class PositionTracker:
         if pos is None:
             return
 
-        current_price = await self._get_current_price(mint)
+        now = time.time()
+
+        try:
+            current_price = await self._get_current_price(mint)
+        except Exception as exc:  # noqa: BLE001
+            current_price = 0.0
+            logger.warning("No se pudo obtener precio de {} ({}): {}", mint, pos.symbol, exc)
+
+        # --- DRY_RUN: venta simulada si no hay precio tras 3 minutos ---
+        if current_price <= 0 and self.config.trading.DRY_RUN:
+            elapsed = now - pos.created_at
+            if elapsed > 180:
+                reason = random.choice(["TAKE_PROFIT", "STOP_LOSS"])
+                if reason == "TAKE_PROFIT":
+                    pnl = 110.0
+                else:
+                    pnl = -35.0
+                logger.info(
+                    "[DRY_RUN] ⚡ Venta simulada de {} ({}) — sin precio tras {:.0f}s | PnL simulado: {:+.2f}%",
+                    mint, pos.symbol, elapsed, pnl,
+                )
+                ok = await process_sell_and_notify(
+                    pos.mint, pos.symbol, reason=reason, pnl=pnl
+                )
+                if ok:
+                    self.remove_position(mint)
+                return
+            else:
+                logger.debug(
+                    "Sin precio para {} ({}); esperando antes de simular ({:.0f}s / 180s).",
+                    mint, pos.symbol, elapsed,
+                )
+                return
+
+        if current_price <= 0:
+            return
 
         if not pos.buy_price or pos.buy_price <= 0:
             logger.warning(
@@ -122,6 +159,14 @@ class PositionTracker:
         pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100.0
         take_profit_pct = float(self.config.trading.TAKE_PROFIT_PCT)
         stop_loss_pct = float(self.config.trading.STOP_LOSS_PCT)
+
+        # --- Log periódico cada 15-30 segundos ---
+        if now - pos.last_log_time >= 20:
+            logger.info(
+                "📊 Monitoreando {}: PnL actual {:+.2f}% (Precio: {:.10g} SOL)",
+                pos.symbol, pnl_pct, current_price,
+            )
+            pos.last_log_time = now
 
         if take_profit_pct and pnl_pct >= take_profit_pct:
             logger.info("🎯 TAKE PROFIT (+{:.2f}%) para {} ({})", pnl_pct, mint, pos.symbol)
@@ -139,28 +184,20 @@ class PositionTracker:
                 self.remove_position(mint)
 
     async def _get_current_price(self, mint: str) -> float:
-        """Precio actual vía Jupiter; en DRY_RUN usa precio simulado si da 404."""
+        """Precio actual vía el ejecutor (Jupiter → DexScreener → Pump.fun).
+
+        Devuelve 0.0 si ningún endpoint pudo proporcionar precio real, para que
+        el monitoreo detecte la ausencia de precio y (en DRY_RUN) genere la
+        venta simulada tras el tiempo de espera.
+        """
         try:
             return await self.executor.get_token_price(mint)
-        except Exception as exc:  # noqa: BLE001 - 404 de Jupiter típico en tokens nuevos
-            if self.config.trading.DRY_RUN:
-                logger.warning(
-                    "Jupiter sin ruta para {} en DRY_RUN; usando precio simulado ({}).",
-                    mint, exc,
-                )
-                return self._simulated_price(mint)
-            raise
-
-    def _simulated_price(self, mint: str) -> float:
-        """Precio simulado determinista (±2% alrededor del precio de entrada)."""
-        pos = self.positions.get(mint)
-        base = pos.buy_price if pos else 0.0
-        if base <= 0:
+        except Exception as exc:  # noqa: BLE001 - sin precio en ningún endpoint
+            logger.warning(
+                "Sin precio real para {} tras agotar fallbacks ({}).",
+                mint, exc,
+            )
             return 0.0
-        self._sim_tick += 1
-        offset = sum(ord(ch) for ch in mint) % 7
-        drift = 1.0 + 0.02 * math.sin(self._sim_tick + offset)
-        return max(base * drift, 0.0)
 
     async def check_position(self, token_mint: str) -> tuple[str, float]:
         """Evalúa una posición y ejecuta la salida si corresponde.

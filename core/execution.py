@@ -8,7 +8,8 @@ y al RPC usan `aiohttp` para no bloquear el event loop.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import aiohttp
@@ -128,6 +129,7 @@ class Position:
     peak_price: float = 0.0               # Precio máximo alcanzado desde la compra.
     sol_invested: float = 0.0             # SOL invertidos inicialmente.
     trailing_active: bool = False         # True una vez que se activó la protección trailing.
+    created_at: float = field(default_factory=time.time)  # Timestamp de creación.
 
 
 class JupiterExecutor:
@@ -382,18 +384,136 @@ class JupiterExecutor:
 
     # --------------------------------------------------- Price / Monitoring
     async def get_token_price(self, token_mint: str) -> float:
-        """Consulta el precio del token contra SOL vía la Quote API de Jupiter.
+        """Consulta el precio del token contra SOL con fallback encadenado.
 
-        Pide una cotización de 1 token a SOL y devuelve el SOL que representa
-        (equivalente al precio del token expresado en SOL).
+        Orden de consulta:
+        1. Jupiter v6 Quote API (preferido).
+        2. DexScreener API (fallback si Jupiter falla por 404 o red).
+        3. Pump.fun API (último recurso para tokens < 30s sin listing en DexScreener).
+
+        Devuelve el precio expresado en SOL.
         """
-        amount_lamports = int(1 * (10 ** await self._get_token_decimals(token_mint)))
+        # --- 1. Jupiter v6 (principal) ---
+        try:
+            decimals = await self._get_token_decimals(token_mint)
+            amount_lamports = int(1 * (10 ** decimals))
+            async with aiohttp.ClientSession() as session:
+                quote = await self._get_quote(
+                    session, token_mint, SOL_MINT, amount_lamports
+                )
+            out = float(quote.get("outAmount") or 0)
+            price_sol = out / 1_000_000_000
+            if price_sol > 0:
+                return price_sol
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Jupiter sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
+
+        # --- 2. DexScreener ---
+        try:
+            price_sol = await self._get_price_from_dexscreener(token_mint)
+            if price_sol > 0:
+                return price_sol
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DexScreener sin precio para {} ({}); intentando Pump.fun.", token_mint, exc)
+
+        # --- 3. Pump.fun (curva de bonding) ---
+        try:
+            price_sol = await self._get_price_from_pumpfun(token_mint)
+            if price_sol > 0:
+                return price_sol
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Pump.fun sin precio para {}: {}", token_mint, exc)
+
+        raise SwapExecutionError(f"No se pudo obtener precio de {token_mint} desde ningún endpoint.")
+
+    async def _get_price_from_dexscreener(self, token_mint: str) -> float:
+        """Consulta precio vía DexScreener. Extrae priceNative (SOL) o priceUsd."""
+        url = f"https://api.dexscreener.com/latest/dex/tokens/{token_mint}"
         async with aiohttp.ClientSession() as session:
-            quote = await self._get_quote(
-                session, token_mint, SOL_MINT, amount_lamports
-            )
-        out = float(quote.get("outAmount") or 0)
-        return out / 1_000_000_000  # lamports -> SOL
+            async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
+                if resp.status != 200:
+                    logger.debug("DexScreener respondió {} para {}", resp.status, token_mint)
+                    return 0.0
+                data = await resp.json()
+
+        pairs = data.get("pairs") or []
+        if not pairs:
+            logger.debug("DexScreener sin pairs para {}", token_mint)
+            return 0.0
+
+        # Prioriza la pair con más liquidez.
+        best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+
+        # priceNative es el precio en SOL (ej: "0.000123").
+        price_native = best.get("priceNative")
+        if price_native:
+            try:
+                return float(price_native)
+            except (ValueError, TypeError):
+                pass
+
+        # Fallback a priceUsd y convertir a SOL usando el precio de SOL en USD.
+        price_usd = best.get("priceUsd")
+        if price_usd:
+            try:
+                sol_usd = await self._get_sol_usd_price()
+                if sol_usd > 0:
+                    return float(price_usd) / sol_usd
+            except Exception:  # noqa: BLE001
+                pass
+
+        return 0.0
+
+    async def _get_price_from_pumpfun(self, token_mint: str) -> float:
+        """Consulta precio vía Pump.fun API; calcula precio SOL desde reservas."""
+        url = f"https://frontend-api.pump.fun/coins/{token_mint}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
+                if resp.status != 200:
+                    logger.debug("Pump.fun respondió {} para {}", resp.status, token_mint)
+                    return 0.0
+                data = await resp.json()
+
+        # La bonding curve de Pump.fun:
+        #   precio_sol = (sol_reserves) / (token_reserves)
+        # donde sol_reserves y token_reserves son las cantidades actuales en la curva.
+        sol_reserves = data.get("sol_reserves")
+        token_reserves = data.get("token_reserves")
+
+        if sol_reserves and token_reserves:
+            try:
+                sol_r = float(sol_reserves)
+                tok_r = float(token_reserves)
+                if tok_r > 0:
+                    return sol_r / tok_r
+            except (ValueError, TypeError):
+                pass
+
+        # Alternativa: precio en SOL directo si la API lo expone.
+        sol_supply = data.get("sol_supply")
+        token_supply = data.get("token_supply")
+        if sol_supply and token_supply:
+            try:
+                return float(sol_supply) / float(token_supply)
+            except (ValueError, TypeError):
+                pass
+
+        return 0.0
+
+    async def _get_sol_usd_price(self) -> float:
+        """Obtiene el precio de SOL en USD para convertir precios de DexScreener."""
+        url = "https://api.dexscreener.com/latest/dex/tokens/So11111111111111111111111111111111111111112"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs") or []
+                    if pairs:
+                        price_usd = pairs[0].get("priceUsd")
+                        if price_usd:
+                            return float(price_usd)
+        # Valor de respaldo razonable si DexScreener falla.
+        return 180.0
 
     async def monitor_position(self, token_mint: str) -> tuple[str, float]:
         """Evalúa una posición y ejecuta la salida según sea necesario.
