@@ -141,6 +141,10 @@ class MemecoinBot:
     async def run(self) -> None:
         """Lanza el listener, el heartbeat y el monitor de posiciones."""
         logger.info("Iniciando bot de memecoins en Solana...")
+        # Verificación de wallet al arrancar: la dirección pública se deriva
+        # de SOLANA_PRIVATE_KEY para validar que la wallet en uso es la esperada.
+        logger.info("👛 Wallet activa (derivada de SOLANA_PRIVATE_KEY): {}", self.executor.wallet_pubkey)
+        logger.info("🔗 RPC configurado: {}", self.executor.rpc_url)
 
         # Tareas de fondo concurrentes (ninguna bloquea el loop principal).
         listener_task = asyncio.create_task(self.listener.run())

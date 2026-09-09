@@ -21,6 +21,7 @@ from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.signature import Signature
+from solders.token.associated import get_associated_token_address
 from solders.transaction import VersionedTransaction
 
 from config import TradingSettings
@@ -33,6 +34,16 @@ JUPITER_SWAP = "https://lite-api.jup.ag/v6/swap"
 
 # API de PumpPortal para trades directos en la bonding curve de Pump.fun.
 PUMPPORTAL_TRADE_URL = "https://pumpportal.fun/api/trade-local"
+
+# Prioridad mínima objetivo para las compras: pagar ~0.0001 SOL extra por swap
+# (200_000 CU x 500_000 micro-lamports/CU = 1e5 lamports = 0.0001 SOL) para
+# reducir los descartes por prioridad baja en los picos de congestión.
+COMPUTE_UNIT_LIMIT = 200_000
+COMPUTE_UNIT_PRICE_MICRO_LAMPORTS = 500_000
+
+# Slippage de compra en la bonding curve de Pump.fun (porcentaje).
+BUY_SLIPPAGE_MIN_PCT = 15.0
+BUY_SLIPPAGE_MAX_PCT = 20.0
 
 _USER_AGENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -242,13 +253,14 @@ class JupiterExecutor:
         self,
         session: aiohttp.ClientSession,
         quote: dict[str, Any],
+        require_confirmation: bool = True,
     ) -> Signature:
         swap_payload = {
             "quoteResponse": quote,
             "userPublicKey": self.wallet_pubkey,
             "wrapAndUnwrapSol": True,
-            "computeUnitLimit": None,
-            "computeUnitPriceMicroLamports": None,
+            "computeUnitLimit": COMPUTE_UNIT_LIMIT,
+            "computeUnitPriceMicroLamports": COMPUTE_UNIT_PRICE_MICRO_LAMPORTS,
         }
         async with session.post(
             JUPITER_SWAP, json=swap_payload, headers=_USER_AGENT_HEADERS
@@ -265,14 +277,27 @@ class JupiterExecutor:
         signature = self.keypair.sign_message(tx.message.to_bytes())
         signed_tx = VersionedTransaction.populate(tx.message, [signature])
 
-        return await self._submit_signed_transaction(signed_tx)
+        return await self._submit_signed_transaction(
+            signed_tx, require_confirmation=require_confirmation
+        )
 
-    async def _submit_signed_transaction(self, signed_tx: VersionedTransaction) -> Signature:
+    async def _submit_signed_transaction(
+        self,
+        signed_tx: VersionedTransaction,
+        *,
+        require_confirmation: bool = True,
+    ) -> Signature:
         """Envía y confirma una transacción firmada vía RPC.
 
-        Devuelve el txid (Signature). Si la confirmación on-chain falla o tarda
-        demasiado se registra un warning; no se re-lanza para evitar reintentos
-        de venta que dupliquen la transacción.
+        En modo estricto (`require_confirmation=True`, compras) la operación
+        SOLO es exitosa si la transacción queda confirmada en un bloque de
+        Solana con commitment "confirmed". Si se cae, vence por timeout o el
+        RPC devuelve error/reversión, se registra el error exacto y se lanza
+        `SwapExecutionError` para que el llamador NO notifique la compra como
+        ejecutada.
+
+        En modo venta (`require_confirmation=False`) no se re-lanza: se devuelve
+        el txid recibido para evitar reintentos que dupliquen la salida.
         """
         async with AsyncClient(self.rpc_url) as client:
             res = await client.send_raw_transaction(
@@ -285,40 +310,94 @@ class JupiterExecutor:
 
             try:
                 confirmation = await client.confirm_transaction(txid, commitment="confirmed")
-                status = confirmation.value[0] if confirmation.value else None
-                if status is not None and status.err is None:
-                    logger.success("Venta confirmada on-chain: {}", txid)
-                else:
-                    logger.warning("Venta falló on-chain ({}): {}", status.err if status else "sin estado", txid)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("No se pudo confirmar la transacción {}: {}", txid, exc)
+            except Exception as exc:  # noqa: BLE001 - timeout/RPC del proveedor
+                logger.error(
+                    "No se pudo confirmar la transacción {} (timeout/RPC): {}", txid, exc
+                )
+                if require_confirmation:
+                    raise SwapExecutionError(
+                        f"Transacción NO confirmada on-chain ({txid}): {exc}"
+                    ) from exc
+                logger.success("Swap enviado pero sin confirmar: {}", txid)
+                return txid
 
-        logger.success("Swap enviado: {}", txid)
+            status = confirmation.value[0] if confirmation.value else None
+            if status is None or status.err is not None:
+                logger.error(
+                    "Transacción NO confirmada/revertida on-chain (estado={}): {}",
+                    status.err if status else "sin estado", txid,
+                )
+                if require_confirmation:
+                    raise SwapExecutionError(
+                        f"Transacción reversada/descartada ({txid}): "
+                        f"{status.err if status else 'sin estado'}"
+                    )
+                logger.success("Swap enviado: {}", txid)
+                return txid
+
+        logger.success("Transacción confirmada on-chain: {}", txid)
         return txid
 
     # ------------------------------------------------------------ Public
     async def buy_token(self, token_mint: str, dry_run: Optional[bool] = None) -> Signature | str:
         simulate = self.dry_run if dry_run is None else dry_run
         amount_lamports = int(self.buy_amount_sol * 1_000_000_000)
-        async with aiohttp.ClientSession() as session:
-            quote = await self._get_quote(
-                session, SOL_MINT, token_mint, amount_lamports,
-                simulate=simulate,
-            )
-            if simulate:
-                logger.info(
-                    "[DRY_RUN] Compra simulada de {} | Monto: {} SOL",
-                    token_mint, self.buy_amount_sol,
-                )
-                sig: Signature | str = "DRY_RUN"
-            else:
-                sig = await self._build_and_send_swap(session, quote)
+        sig: Signature | str
+        quote: Optional[dict[str, Any]] = None
+        via_pumpfun = False
 
-        out_amount = float(
-            quote.get("outAmount", quote.get("routePlan", [{}])[0].get("outAmount", 0)) or 0
-        )
-        decimals = await self._get_token_decimals(token_mint)
-        token_qty_ui = out_amount / (10 ** decimals) if decimals else 0.0
+        if simulate:
+            logger.info(
+                "[DRY_RUN] Compra simulada de {} | Monto: {} SOL",
+                token_mint, self.buy_amount_sol,
+            )
+            async with aiohttp.ClientSession() as session:
+                quote = await self._get_quote(
+                    session, SOL_MINT, token_mint, amount_lamports,
+                    simulate=True,
+                )
+            sig = "DRY_RUN"
+        else:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    quote = await self._get_quote(
+                        session, SOL_MINT, token_mint, amount_lamports,
+                        simulate=False,
+                    )
+                    sig = await self._build_and_send_swap(
+                        session, quote, require_confirmation=True
+                    )
+            except SwapExecutionError as exc:
+                if _is_rate_limit(exc):
+                    logger.warning(
+                        "Jupiter saturado comprando {} ({}). Pausa de 1s y "
+                        "fallback por Pump.fun (bonding curve).",
+                        token_mint, exc,
+                    )
+                    await asyncio.sleep(1.0)
+                    self.pump_bonding_tokens.add(token_mint)
+                    via_pumpfun = True
+                    sig = await self._buy_via_pumpportal(token_mint)
+                elif _is_route_not_found(exc):
+                    logger.warning(
+                        "Jupiter sin ruta para comprar {} ({}): token en la "
+                        "bonding curve de Pump.fun. Comprando directo por PumpPortal.",
+                        token_mint, exc,
+                    )
+                    self.pump_bonding_tokens.add(token_mint)
+                    via_pumpfun = True
+                    sig = await self._buy_via_pumpportal(token_mint)
+                else:
+                    raise
+
+        if via_pumpfun:
+            token_qty_ui = await self._get_token_balance_ui(token_mint)
+        else:
+            out_amount = float(
+                quote.get("outAmount", quote.get("routePlan", [{}])[0].get("outAmount", 0)) or 0
+            )
+            decimals = await self._get_token_decimals(token_mint)
+            token_qty_ui = out_amount / (10 ** decimals) if decimals else 0.0
 
         if simulate:
             entry_price_sol = 0.0
@@ -353,6 +432,71 @@ class JupiterExecutor:
             logger.warning("📌 Posición registrada con entry_price PENDIENTE para {}", token_mint)
         return sig
 
+    async def _buy_via_pumpportal(
+        self,
+        mint: str,
+        amount_sol: Optional[float] = None,
+    ) -> Signature:
+        """Compra directa en la bonding curve de Pump.fun vía PumpPortal.
+
+        Payload en SOL (`denominatedInSol="true"`) con un `priorityFee` mínimo
+        de 0.0001 SOL y un `slippage` de compra dentro de [15, 20]% para no
+        fallar ante las variaciones bruscas de precio de la curva. La
+        confirmación on-chain es obligatoria (`require_confirmation=True`).
+        """
+        amount_sol = self.buy_amount_sol if amount_sol is None else amount_sol
+        slippage_pct = min(BUY_SLIPPAGE_MAX_PCT, max(BUY_SLIPPAGE_MIN_PCT, self.slippage_bps / 100.0))
+        logger.info(
+            "Comprando {} SOL de {} por PumpPortal (bonding curve, slippage {}%)",
+            amount_sol, mint, slippage_pct,
+        )
+        payload = {
+            "publicKey": self.wallet_pubkey,
+            "action": "buy",
+            "mint": mint,
+            "amount": amount_sol,
+            "denominatedInSol": "true",
+            "slippage": slippage_pct,
+            "priorityFee": 0.0001,
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                PUMPPORTAL_TRADE_URL, json=payload, headers=_USER_AGENT_HEADERS
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    raise SwapExecutionError(f"PumpPortal buy falló ({resp.status}): {text[:200]}")
+                data = await resp.json()
+
+        raw_tx = data.get("transaction")
+        if not raw_tx:
+            raise SwapExecutionError("PumpPortal buy no devolvió una transacción en 'transaction'")
+
+        tx_bytes = self._decode_trade_local(raw_tx)
+        tx = VersionedTransaction.from_bytes(tx_bytes)
+        signature = self.keypair.sign_message(tx.message.to_bytes())
+        signed_tx = VersionedTransaction.populate(tx.message, [signature])
+
+        logger.info("Compra directa Pump.fun de {} enviada a la red.", mint)
+        return await self._submit_signed_transaction(
+            signed_tx, require_confirmation=True
+        )
+
+    async def _get_token_balance_ui(self, token_mint: str) -> float:
+        """Saldo real (en unidades humanas) de un token en la wallet vía RPC.
+
+        Necesario tras una compra directa por Pump.fun, donde no hay quote de
+        Jupiter para estimar la cantidad recibida.
+        """
+        ata = get_associated_token_address(
+            self.keypair.pubkey(), Pubkey.from_string(token_mint)
+        )
+        async with AsyncClient(self.rpc_url) as client:
+            resp = await client.get_token_account_balance(ata)
+            if not resp.value or resp.value.ui_amount is None:
+                return 0.0
+            return float(resp.value.ui_amount)
+
     async def sell_token(
         self,
         token_mint: str,
@@ -386,7 +530,9 @@ class JupiterExecutor:
                 )
                 if not quote:
                     raise SwapExecutionError("Jupiter quote vacía (Route not found)")
-                return await self._build_and_send_swap(session, quote)
+                return await self._build_and_send_swap(
+                    session, quote, require_confirmation=False
+                )
         except SwapExecutionError as exc:
             if _is_rate_limit(exc):
                 logger.warning(
@@ -453,7 +599,9 @@ class JupiterExecutor:
         signed_tx = VersionedTransaction.populate(tx.message, [signature])
 
         logger.info("Venta directa Pump.fun de {} enviada a la red.", mint)
-        return await self._submit_signed_transaction(signed_tx)
+        return await self._submit_signed_transaction(
+            signed_tx, require_confirmation=False
+        )
 
     @staticmethod
     def _decode_trade_local(raw_tx: Any) -> bytes:

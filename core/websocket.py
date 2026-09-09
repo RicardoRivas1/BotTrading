@@ -126,7 +126,7 @@ async def process_buy_and_notify(
     else:
         label = "COMPRA REAL"
     try:
-        sig = await executor.buy_token(mint, dry_run=True)
+        sig = await executor.buy_token(mint, dry_run=cfg.trading.DRY_RUN)
     except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
         logger.error(f"Error comprando {mint} ({label}): {exc}")
         await notifier.send_error(f"No se pudo comprar {mint} ({label}): {exc}")
