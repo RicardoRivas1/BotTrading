@@ -85,11 +85,18 @@ async def process_buy_and_notify(mint: str, symbol: str = "N/A") -> None:
         token=cfg.telegram.TELEGRAM_TOKEN,
         chat_id=cfg.telegram.TELEGRAM_CHAT_ID,
     )
+    # Etiqueta según el estado real de ejecución.
+    if os.getenv("FORCE_TEST_BUY", "False").lower() == "true":
+        label = "TEST FORZADO"
+    elif cfg.trading.DRY_RUN:
+        label = "SIMULACIÓN DRY_RUN"
+    else:
+        label = "COMPRA REAL"
     try:
         sig = await executor.buy_token(mint, dry_run=True)
     except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
-        logger.error("Error comprando {} (FORCE_TEST_BUY): {}", mint, exc)
-        await notifier.send_error(f"No se pudo comprar {mint}: {exc}")
+        logger.error("Error comprando {} ({}): {}", mint, label, exc)
+        await notifier.send_error(f"No se pudo comprar {mint} ({label}): {exc}")
         return
 
     # Captura del precio de entrada real (positivo) desde la posición abierta.
@@ -105,8 +112,8 @@ async def process_buy_and_notify(mint: str, symbol: str = "N/A") -> None:
 
     await notifier.send_buy(mint, cfg.trading.BUY_AMOUNT_SOL, price=entry_price)
     logger.success(
-        "Compra de prueba (FORCE_TEST_BUY) de {} ejecutada: {} @ entry={:.10g}",
-        mint, sig, entry_price,
+        "Compra de {} ({}) de {} ejecutada: {} @ entry={:.10g}",
+        label, mint, sig, entry_price,
     )
 
 
@@ -209,7 +216,11 @@ class TokenWebSocket:
                             score = await check_rugcheck(mint)
                             max_score = float(os.getenv("RUGCHECK_MAX_SCORE", "10000"))
                             logger.info(f"📊 Score RugCheck para {mint}: {score}")
-                            if score <= max_score:
+                            if score == 0:
+                                logger.warning(
+                                    f"⚠️ Token con Score 0 (sin analizar en RugCheck) para {mint}. Omitiendo por seguridad..."
+                                )
+                            elif score <= max_score:
                                 logger.info(
                                     f"✅ Token APROBADO por RugCheck (Score: {score} <= {max_score}). Ejecutando compra..."
                                 )
