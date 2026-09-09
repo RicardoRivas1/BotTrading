@@ -5,6 +5,7 @@
 pytest
 pytest-asyncio
 pytest-cov
+pytest-xdist
 mutmut
 ruff
 mypy

@@ -24,7 +24,7 @@ addopts = """
 [tool.mutmut]
 source_paths = ["core/"]
 also_copy = ["config.py"]
-runner = "python -m pytest tests/test_tracker.py tests/test_execution.py -o addopts='--cov=core/tracker.py --cov=core/execution.py --cov-fail-under=0'"
+runner = "python -m pytest tests/test_tracker.py tests/test_execution.py -n auto -o addopts='--cov=core/tracker.py --cov=core/execution.py --cov-fail-under=0'"
 pytest_add_cli_args = ["--cov-fail-under=0"]
 backup = false
 
