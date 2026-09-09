@@ -42,11 +42,11 @@ class TradingSettings(BaseSettings):
     BUY_AMOUNT_SOL: float = Field(default=0.05, gt=0, description="Monto fijo por compra en SOL")
     SLIPPAGE_BPS: int = Field(default=500, ge=1, le=10000, description="Slippage máximo en basis points")
     JUPITER_QUOTE_URL: str = Field(
-        default="https://quote-api.jup.ag/v6/quote",
+        default="https://lite-api.jup.ag/v6/quote",
         description="Endpoint principal de cotización de la Jupiter Swap API v6",
     )
     JUPITER_FALLBACK_URL: str = Field(
-        default="https://lite-api.jup.ag/v6/quote",
+        default="https://api.jup.ag/swap/v1/quote",
         description="Endpoint secundario (fallback) de Jupiter ante fallos de DNS/red",
     )
     AUTO_SELL: bool = Field(default=True, description="Si vende automáticamente tras take-profit/stop-loss")

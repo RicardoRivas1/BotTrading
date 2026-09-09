@@ -64,12 +64,30 @@ async def check_rugcheck(mint: str) -> int:
     return validator._rugcheck_score(report)
 
 
+def resolve_symbol(symbol: Any, mint: Any = None) -> str:
+    """Devuelve un ticker/símbolo válido y nunca "N/A".
+
+    Si `symbol` llega vacío, "N/A" o nulo (tokens recién creados que aún no
+    tienen ticker), deriva un ticker de respaldo desde el mint: los primeros
+    4 caracteres precedidos por "$" (ej: mint "KEJj..." -> "$KEJj").
+    """
+    if symbol and str(symbol).strip() and str(symbol).strip().upper() != "N/A":
+        return str(symbol).strip()
+    if mint:
+        return f"${str(mint)[:4]}"
+    return "N/A"
+
+
 async def process_buy_and_notify(
     mint: str, symbol: str = "N/A", score: Optional[float] = None
 ) -> None:
     """Ejecuta una compra de prueba (simulada) y notifica a Telegram."""
     from core.execution import JupiterExecutor
     from core.notifier import TelegramNotifier
+
+    # Nunca registrar ni notificar un símbolo "N/A": si no hay ticker, se
+    # deriva uno de respaldo desde el mint (primeros 4 caracteres).
+    symbol = resolve_symbol(symbol, mint)
 
     cfg = config.load_config()
     executor = JupiterExecutor(
@@ -97,7 +115,7 @@ async def process_buy_and_notify(
     try:
         sig = await executor.buy_token(mint, dry_run=True)
     except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
-        logger.error("Error comprando {} ({}): {}", mint, label, exc)
+        logger.error(f"Error comprando {mint} ({label}): {exc}")
         await notifier.send_error(f"No se pudo comprar {mint} ({label}): {exc}")
         return
 
@@ -110,7 +128,7 @@ async def process_buy_and_notify(
         try:
             entry_price = await executor.get_token_price(mint)
         except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
-            logger.error("No se pudo consultar precio de entrada de {}: {}", mint, exc)
+            logger.error(f"No se pudo consultar precio de entrada de {mint}: {exc}")
 
     await notifier.send_buy(
         mint,
@@ -135,8 +153,7 @@ async def process_buy_and_notify(
     logger.info(f"📌 Posición registrada en tracker para {symbol} ({mint})")
 
     logger.success(
-        "Compra de {} ({}) de {} ejecutada: {} @ entry={:.10g}",
-        label, mint, sig, entry_price,
+        f"Compra de {label} ({mint}) ejecutada: {sig} @ entry={entry_price:.10g} SOL"
     )
 
 
@@ -172,12 +189,12 @@ async def process_sell_and_notify(
             pos = tracker.get_position(mint)
             token_amount = (pos.amount / pos.buy_price) if pos and pos.buy_price else 0.0
             if token_amount <= 0:
-                logger.warning("Sin balance estimado para vender {} ({}); omitiendo.", symbol, mint)
+                logger.warning(f"Sin balance estimado para vender {symbol} ({mint}); omitiendo.")
                 return False
             await tracker.executor.sell_token(mint, token_amount)
-            logger.success("Venta de {} ({}) ejecutada por {} (PnL {:.2f}%)", symbol, mint, reason, pnl)
+            logger.success(f"Venta de {symbol} ({mint}) ejecutada por {reason} (PnL {pnl:.2f}%)")
     except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
-        logger.error("Error vendiendo {} ({}): {}", symbol, reason, exc)
+        logger.error(f"Error vendiendo {symbol} ({reason}): {exc}")
         await notifier.send_error(f"No se pudo vender {symbol} ({mint}) por {reason}: {exc}")
         return False
 
@@ -226,7 +243,7 @@ class TokenWebSocket:
                 ssl=False,
                 max_msg_size=8 * 1024 * 1024,
             ) as ws:
-                logger.info("Conectado al WebSocket: {}", self.uri)
+                logger.info(f"Conectado al WebSocket: {self.uri}")
                 self.retry_delay = _RECONNECT_MIN
 
                 # Suscripción a eventos de creación de nuevos tokens (payload oficial).
@@ -242,7 +259,7 @@ class TokenWebSocket:
                         break
                     # Log de depuración: muestra CUALQUIER paquete recibido para
                     # confirmar que el feed sigue fluyendo en tiempo real (msg.data[:100]).
-                    logger.info("📩 Evento raw recibido: {}", raw.data[:100])
+                    logger.info(f"📩 Evento raw recibido: {raw.data[:100]}")
                     try:
                         payload: dict[str, Any] = raw.json()
                     except (TypeError, ValueError):
@@ -253,9 +270,7 @@ class TokenWebSocket:
                     # con la clave 'errors' (p. ej. {"errors": "..."}), lo registramos
                     # y reintentamos la suscripción tras _ERROR_RESUBSCRIBE_SECONDS.
                     if "errors" in payload:
-                        logger.error(
-                            "⚠️ Error del WebSocket de PumpPortal: {}", payload.get("errors")
-                        )
+                        logger.error(f"⚠️ Error del WebSocket de PumpPortal: {payload.get('errors')}")
                         logger.warning(
                             f"Reintentando suscripción en {_ERROR_RESUBSCRIBE_SECONDS:.0f}s..."
                         )
@@ -266,13 +281,10 @@ class TokenWebSocket:
                         continue
 
                     mint = payload.get("mint") or payload.get("token", {}).get("mint")
-                    symbol = payload.get("symbol") or payload.get("token", {}).get("symbol", "N/A")
+                    raw_symbol = payload.get("symbol") or payload.get("token", {}).get("symbol", "N/A")
+                    symbol = resolve_symbol(raw_symbol, mint)
                     if mint:
-                        logger.info(
-                            "🔎 Analizando mint: {} | Ticker: {}",
-                            mint,
-                            symbol,
-                        )
+                        logger.info(f"🔎 Analizando mint: {mint} | Ticker: {symbol}")
 
                         # FORCE_TEST_BUY: disparo único de compra de prueba (modo diagnóstico).
                         if os.getenv("FORCE_TEST_BUY", "False").lower() == "true":
@@ -334,24 +346,21 @@ class TokenWebSocket:
                 # Handshakes HTTP erróneos (típicos 502/503 de proxies/Cloudflare
                 # tras un deploy en Render). Reintentar en ráfaga solo empeora el
                 # bloqueo del upstream, así que esperamos 10s fijos.
-                logger.error("Handshake HTTP {} fallido: {}", exc.status, exc)
+                logger.error(f"Handshake HTTP {exc.status} fallido: {exc}")
                 if exc.status in (502, 503):
                     self.retry_delay = _ERROR_502_RETRY_SECONDS
                     logger.warning(
-                        "⚠️ HTTP {} detectado: reintentando en {:.0f}s para no saturar la red.",
-                        exc.status, self.retry_delay,
+                        f"⚠️ HTTP {exc.status} detectado: reintentando en {self.retry_delay:.0f}s para no saturar la red."
                     )
             except Exception as exc:  # noqa: BLE001 - fallo de red manejado aquí
-                logger.error("Error en WebSocket: {}", exc)
+                logger.error(f"Error en WebSocket: {exc}")
 
             if not self.running:
                 break
 
             # Backoff exponencial: se queda bloqueado 'sleep' pero con
             # `asyncio.sleep` para no bloquear el event loop.
-            logger.warning(
-                "Reconectando en {:.1f} s (backoff)...", self.retry_delay
-            )
+            logger.warning(f"Reconectando en {self.retry_delay:.1f} s (backoff)...")
             await asyncio.sleep(self.retry_delay)
             self.retry_delay = min(self.retry_delay * 2, _RECONNECT_MAX)
 

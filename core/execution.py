@@ -29,7 +29,7 @@ from config import TradingSettings
 _trading_settings = TradingSettings()
 JUPITER_QUOTE_URL = _trading_settings.JUPITER_QUOTE_URL
 JUPITER_FALLBACK_URL = _trading_settings.JUPITER_FALLBACK_URL
-JUPITER_SWAP = "https://quote-api.jup.ag/v6/swap"
+JUPITER_SWAP = "https://lite-api.jup.ag/v6/swap"
 
 # User-Agent de navegador para eludir bloqueos básicos de Cloudflare.
 _USER_AGENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
