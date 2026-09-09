@@ -341,8 +341,9 @@ class JupiterExecutor:
         if simulate:
             # DRY_RUN: usar el MISMO endpoint de monitoreo (get_token_price ->
             # Jupiter/DexScreener/Pump.fun) para que el PnL del tracker sea
-            # coherente. Nunca inventar un precio de entrada. La cotización
-            # simulada de Jupiter (1:1) daría 0.001 SOL hardcodeado: se evita.
+            # coherente. Nunca inventar un precio de entrada: la cotización
+            # simulada 1:1 daría 0.001 SOL hardcodeado, por eso si no hay
+            # precio real se deja la entrada en 0.0 (PENDIENTE).
             entry_price_sol = 0.0
             try:
                 entry_price_sol = await self.get_token_price(token_mint)
@@ -351,9 +352,9 @@ class JupiterExecutor:
                     "No se pudo obtener precio real de {} en DRY_RUN: {}", token_mint, exc
                 )
             if entry_price_sol <= 0:
-                # Último recurso sin inventar precio: derivo de la bond curve
-                # de la cotización obtenida (p. ej. Jupiter con ruta real).
-                entry_price_sol = self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
+                # Ningún endpoint entregó precio real: entrada queda PENDIENTE
+                # para que el tracker fije el primer precio real como base.
+                entry_price_sol = 0.0
         else:
             entry_price_sol = (
                 self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
@@ -365,16 +366,22 @@ class JupiterExecutor:
                     entry_price_sol = await self.get_token_price(token_mint)
                 except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
                     logger.warning("No se pudo obtener precio base de {}: {}", token_mint, exc)
+                if entry_price_sol <= 0:
+                    # Sin precio real en ningún endpoint: entrada PENDIENTE.
+                    entry_price_sol = 0.0
         entry_price_sol = max(entry_price_sol, 0.0)
 
         self.positions[token_mint] = Position(
             mint=token_mint,
             token_amount_ui=token_qty_ui,
             entry_price=entry_price_sol,
-            peak_price=entry_price_sol,
+            peak_price=entry_price_sol if entry_price_sol > 0 else 0.0,
             sol_invested=self.buy_amount_sol,
         )
-        logger.info("Posición registrada para {} @ entry={:.9f} SOL", token_mint, entry_price_sol)
+        if entry_price_sol > 0:
+            logger.info("Posición registrada para {} @ entry={:.9f} SOL", token_mint, entry_price_sol)
+        else:
+            logger.warning("📌 Posición registrada con entry_price PENDIENTE para {}", token_mint)
         return sig
 
     async def sell_token(

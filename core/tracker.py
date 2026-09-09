@@ -152,15 +152,23 @@ class PositionTracker:
                 self.remove_position(mint)
             return
 
-        if current_price <= 0:
+        if current_price is None or current_price <= 0:
+            # Sin precio real en ningún endpoint: esperar al siguiente ciclo
+            # sin calcular PnL.
             return
 
-        if not pos.buy_price or pos.buy_price <= 0:
-            logger.warning(
-                "Precio de entrada inválido para {} ({}); adoptando precio actual.",
-                mint, pos.symbol,
-            )
+        # --- Asignación dinámica del precio de entrada (BASE) ---
+        # Si el entry sigue PENDIENTE (None, 0.0 o el sentinel 1.0 del default
+        # antiguo), el PRIMER precio válido (>0) obtenido en el bucle se fija
+        # como base de entrada y se salta la evaluación de PnL en este ciclo.
+        entry_pending = (
+            pos.buy_price is None
+            or pos.buy_price <= 0
+            or abs(pos.buy_price - 1.0) < 1e-9
+        )
+        if entry_pending:
             pos.buy_price = current_price
+            logger.info(f"🎯 Precio de entrada BASE fijado para {pos.symbol}: {current_price} SOL")
             return
 
         pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100.0
@@ -227,12 +235,20 @@ class PositionTracker:
         de prueba (~9 ciclos al alza, ~5 a la baja con CHECK_INTERVAL_SEC=2s).
         """
         pos = self.positions.get(mint)
-        if pos is None or pos.buy_price <= 0:
+        if pos is None:
             return 0.0
+        # Base de la simulación: el precio de entrada real si ya existe. Si la
+        # entrada está PENDIENTE (0.0 o 1.0), se usa una base nominal 0.0001 SOL
+        # para que el flujo DRY_RUN siga avanzando hasta TP/SL (el tracker fija
+        # la entrada BASE con el primer precio simulado en el ciclo siguiente).
+        if pos.buy_price is not None and pos.buy_price > 0 and abs(pos.buy_price - 1.0) >= 1e-9:
+            base = pos.buy_price
+        else:
+            base = 0.0001
         pos.sim_steps += 1
         if pos.sim_direction > 0:
-            return pos.buy_price * (1.08 ** pos.sim_steps)
-        return pos.buy_price * (0.92 ** pos.sim_steps)
+            return base * (1.08 ** pos.sim_steps)
+        return base * (0.92 ** pos.sim_steps)
 
     async def check_position(self, token_mint: str) -> tuple[str, float]:
         """Evalúa una posición y ejecuta la salida si corresponde.
