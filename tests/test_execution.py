@@ -389,7 +389,7 @@ class TestUtilities:
         client.get_token_supply.return_value = _FakeResp()
 
         monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
-        assert await executor._get_token_decimals(MINT_RAYDIUM) == 9
+        assert await executor._get_token_decimals(MINT_RAYDIUM) == 6
 
 
 class TestCompraVenta:
