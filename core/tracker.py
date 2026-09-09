@@ -50,6 +50,16 @@ class PositionTracker:
             logger.warning("No se pudo consultar precio de {}: {}", token_mint, exc)
             return "", 0.0
 
+        # Si falta un precio de entrada válido, se re-consulta el precio base
+        # para no ignorar la posición ni provocar una división por cero.
+        if not position.entry_price or position.entry_price <= 0:
+            try:
+                position.entry_price = await self.executor.get_token_price(token_mint)
+            except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
+                logger.warning("No se pudo re-consultar precio de entrada de {}: {}", token_mint, exc)
+                return "", 0.0
+            logger.info("Precio de entrada re-establecido para {}: {:.10g}", token_mint, position.entry_price)
+
         pnl_pct = (
             (current_price - position.entry_price) / position.entry_price * 100
         ) if position.entry_price else 0.0

@@ -92,8 +92,22 @@ async def process_buy_and_notify(mint: str, symbol: str = "N/A") -> None:
         await notifier.send_error(f"No se pudo comprar {mint}: {exc}")
         return
 
-    await notifier.send_buy(mint, cfg.trading.BUY_AMOUNT_SOL)
-    logger.success("Compra de prueba (FORCE_TEST_BUY) de {} ejecutada: {}", mint, sig)
+    # Captura del precio de entrada real (positivo) desde la posición abierta.
+    entry_price = 0.0
+    position = executor.positions.get(mint)
+    if position and position.entry_price and position.entry_price > 0:
+        entry_price = position.entry_price
+    else:
+        try:
+            entry_price = await executor.get_token_price(mint)
+        except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
+            logger.error("No se pudo consultar precio de entrada de {}: {}", mint, exc)
+
+    await notifier.send_buy(mint, cfg.trading.BUY_AMOUNT_SOL, price=entry_price)
+    logger.success(
+        "Compra de prueba (FORCE_TEST_BUY) de {} ejecutada: {} @ entry={:.10g}",
+        mint, sig, entry_price,
+    )
 
 
 class TokenWebSocket:

@@ -82,7 +82,13 @@ class TelegramNotifier:
     async def send_buy(self, mint: str, amount_sol: float, price: Optional[float] = None) -> bool:
         """Notifica una compra de token ejecutada."""
         amount_txt = f"{amount_sol:.4f}"
-        price_txt = f"{price:,.10f}" if price else "N/D"
+        if price and price > 0:
+            if price < 1:
+                price_txt = f"${price:.10f}"
+            else:
+                price_txt = f"${price:,.6f} SOL"
+        else:
+            price_txt = "N/D"
         html_text = (
             "<b>🟢 COMPRA EJECUTADA</b>\n\n"
             f"<b>Token:</b> <code>{html.escape(str(mint))}</code>\n"

@@ -336,6 +336,15 @@ class JupiterExecutor:
         token_qty_ui = out_amount / (10 ** decimals) if decimals else 0.0
         entry_price = self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
 
+        # Si no pudimos estimar un precio válido, consultamos el precio base vía
+        # Jupiter para asegurar que entry_price sea un float positivo.
+        if not entry_price or entry_price <= 0:
+            try:
+                entry_price = await self.get_token_price(token_mint)
+            except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
+                logger.warning("No se pudo obtener precio base de {}: {}", token_mint, exc)
+        entry_price = max(entry_price, 0.0)
+
         self.positions[token_mint] = Position(
             mint=token_mint,
             token_amount_ui=token_qty_ui,
@@ -401,6 +410,16 @@ class JupiterExecutor:
         except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
             logger.warning("No se pudo consultar precio de {}: {}", token_mint, exc)
             return "", 0.0
+
+        # Si falta un precio de entrada válido, se re-consulta el precio base
+        # para no ignorar la posición ni provocar una división por cero.
+        if not position.entry_price or position.entry_price <= 0:
+            try:
+                position.entry_price = await self.get_token_price(token_mint)
+            except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
+                logger.warning("No se pudo re-consultar precio de entrada de {}: {}", token_mint, exc)
+                return "", 0.0
+            logger.info("Precio de entrada re-establecido para {}: {:.10g}", token_mint, position.entry_price)
 
         # Actualizamos el peak: el máximo alcanzado jamás puede bajar.
         position.peak_price = max(position.peak_price, current_price)
