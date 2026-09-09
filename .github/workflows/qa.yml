@@ -73,5 +73,5 @@ jobs:
           pip install -r requirements.txt -r requirements-dev.txt
       - name: mutmut sobre tracker + execution
         env:
-          PYTHONPATH: .
+          PYTHONPATH: ${{ github.workspace }}
         run: mutmut run
