@@ -192,15 +192,18 @@ class TelegramNotifier:
         position: Any,
         *,
         max_hold_seconds: float = 0.0,
+        take_profit_pct: float = 0.0,
+        stop_loss_pct: float = 0.0,
     ) -> bool:
         """Notifica el estado/progreso de una posición abierta en espera.
 
-        Muestra el ticker y mint, el PnL% actual con emoji (📈 positivo,
-        📉 negativo), el precio de entrada vs. el actual, el tiempo transcurrido
-        frente al máximo de retención (⏱️) y el pico de PnL alcanzado.
-        `position` puede ser un `TrackerPosition` o cualquier objeto con los
-        atributos: symbol, mint, buy_price, current_price, latest_pnl_pct,
-        highest_pnl_pct, created_at y opcionalmente max_hold_seconds.
+        Reporta ticker y mint, PnL actual con emoji (📈 positivo, 📉 negativo),
+        pico máximo de PnL, precios de entrada y actual (8 decimales SOL),
+        tiempo transcurrido vs. retención máxima (⏱️), objetivos TP/SL y enlaces
+        a Pump.fun/DexScreener/Solscan. `position` puede ser un
+        `TrackerPosition` o cualquier objeto con los atributos: symbol, mint,
+        buy_price, current_price, latest_pnl_pct, highest_pnl_pct, created_at y
+        opcionalmente max_hold_seconds.
         """
         safe_symbol = html.escape(str(getattr(position, "symbol", "N/A")).upper() or "N/A")
         safe_mint = html.escape(str(getattr(position, "mint", "") or ""))
@@ -214,21 +217,25 @@ class TelegramNotifier:
         max_hold = max_hold_seconds or float(getattr(position, "max_hold_seconds", 0.0) or 0.0)
 
         emoji = "📈" if pnl_pct >= 0 else "📉"
-        entry_txt = html.escape(f"{entry_price:.10g}")
-        current_txt = html.escape(f"{current_price:.10g}")
+        pnl_txt = html.escape(f"{pnl_pct:+.2f}%")
+        pico_txt = html.escape(f"{highest_pnl:+.2f}%")
+        entry_txt = html.escape(f"{entry_price:.8f}")
+        current_txt = html.escape(f"{current_price:.8f}")
         elapsed_txt = html.escape(f"{int(elapsed)}s")
         max_hold_txt = html.escape(f"{int(max_hold)}s") if max_hold > 0 else "∞"
-        highest_txt = html.escape(f"{highest_pnl:+.2f}%")
+        tp_txt = html.escape(f"+{take_profit_pct:.0f}%") if take_profit_pct else "N/D"
+        sl_txt = html.escape(f"-{abs(stop_loss_pct):.0f}%") if stop_loss_pct else "N/D"
 
         html_text = (
-            "💰 <b>PROGRESO DE POSICIÓN</b>\n\n"
+            "📊 <b>PROGRESO DE POSICIÓN</b>\n\n"
             f"💎 ${safe_symbol}\n"
-            f"<code>{safe_mint}</code>\n\n"
-            f"{emoji} <b>PnL:</b> {html.escape(f'{pnl_pct:+.2f}%')}\n"
-            f"<b>Entrada:</b> {entry_txt} SOL\n"
-            f"<b>Actual:</b> {current_txt} SOL\n"
-            f"<b>Máx:</b> {highest_txt}\n"
-            f"⏱️ {elapsed_txt} / {max_hold_txt}"
+            f"{emoji} PnL Actual: {pnl_txt} <b>(Pico: {pico_txt})</b>\n"
+            f"💵 Entrada: {entry_txt} SOL | Actual: {current_txt} SOL\n"
+            f"⏱️ Tiempo: {elapsed_txt} / {max_hold_txt}\n"
+            f"🎯 TP: {tp_txt} | SL: {sl_txt}\n\n"
+            f'🔗 <a href="https://pump.fun/{safe_mint}">Pump.fun</a> | '
+            f'<a href="https://dexscreener.com/solana/{safe_mint}">DexScreener</a> | '
+            f'<a href="https://solscan.io/token/{safe_mint}">Solscan</a>'
         )
         return await self.send(html_text)
 

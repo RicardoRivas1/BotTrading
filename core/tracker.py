@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import aiohttp
 from loguru import logger
 
 # Intervalo del bucle de monitoreo de posiciones activas (segundos).
@@ -30,6 +31,52 @@ CHECK_INTERVAL_SEC = 2.0
 # Tiempo máximo que una posición puede permanecer activa antes de forzar la
 # salida (TIME_EXPIRED), independientemente de su PnL. Configurable via .env.
 MAX_HOLD_TIME_SEC = int(os.getenv("MAX_HOLD_TIME_SEC", "180"))
+
+# API directa de Pump.fun para la cotización en SOL por token. Se usan
+# cabeceras de navegador para evitar el bloqueo 403 de Cloudflare.
+PUMPFUN_API = "https://frontend-api.pump.fun/coins/{mint}"
+PUMPFUN_API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
+
+async def get_pumpfun_price(mint: str) -> Optional[float]:
+    """Precio real en SOL por token desde la bonding curve de Pump.fun.
+
+    Consulta `https://frontend-api.pump.fun/coins/{mint}` y deriva la cotización
+    de las reservas virtuales ajustando los decimales de Solana (SOL = 9
+    decimales, token = 6):
+
+        v_sol = virtual_sol_reserves  / 1e9
+        v_tokens = virtual_token_reserves / 1e6
+        price_in_sol = v_sol / v_tokens
+
+    Devuelve None si el token no cotiza en Pump.fun, la API responde un estado
+    no-200 o el cálculo no es posible (nunca lanza excepciones hacia el caller).
+    """
+    url = PUMPFUN_API.format(mint=mint)
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=PUMPFUN_API_HEADERS) as resp:
+                if resp.status != 200:
+                    logger.debug("Pump.fun respondió {} para {}", resp.status, mint)
+                    return None
+                data = await resp.json(content_type=None)
+
+        v_sol = float(data["virtual_sol_reserves"]) / 1e9
+        v_tokens = float(data["virtual_token_reserves"]) / 1e6
+        if v_sol > 0 and v_tokens > 0:
+            return v_sol / v_tokens
+        logger.debug("Pump.fun sin reservas válidas para {}", mint)
+        return None
+    except (aiohttp.ClientError, KeyError, TypeError, ValueError) as exc:
+        logger.debug("Pump.fun sin precio para {}: {}", mint, exc)
+        return None
 
 
 @dataclass
@@ -143,25 +190,9 @@ class PositionTracker:
             pos.current_price = current_price
             pos.current_price_updated_at = now
 
-        # --- TIME_EXPIRED: cierre forzado sin importar el PnL actual ---
-        if now - pos.created_at > MAX_HOLD_TIME_SEC:
-            pnl_pct = (
-                (current_price - pos.buy_price) / pos.buy_price * 100.0
-            ) if pos.buy_price and current_price > 0 else 0.0
-            logger.info(
-                "⏳ TIME EXPIRED para {} ({}) tras {:.0f}s (PnL {:+.2f}%)",
-                mint, pos.symbol, MAX_HOLD_TIME_SEC, pnl_pct,
-            )
-            ok = await process_sell_and_notify(
-                pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=pnl_pct
-            )
-            if ok:
-                self.remove_position(mint)
-            return
-
         if current_price is None or current_price <= 0:
-            # Sin precio real en ningún endpoint: esperar al siguiente ciclo
-            # sin calcular PnL.
+            # Sin ningún precio real conocido: esperar al siguiente ciclo sin
+            # calcular PnL ni ejecutar salidas.
             return
 
         # --- Asignación dinámica del precio de entrada (BASE) ---
@@ -178,6 +209,9 @@ class PositionTracker:
             logger.info(f"🎯 Precio de entrada BASE fijado para {pos.symbol}: {current_price} SOL")
             return
 
+        # PnL en las mismas unidades (SOL por Token). Si None retorna 0 sobre
+        # señales de refresco, _refresh_position_price conserva la última
+        # cotización válida conocida (jamás se iguala al precio de entrada).
         pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100.0
         pos.latest_pnl_pct = pnl_pct
         if pnl_pct > pos.highest_pnl_pct:
@@ -193,6 +227,8 @@ class PositionTracker:
             )
             pos.last_log_time = now
 
+        # --- TP / SL primero (incluso en DRY_RUN) para salir antes de agotar
+        # el hold máximo ---
         if take_profit_pct and pnl_pct >= take_profit_pct:
             logger.info("🎯 TAKE PROFIT (+{:.2f}%) para {} ({})", pnl_pct, mint, pos.symbol)
             ok = await process_sell_and_notify(
@@ -200,52 +236,87 @@ class PositionTracker:
             )
             if ok:
                 self.remove_position(mint)
-        elif stop_loss_pct and pnl_pct <= -stop_loss_pct:
+            return
+        if stop_loss_pct and pnl_pct <= -stop_loss_pct:
             logger.info("🛑 STOP LOSS ({:.2f}%) para {} ({})", pnl_pct, mint, pos.symbol)
             ok = await process_sell_and_notify(
                 pos.mint, pos.symbol, reason="STOP_LOSS", pnl=pnl_pct
             )
             if ok:
                 self.remove_position(mint)
-
-        # Progreso: si la posición sigue abierta (no se vendió por TP/SL), se
-        # reporta su estado de forma periódica o ante saltos de PnL ≥ ±2%.
-        if mint not in self.positions:
             return
+
+        # --- TIME_EXPIRED: cierre forzado si se superó el hold máximo ---
+        if now - pos.created_at > MAX_HOLD_TIME_SEC:
+            logger.info(
+                "⏳ TIME EXPIRED para {} ({}) tras {:.0f}s (PnL {:+.2f}%)",
+                mint, pos.symbol, MAX_HOLD_TIME_SEC, pnl_pct,
+            )
+            ok = await process_sell_and_notify(
+                pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=pnl_pct
+            )
+            if ok:
+                self.remove_position(mint)
+            return
+
+        # Progreso: si la posición sigue abierta (no se vendió por TP/SL o
+        # TIME_EXPIRED), se reporta su estado periódicamente o ante saltos de
+        # PnL ≥ ±2%.
         await self._maybe_notify_progress(pos, pnl_pct)
 
     async def _get_current_price(self, mint: str) -> float:
-        """Precio actual real vía el ejecutor (Jupiter → DexScreener → Pump.fun).
+        """Precio real en cascada: Pump.fun → Jupiter/DexScreener (executor).
 
-        Siempre se consulta el precio de mercado real, en DRY_RUN igual que en
-        modo real. Si ningún endpoint entrega precio válido devuelve 0.0 (el
-        bucle esperará al TIME_EXPIRED sin calcular PnL).
+        El precio siempre está en las mismas unidades que el de entrada
+        (SOL por Token). Orden de fuentes:
+
+        1. `get_pumpfun_price(mint)`: bonding curve de Pump.fun directamente.
+        2. `executor.get_token_price(mint)`: Jupiter v6 → DexScreener → Pump.fun.
+
+        Si ninguna fuente entrega precio válido devuelve 0.0 (el caller decide
+        conservar la última cotización conocida) y registra un `warning`
+        aplacado (máx. 1 cada 30s) con la causa del fallo.
         """
         pos = self.positions.get(mint)
+        cause: Optional[str] = None
+
+        try:
+            price = await get_pumpfun_price(mint)
+            if price is not None and price > 0:
+                return price
+            cause = "Pump.fun sin cotización"
+        except Exception as exc:  # noqa: BLE001
+            cause = f"Pump.fun: {exc}"
+
         try:
             price = await self.executor.get_token_price(mint)
             if price is not None and price > 0:
                 return price
-        except Exception as exc:  # noqa: BLE001 - sin precio en ningún endpoint
-            # Throttle: como mucho 1 log de "sin precio" cada 30 segundos.
-            if pos is not None:
-                now = time.time()
-                if now - pos.last_no_price_log >= 30:
-                    logger.warning(
-                        "Sin precio real para {} ({}): {}",
-                        mint, pos.symbol, exc,
-                    )
-                    pos.last_no_price_log = now
+            cause = f"{cause or 'executor'}: sin cotización"
+        except Exception as exc:  # noqa: BLE001
+            cause = f"{cause or 'executor'}: {exc}"
 
+        if pos is not None:
+            now = time.time()
+            if now - pos.last_no_price_log >= 30:
+                logger.warning(
+                    "Sin precio real para {} ({}): {}",
+                    mint, pos.symbol, cause,
+                )
+                pos.last_no_price_log = now
         return 0.0
 
     async def _refresh_position_price(self, pos: TrackerPosition) -> float:
-        """Precio real, con refresh vía HTTP cuando la cotización está obsoleta.
+        """Precio real actualizado, con fallback en cascada y último precio válido.
 
         Si existe una cotización fresca reciente (menos de
         PRICE_POLL_FALLBACK_SECONDS) se reutiliza sin golpear la red. En caso
-        contrario (p. ej. sin eventos de precio que la actualicen) se consulta
-        el fallback HTTP real vía el ejecutor (Jupiter → DexScreener → Pump.fun).
+        contrario consulta la cascada Pump.fun → Jupiter/DexScreener. Si ninguna
+        fuente devuelve precio:
+
+        - Si ya había una cotización conocida previa, la conserva (NUNCA la
+          sustituye por `buy_price`) y avisa con un `warning`.
+        - Si no hay ningún precio conocido, devuelve 0.0.
         """
         now = time.time()
         fallback_gap = float(
@@ -255,7 +326,28 @@ class PositionTracker:
             fresh = pos.current_price > 0 and (now - pos.current_price_updated_at) < fallback_gap
             if fresh:
                 return pos.current_price
-        return await self._get_current_price(pos.mint)
+
+        try:
+            price = await self._get_current_price(pos.mint)
+        except Exception as exc:  # noqa: BLE001
+            price = 0.0
+            logger.warning("No se pudo obtener precio de {} ({}): {}", pos.mint, pos.symbol, exc)
+
+        if price is not None and price > 0:
+            pos.current_price = price
+            pos.current_price_updated_at = now
+            return price
+
+        # Fallback total: conservar la última cotización válida conocida. Jamás
+        # se iguala current_price con el precio de entrada para no enmascarar
+        # un PnL congelado en 0.00%.
+        if pos.current_price > 0:
+            logger.warning(
+                "Sin precio real para {} ({}); conservando última cotización {:.10g} SOL",
+                pos.mint, pos.symbol, pos.current_price,
+            )
+            return pos.current_price
+        return 0.0
 
     async def _maybe_notify_progress(self, pos: TrackerPosition, pnl_pct: float) -> None:
         """Notifica el progreso de la posición de forma periódica o por salto de PnL.
@@ -274,7 +366,15 @@ class PositionTracker:
         big_jump = abs(pnl_pct - pos.last_notified_pnl_pct) >= 2.0
         if not (period_expired or big_jump):
             return
-        result = self.notifier.notify_position_progress(pos)
+        result = self.notifier.notify_position_progress(
+            pos,
+            take_profit_pct=float(
+                getattr(self.config.trading, "TAKE_PROFIT_PCT", 0.0) or 0.0
+            ),
+            stop_loss_pct=float(
+                getattr(self.config.trading, "STOP_LOSS_PCT", 0.0) or 0.0
+            ),
+        )
         if inspect.isawaitable(result):
             await result
         pos.last_progress_notify_at = now
