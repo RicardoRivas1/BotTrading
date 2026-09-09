@@ -132,8 +132,6 @@ class TestFallbackPrecio:
             await executor.get_token_price(MINT_RAYDIUM)
 
     async def test_precio_adopta_entry_base_de_la_posicion(self, executor: JupiterExecutor) -> None:
-        from core.execution import Position
-
         executor.positions[MINT_RAYDIUM] = Position(mint=MINT_RAYDIUM, entry_price=0.0)
         executor._get_token_decimals = AsyncMock(return_value=6)
         executor._get_quote = AsyncMock(side_effect=SwapExecutionError("no route"))
@@ -322,13 +320,8 @@ class TestUtilities:
 
             value = _Inner()
 
-        async def _get(*_a, **_k) -> _FakeResp:
-            return _FakeResp()
-
-        client = MagicMock()
-        client.get_account_info_json_parsed = _get
-        client.__aenter__ = AsyncMock(return_value=client)
-        client.__aexit__ = AsyncMock(return_value=False)
+        client = AsyncMock()
+        client.get_account_info_json_parsed.return_value = _FakeResp()
         monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
         assert await executor._get_token_decimals(MINT_RAYDIUM) == 6
 
@@ -336,10 +329,8 @@ class TestUtilities:
         class _FakeResp:
             value = None
 
-        client = MagicMock()
-        client.get_account_info_json_parsed = AsyncMock(return_value=_FakeResp())
-        client.__aenter__ = AsyncMock(return_value=client)
-        client.__aexit__ = AsyncMock(return_value=False)
+        client = AsyncMock()
+        client.get_account_info_json_parsed.return_value = _FakeResp()
         monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
         assert await executor._get_token_decimals(MINT_RAYDIUM) == 9
 
