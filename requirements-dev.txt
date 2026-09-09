@@ -6,6 +6,7 @@ pytest
 pytest-asyncio
 pytest-cov
 pytest-xdist
+pytest-timeout
 mutmut
 ruff
 mypy
