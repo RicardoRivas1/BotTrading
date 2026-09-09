@@ -42,8 +42,6 @@ class TrackerPosition:
     created_at: float = field(default_factory=time.time)
     last_log_time: float = field(default_factory=time.time)
     last_no_price_log: float = 0.0
-    sim_steps: int = 0          # Ciclos de precio simulado (DRY_RUN).
-    sim_direction: int = 1      # +1 drifta hacia TAKE_PROFIT, -1 hacia STOP_LOSS.
 
 
 class PositionTracker:
@@ -75,14 +73,11 @@ class PositionTracker:
         else:
             symbol = str(mint)[:6].upper()
 
-        # Dirección de la simulación determinista por mint (mitad a TP, mitad a SL).
-        sim_direction = 1 if (sum(ord(ch) for ch in mint) % 2 == 0) else -1
         self.positions[mint] = TrackerPosition(
             mint=mint,
             symbol=symbol,
             buy_price=buy_price,
             amount=amount,
-            sim_direction=sim_direction,
         )
 
     def remove_position(self, mint: str) -> bool:
@@ -201,10 +196,9 @@ class PositionTracker:
     async def _get_current_price(self, mint: str) -> float:
         """Precio actual real vía el ejecutor (Jupiter → DexScreener → Pump.fun).
 
-        Si ningún endpoint entrega precio:
-        - En DRY_RUN: genera un precio simulado dinámico sobre el precio de
-          entrada (multiplicador progresivo por ciclo).
-        - En modo real: devuelve 0.0 (el bucle esperará al TIME_EXPIRED).
+        Siempre se consulta el precio de mercado real, en DRY_RUN igual que en
+        modo real. Si ningún endpoint entrega precio válido devuelve 0.0 (el
+        bucle esperará al TIME_EXPIRED sin calcular PnL).
         """
         pos = self.positions.get(mint)
         try:
@@ -222,33 +216,7 @@ class PositionTracker:
                     )
                     pos.last_no_price_log = now
 
-        if self.config.trading.DRY_RUN:
-            return self._simulated_price(mint)
         return 0.0
-
-    def _simulated_price(self, mint: str) -> float:
-        """Precio simulado dinámico en DRY_RUN.
-
-        Aplica un multiplicador progresivo en cada ciclo sobre el precio de
-        entrada para emular volatilidad de memecoin. Según `sim_direction`,
-        el PnL alcanza TAKE_PROFIT (+100%) o STOP_LOSS (-30%) en pocos ciclos
-        de prueba (~9 ciclos al alza, ~5 a la baja con CHECK_INTERVAL_SEC=2s).
-        """
-        pos = self.positions.get(mint)
-        if pos is None:
-            return 0.0
-        # Base de la simulación: el precio de entrada real si ya existe. Si la
-        # entrada está PENDIENTE (0.0 o 1.0), se usa una base nominal 0.0001 SOL
-        # para que el flujo DRY_RUN siga avanzando hasta TP/SL (el tracker fija
-        # la entrada BASE con el primer precio simulado en el ciclo siguiente).
-        if pos.buy_price is not None and pos.buy_price > 0 and abs(pos.buy_price - 1.0) >= 1e-9:
-            base = pos.buy_price
-        else:
-            base = 0.0001
-        pos.sim_steps += 1
-        if pos.sim_direction > 0:
-            return base * (1.08 ** pos.sim_steps)
-        return base * (0.92 ** pos.sim_steps)
 
     async def check_position(self, token_mint: str) -> tuple[str, float]:
         """Evalúa una posición y ejecuta la salida si corresponde.

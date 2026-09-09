@@ -341,9 +341,10 @@ class JupiterExecutor:
         if simulate:
             # DRY_RUN: usar el MISMO endpoint de monitoreo (get_token_price ->
             # Jupiter/DexScreener/Pump.fun) para que el PnL del tracker sea
-            # coherente. Nunca inventar un precio de entrada: la cotización
-            # simulada 1:1 daría 0.001 SOL hardcodeado, por eso si no hay
-            # precio real se deja la entrada en 0.0 (PENDIENTE).
+            # coherente. Nunca inventar un precio de entrada: el precio viene
+            # siempre de una fuente de mercado real vía get_token_price; si no
+            # hay precio real se deja la entrada en 0.0 (PENDIENTE) para que el
+            # tracker fije la base con el primer precio real obtenido.
             entry_price_sol = 0.0
             try:
                 entry_price_sol = await self.get_token_price(token_mint)
@@ -352,8 +353,6 @@ class JupiterExecutor:
                     "No se pudo obtener precio real de {} en DRY_RUN: {}", token_mint, exc
                 )
             if entry_price_sol <= 0:
-                # Ningún endpoint entregó precio real: entrada queda PENDIENTE
-                # para que el tracker fije el primer precio real como base.
                 entry_price_sol = 0.0
         else:
             entry_price_sol = (
