@@ -83,16 +83,26 @@ class TelegramNotifier:
         self,
         mint: str,
         amount_sol: float,
+        symbol: str = "N/A",
+        score: Optional[float] = None,
         price: Optional[float] = None,
         price_unit: str = "SOL",
+        dry_run: bool = True,
     ) -> bool:
         """Notifica una compra de token ejecutada.
 
-        `price_unit` admite "SOL" (por defecto) o "USD":
-            - SOL: "0.000000042 SOL" ({price:.9f} SOL)
-            - USD: "$0.00000004"    (${price:.8f})
+        Muestra el ticker/símbolo del token en grande y enlaza a Pump.fun,
+        DexScreener y Solscan. `symbol` y `mint` se escapan con `html.escape()`
+        para evitar errores 400 de Telegram. `price` (con `price_unit` "SOL" o
+        "USD") solo se muestra si está definido.
         """
-        amount_txt = f"{amount_sol:.4f}"
+        mode_txt = "DRY_RUN" if dry_run else "REAL"
+        safe_symbol = html.escape(str(symbol).upper())
+        safe_mint = html.escape(str(mint))
+        amount_txt = html.escape(f"{amount_sol:.4f}")
+
+        # Ticker/símbolo en grande y precio con formato coherente (SOL o USD).
+        big_symbol = f"💎 ${safe_symbol}"
         if price and price > 0:
             if price_unit.upper() == "USD":
                 price_txt = f"${price:.8f}"
@@ -100,17 +110,35 @@ class TelegramNotifier:
                 price_txt = f"{price:.9f} SOL"
         else:
             price_txt = "N/D"
+
+        price_line = f"\n<b>Precio:</b> {html.escape(price_txt)}" if price and price > 0 else ""
+
+        score_txt = html.escape(str(score)) if score is not None else "N/D"
+
         html_text = (
-            "<b>🟢 COMPRA EJECUTADA</b>\n\n"
-            f"<b>Token:</b> <code>{html.escape(str(mint))}</code>\n"
-            f"<b>Monto:</b> {html.escape(amount_txt)} SOL\n"
-            f"<b>Precio:</b> {html.escape(price_txt)}"
+            f"🚀 <b>COMPRA EJECUTADA</b> [{mode_txt}]\n\n"
+            f"{big_symbol}\n\n"
+            f"<b>Token:</b> ${safe_symbol}\n"
+            f"<code>{safe_mint}</code>\n"
+            f"<b>Monto:</b> {amount_txt} SOL\n"
+            f"<b>Score RugCheck:</b> {score_txt}"
+            f"{price_line}\n\n"
+            f'🔗 <a href="https://pump.fun/{safe_mint}">Pump.fun</a> | '
+            f'<a href="https://dexscreener.com/solana/{safe_mint}">DexScreener</a> | '
+            f'<a href="https://solscan.io/token/{safe_mint}">Solscan</a>'
         )
         return await self.send(html_text)
 
-    async def send_buy_notification(self, mint: str, amount_sol: float, price: Optional[float] = None) -> bool:
+    async def send_buy_notification(
+        self,
+        mint: str,
+        amount_sol: float,
+        price: Optional[float] = None,
+        symbol: str = "N/A",
+        score: Optional[float] = None,
+    ) -> bool:
         """Alias de `send_buy` para compatibilidad con flujos de test."""
-        return await self.send_buy(mint, amount_sol, price)
+        return await self.send_buy(mint, amount_sol, symbol=symbol, score=score, price=price)
 
     async def send_sell(self, mint: str, amount_tokens: float, sol_received: float) -> bool:
         """Notifica una venta de token ejecutada."""

@@ -25,7 +25,7 @@ from core.websocket import TokenWebSocket, create_listener
 from core.security import TokenSecurityValidator, SecurityValidationError
 from core.execution import JupiterExecutor
 from core.notifier import TelegramNotifier
-from core.tracker import PositionTracker
+from core.tracker import PositionTracker, set_global_tracker
 
 # -- Configuración inicial de loguru ------------------------------------------
 logger.remove()
@@ -76,6 +76,8 @@ class MemecoinBot:
             notifier=self.notifier,
             config=config,
         )
+        # Comparte el tracker con los flujos de compra (websocket).
+        set_global_tracker(self.tracker)
 
     # ------------------------------------------------------------ Trading
     async def _process_new_token(self, mint: str, ticker: str = "N/A") -> None:
@@ -104,6 +106,8 @@ class MemecoinBot:
             await self.notifier.send_buy(
                 mint,
                 self.config.trading.BUY_AMOUNT_SOL,
+                symbol=ticker,
+                dry_run=self.config.trading.DRY_RUN,
             )
             logger.success("Compra de prueba (TEST_MODE) de {} ejecutada: {}", mint, sig)
             return
@@ -129,26 +133,10 @@ class MemecoinBot:
         await self.notifier.send_buy(
             mint,
             self.config.trading.BUY_AMOUNT_SOL,
+            symbol=ticker,
+            dry_run=self.config.trading.DRY_RUN,
         )
         logger.success("Compra de {} ejecutada: {}", mint, sig)
-
-    # ------------------------------------------------- Positions monitor
-    async def _monitor_positions(self, interval_seconds: float) -> None:
-        """Revisa periódicamente las posiciones abiertas (TP/SL).
-
-        Corre en segundo plano tras cada compra. El `PositionTracker` consulta
-        la cotización vía Jupiter v6, dispara la venta (con slippage alto en
-        stop-loss) y notifica a Telegram.
-        """
-        while True:
-            await asyncio.sleep(interval_seconds)
-            opens = list(self.executor.positions.keys())
-            for mint in opens:
-                try:
-                    await self.tracker.check_position(mint)
-                except Exception as exc:  # noqa: BLE001 - nunca detener el bot
-                    logger.warning("Error monitoreando {}: {}", mint, exc)
-                    continue
 
     # ------------------------------------------------------------ Loop
     async def run(self) -> None:
@@ -160,11 +148,7 @@ class MemecoinBot:
         heartbeat_task = asyncio.create_task(
             self.notifier.start_heartbeat(interval_minutes=30.0)
         )
-        monitor_task = asyncio.create_task(
-            self._monitor_positions(
-                interval_seconds=self.config.bot.POLL_INTERVAL_SECONDS
-            )
-        )
+        monitor_task = asyncio.create_task(self.tracker.start_monitoring())
 
         try:
             # Consumimos los eventos que llegan de forma asíncrona.

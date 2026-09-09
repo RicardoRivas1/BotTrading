@@ -64,7 +64,9 @@ async def check_rugcheck(mint: str) -> int:
     return validator._rugcheck_score(report)
 
 
-async def process_buy_and_notify(mint: str, symbol: str = "N/A") -> None:
+async def process_buy_and_notify(
+    mint: str, symbol: str = "N/A", score: Optional[float] = None
+) -> None:
     """Ejecuta una compra de prueba (simulada) y notifica a Telegram."""
     from core.execution import JupiterExecutor
     from core.notifier import TelegramNotifier
@@ -110,11 +112,82 @@ async def process_buy_and_notify(mint: str, symbol: str = "N/A") -> None:
         except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
             logger.error("No se pudo consultar precio de entrada de {}: {}", mint, exc)
 
-    await notifier.send_buy(mint, cfg.trading.BUY_AMOUNT_SOL, price=entry_price)
+    await notifier.send_buy(
+        mint,
+        cfg.trading.BUY_AMOUNT_SOL,
+        symbol=symbol,
+        score=score,
+        price=entry_price,
+        dry_run=cfg.trading.DRY_RUN,
+    )
+
+    # Registro de la posición activa en la memoria global del tracker para que
+    # el bucle de monitoreo (TP/SL) la vigile en segundo plano.
+    from core.tracker import get_global_tracker
+
+    tracker = get_global_tracker()
+    tracker.add_position(
+        mint=mint,
+        symbol=symbol,
+        buy_price=entry_price,
+        amount=cfg.trading.BUY_AMOUNT_SOL,
+    )
+    logger.info(f"📌 Posición registrada en tracker para {symbol} ({mint})")
+
     logger.success(
         "Compra de {} ({}) de {} ejecutada: {} @ entry={:.10g}",
         label, mint, sig, entry_price,
     )
+
+
+async def process_sell_and_notify(
+    mint: str,
+    symbol: str = "N/A",
+    reason: str = "",
+    pnl: float = 0.0,
+) -> bool:
+    """Vende (real o simulado) y notifica el motivo de la salida TP/SL.
+
+    En DRY_RUN solo registra la venta simulada. En modo real, el balance de
+    tokens se estima desde la posición del tracker (`amount / buy_price`) y la
+    totalidad se vende vía Jupiter. Devuelve True si la salida se ejecutó.
+    """
+    from core.notifier import TelegramNotifier
+    from core.tracker import get_global_tracker
+
+    cfg = config.load_config()
+    notifier = TelegramNotifier(
+        token=cfg.telegram.TELEGRAM_TOKEN,
+        chat_id=cfg.telegram.TELEGRAM_CHAT_ID,
+    )
+    tracker = get_global_tracker()
+
+    try:
+        if cfg.trading.DRY_RUN:
+            logger.info(
+                "[DRY_RUN] Venta simulada de {} ({}) por {} (PnL {:.2f}%)",
+                symbol, mint, reason, pnl,
+            )
+        else:
+            pos = tracker.get_position(mint)
+            token_amount = (pos.amount / pos.buy_price) if pos and pos.buy_price else 0.0
+            if token_amount <= 0:
+                logger.warning("Sin balance estimado para vender {} ({}); omitiendo.", symbol, mint)
+                return False
+            await tracker.executor.sell_token(mint, token_amount)
+            logger.success("Venta de {} ({}) ejecutada por {} (PnL {:.2f}%)", symbol, mint, reason, pnl)
+    except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
+        logger.error("Error vendiendo {} ({}): {}", symbol, reason, exc)
+        await notifier.send_error(f"No se pudo vender {symbol} ({mint}) por {reason}: {exc}")
+        return False
+
+    if reason == "TAKE_PROFIT":
+        await notifier.send_take_profit(mint, pnl)
+    elif reason == "STOP_LOSS":
+        await notifier.send_stop_loss(mint, pnl)
+    else:
+        await notifier.send_status(f"Venta de {symbol} ({mint}) por {reason} (PnL {pnl:.2f}%)")
+    return True
 
 
 class TokenWebSocket:
@@ -224,7 +297,7 @@ class TokenWebSocket:
                                 logger.info(
                                     f"✅ Token APROBADO por RugCheck (Score: {score} <= {max_score}). Ejecutando compra..."
                                 )
-                                await process_buy_and_notify(mint, symbol)
+                                await process_buy_and_notify(mint, symbol, score=score)
                             else:
                                 logger.info(
                                     f"❌ Token RECHAZADO por RugCheck (Score: {score} > {max_score})"
