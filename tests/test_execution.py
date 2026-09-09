@@ -315,13 +315,12 @@ class TestUtilities:
     async def test_get_token_decimals_parsed(self, executor: JupiterExecutor, monkeypatch) -> None:
         class _FakeResp:
             class _Inner:
-                data = MagicMock()
-                data.parsed = {"info": {"decimals": 6}}
+                decimals = 6
 
             value = _Inner()
 
         client = AsyncMock()
-        client.get_account_info_json_parsed.return_value = _FakeResp()
+        client.get_token_supply.return_value = _FakeResp()
         monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
         assert await executor._get_token_decimals(MINT_RAYDIUM) == 6
 
@@ -330,7 +329,7 @@ class TestUtilities:
             value = None
 
         client = AsyncMock()
-        client.get_account_info_json_parsed.return_value = _FakeResp()
+        client.get_token_supply.return_value = _FakeResp()
         monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
         assert await executor._get_token_decimals(MINT_RAYDIUM) == 9
 
