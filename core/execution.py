@@ -524,7 +524,13 @@ class JupiterExecutor:
         return 0.0
 
     async def _get_price_from_pumpfun(self, token_mint: str) -> float:
-        """Consulta precio vía Pump.fun API; calcula precio SOL desde reservas."""
+        """Consulta precio vía Pump.fun API; calcula precio SOL desde la curva.
+
+        Prioriza las reservas virtuales de la bonding curve (Pump.fun):
+            precio_sol = virtual_sol_reserves / virtual_token_reserves
+        y cae a las reservas reales (`sol_reserves`/`token_reserves`) si las
+        virtuales no están disponibles.
+        """
         url = f"https://frontend-api.pump.fun/coins/{token_mint}"
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=_USER_AGENT_HEADERS) as resp:
@@ -533,12 +539,22 @@ class JupiterExecutor:
                     return 0.0
                 data = await resp.json()
 
-        # La bonding curve de Pump.fun:
-        #   precio_sol = (sol_reserves) / (token_reserves)
-        # donde sol_reserves y token_reserves son las cantidades actuales en la curva.
+        # Bonding curve de Pump.fun (reservas virtuales):
+        #   precio_sol = (virtual_sol_reserves) / (virtual_token_reserves)
+        virtual_sol = data.get("virtual_sol_reserves")
+        virtual_tokens = data.get("virtual_token_reserves")
+        if virtual_sol and virtual_tokens:
+            try:
+                vsol = float(virtual_sol)
+                vtok = float(virtual_tokens)
+                if vtok > 0:
+                    return vsol / vtok
+            except (ValueError, TypeError):
+                pass
+
+        # Alternativa: reservas reales de la curva, si la API no expone virtual.
         sol_reserves = data.get("sol_reserves")
         token_reserves = data.get("token_reserves")
-
         if sol_reserves and token_reserves:
             try:
                 sol_r = float(sol_reserves)

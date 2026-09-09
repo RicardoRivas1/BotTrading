@@ -141,7 +141,15 @@ async def process_buy_and_notify(
         try:
             entry_price = await executor.get_token_price(mint)
         except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
-            logger.error(f"No se pudo consultar precio de entrada de {mint}: {exc}")
+            logger.warning(f"No se pudo consultar precio de entrada de {mint}: {exc}")
+
+    if not entry_price or entry_price <= 0:
+        # Entrada PENDIENTE (sin precio real en ningún endpoint): no es un error
+        # operativo. El tracker la fijará como BASE con el primer precio real.
+        logger.warning(
+            f"📌 Precio de entrada PENDIENTE para {symbol} ({mint}); "
+            f"el tracker fijará el entry base real."
+        )
 
     await notifier.send_buy(
         mint,
