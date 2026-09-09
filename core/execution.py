@@ -410,10 +410,13 @@ class JupiterExecutor:
     async def get_token_price(self, token_mint: str) -> float:
         """Consulta el precio del token contra SOL con fallback encadenado.
 
-        Orden de consulta:
-        1. Jupiter v6 Quote API (preferido).
-        2. DexScreener API (fallback si Jupiter falla por 404 o red).
-        3. Pump.fun API (último recurso para tokens < 30s sin listing en DexScreener).
+        Orden de consulta optimizado:
+        - Tokens de Pump.fun (mint terminado en "pump", recién creados):
+          DexScreener -> Pump.fun -> Jupiter (último recurso para tokens ya
+          migrados a Raydium). Se evita golpear Jupiter primero, que devolvería
+          404 seguro.
+        - Resto de tokens: Jupiter v6 -> DexScreener -> Pump.fun.
+        - Pump.fun como último recurso para tokens < 30s sin listing.
 
         Todas las fuentes devuelven SOL (priceNative de DexScreener / reservas de
         Pump.fun), de forma que `current_price` y `entry_price` quedan en la misma
@@ -421,38 +424,52 @@ class JupiterExecutor:
         no tiene un precio de entrada previo, el primer precio real obtenido se
         adopta como `entry_price` base de la posición.
         """
+        # Los mints de Pump.fun siempre terminan en "pump": su cotización aún
+        # no está en Jupiter (404 seguro), así que no tiene sentido consultarlo
+        # primero para tokens recién creados.
+        is_pump_mint = str(token_mint).lower().endswith("pump")
+        try_sequence = (
+            ("dexscreener", "pumpfun", "jupiter")
+            if is_pump_mint
+            else ("jupiter", "dexscreener", "pumpfun")
+        )
+
         price_sol = 0.0
+        for source in try_sequence:
+            if price_sol > 0:
+                break
 
-        # --- 1. Jupiter v6 (principal) ---
-        try:
-            decimals = await self._get_token_decimals(token_mint)
-            amount_lamports = int(1 * (10 ** decimals))
-            async with aiohttp.ClientSession() as session:
-                quote = await self._get_quote(
-                    session, token_mint, SOL_MINT, amount_lamports
-                )
-            out = float(quote.get("outAmount") or 0)
-            price_sol = out / 1_000_000_000  # lamports -> SOL
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Jupiter sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
+            if source == "jupiter":
+                try:
+                    decimals = await self._get_token_decimals(token_mint)
+                    amount_lamports = int(1 * (10 ** decimals))
+                    async with aiohttp.ClientSession() as session:
+                        quote = await self._get_quote(
+                            session, token_mint, SOL_MINT, amount_lamports
+                        )
+                    out = float(quote.get("outAmount") or 0)
+                    price_sol = out / 1_000_000_000  # lamports -> SOL
+                    if price_sol > 0:
+                        logger.info("Precio de {} vía Jupiter (SOL): {:.10g}", token_mint, price_sol)
+                except Exception as exc:  # noqa: BLE001
+                    # Silencioso: 404 de Jupiter es lo esperado para tokens nuevos.
+                    logger.debug("Jupiter sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
 
-        # --- 2. DexScreener ---
-        if price_sol <= 0:
-            try:
-                price_sol = await self._get_price_from_dexscreener(token_mint)
-                if price_sol > 0:
-                    logger.info("Precio de {} vía DexScreener (SOL): {:.10g}", token_mint, price_sol)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("DexScreener sin precio para {} ({}); intentando Pump.fun.", token_mint, exc)
+            elif source == "dexscreener":
+                try:
+                    price_sol = await self._get_price_from_dexscreener(token_mint)
+                    if price_sol > 0:
+                        logger.info("Precio de {} vía DexScreener (SOL): {:.10g}", token_mint, price_sol)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("DexScreener sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
 
-        # --- 3. Pump.fun (curva de bonding) ---
-        if price_sol <= 0:
-            try:
-                price_sol = await self._get_price_from_pumpfun(token_mint)
-                if price_sol > 0:
-                    logger.info("Precio de {} vía Pump.fun (SOL): {:.10g}", token_mint, price_sol)
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Pump.fun sin precio para {}: {}", token_mint, exc)
+            elif source == "pumpfun":
+                try:
+                    price_sol = await self._get_price_from_pumpfun(token_mint)
+                    if price_sol > 0:
+                        logger.info("Precio de {} vía Pump.fun (SOL): {:.10g}", token_mint, price_sol)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Pump.fun sin precio para {}: {}", token_mint, exc)
 
         if price_sol <= 0:
             raise SwapExecutionError(f"No se pudo obtener precio de {token_mint} desde ningún endpoint.")
