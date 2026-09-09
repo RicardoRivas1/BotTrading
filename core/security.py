@@ -86,16 +86,15 @@ class TokenSecurityValidator:
         """
         url = f"{RUGCHECK_API}/{mint}/report"
         timeout = aiohttp.ClientTimeout(total=5)
-        # Retardo de indexación: da tiempo a que RugCheck procese el contrato
+      # Retardo de indexación: da tiempo a que RugCheck procese el contrato
         # recién creado antes de consultarlo.
-       await asyncio.sleep(2.0)
+        await asyncio.sleep(2.0)
         try:
             async with session.post(self.rpc_url, json=payload) as resp:
                 if resp.status != 200:
                     logger.warning(f"RPC getAccountInfo status {resp.status} para {mint}")
         except Exception as e:
-            logger.error(f"Error en RPC: {e}")
-
+            logger.error(f"Error en consulta RPC: {e}")
     def _parse_auth_from_mint(self, account_info: Optional[dict[str, Any]]) -> tuple[Optional[str], Optional[str], float]:
         """Extrae mint/freeze authority y % de supply del Dev del mint.
         
