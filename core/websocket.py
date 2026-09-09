@@ -193,7 +193,17 @@ class TokenWebSocket:
                         # Evaluación de seguridad: consulta a RugCheck con captura de errores.
                         try:
                             score = await check_rugcheck(mint)
+                            max_score = float(os.getenv("RUGCHECK_MAX_SCORE", "10000"))
                             logger.info(f"📊 Score RugCheck para {mint}: {score}")
+                            if score <= max_score:
+                                logger.info(
+                                    f"✅ Token APROBADO por RugCheck (Score: {score} <= {max_score}). Ejecutando compra..."
+                                )
+                                await process_buy_and_notify(mint, symbol)
+                            else:
+                                logger.info(
+                                    f"❌ Token RECHAZADO por RugCheck (Score: {score} > {max_score})"
+                                )
                         except Exception as e:
                             logger.error(f"❌ Error al evaluar RugCheck para {mint}: {e}")
                     if payload.get("type") in ("tokenCreation", "create"):
