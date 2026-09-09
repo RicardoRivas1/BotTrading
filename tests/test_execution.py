@@ -114,7 +114,9 @@ class TestFallbackPrecio:
         self, executor: JupiterExecutor
     ) -> None:
         executor._get_token_decimals = AsyncMock(return_value=6)
-        executor._get_quote = AsyncMock(return_value={"outAmount": 1_000_000})  # 0.001 SOL
+        executor._get_quote = AsyncMock(
+            return_value={"outAmount": 1_000_000}
+        )  # 0.001 SOL
         executor._get_price_from_dexscreener = AsyncMock(return_value=0.0)
         executor._get_price_from_pumpfun = AsyncMock(return_value=0.0)
 
@@ -122,7 +124,9 @@ class TestFallbackPrecio:
 
         assert price == pytest.approx(0.001)
 
-    async def test_todas_las_fuentes_fallan_lanza_error(self, executor: JupiterExecutor) -> None:
+    async def test_todas_las_fuentes_fallan_lanza_error(
+        self, executor: JupiterExecutor
+    ) -> None:
         executor._get_token_decimals = AsyncMock(return_value=6)
         executor._get_quote = AsyncMock(side_effect=SwapExecutionError("no route"))
         executor._get_price_from_dexscreener = AsyncMock(return_value=0.0)
@@ -131,7 +135,9 @@ class TestFallbackPrecio:
         with pytest.raises(SwapExecutionError, match="No se pudo obtener precio"):
             await executor.get_token_price(MINT_RAYDIUM)
 
-    async def test_precio_adopta_entry_base_de_la_posicion(self, executor: JupiterExecutor) -> None:
+    async def test_precio_adopta_entry_base_de_la_posicion(
+        self, executor: JupiterExecutor
+    ) -> None:
         executor.positions[MINT_RAYDIUM] = Position(mint=MINT_RAYDIUM, entry_price=0.0)
         executor._get_token_decimals = AsyncMock(return_value=6)
         executor._get_quote = AsyncMock(side_effect=SwapExecutionError("no route"))
@@ -151,8 +157,16 @@ class TestDexScreener:
     ) -> None:
         payload = {
             "pairs": [
-                {"liquidity": {"usd": 5000}, "priceNative": "0.000123", "baseToken": {"symbol": "MET"}},
-                {"liquidity": {"usd": 90000}, "priceNative": "0.000999", "baseToken": {"symbol": "MET"}},
+                {
+                    "liquidity": {"usd": 5000},
+                    "priceNative": "0.000123",
+                    "baseToken": {"symbol": "MET"},
+                },
+                {
+                    "liquidity": {"usd": 90000},
+                    "priceNative": "0.000999",
+                    "baseToken": {"symbol": "MET"},
+                },
             ]
         }
         _patch_session(monkeypatch, _FakeResponse(200, payload), lambda resp: resp)
@@ -161,11 +175,17 @@ class TestDexScreener:
 
         assert price == pytest.approx(0.000999)  # prioriza la pair con más liquidez
 
-    async def test_sin_pairs_devuelve_cero(self, executor: JupiterExecutor, monkeypatch) -> None:
-        _patch_session(monkeypatch, _FakeResponse(200, {"pairs": []}), lambda resp: resp)
+    async def test_sin_pairs_devuelve_cero(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        _patch_session(
+            monkeypatch, _FakeResponse(200, {"pairs": []}), lambda resp: resp
+        )
         assert await executor._get_price_from_dexscreener(MINT_RAYDIUM) == 0.0
 
-    async def test_status_no_200_devuelve_cero(self, executor: JupiterExecutor, monkeypatch) -> None:
+    async def test_status_no_200_devuelve_cero(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
         _patch_session(monkeypatch, _FakeResponse(404, {}), lambda resp: resp)
         assert await executor._get_price_from_dexscreener(MINT_RAYDIUM) == 0.0
 
@@ -193,8 +213,13 @@ class TestDexScreener:
 class TestPumpFun:
     """Parseo de la respuesta de Pump.fun (reservas virtuales de la curva)."""
 
-    async def test_precio_desde_reservas_virtuales(self, executor: JupiterExecutor, monkeypatch) -> None:
-        payload = {"virtual_sol_reserves": 100_000, "virtual_token_reserves": 1_000_000_000}
+    async def test_precio_desde_reservas_virtuales(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        payload = {
+            "virtual_sol_reserves": 100_000,
+            "virtual_token_reserves": 1_000_000_000,
+        }
         _patch_session(monkeypatch, _FakeResponse(200, payload), lambda resp: resp)
 
         price = await executor._get_price_from_pumpfun(MINT_PUMP)
@@ -202,7 +227,9 @@ class TestPumpFun:
         # 100000 / 1000000000 = 0.0001 SOL
         assert price == pytest.approx(0.0001)
 
-    async def test_fallback_a_reservas_reales(self, executor: JupiterExecutor, monkeypatch) -> None:
+    async def test_fallback_a_reservas_reales(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
         payload = {"sol_reserves": "50000", "token_reserves": "1000000000"}
         _patch_session(monkeypatch, _FakeResponse(200, payload), lambda resp: resp)
 
@@ -210,11 +237,15 @@ class TestPumpFun:
 
         assert price == pytest.approx(0.00005)
 
-    async def test_sin_precio_devuelve_cero(self, executor: JupiterExecutor, monkeypatch) -> None:
+    async def test_sin_precio_devuelve_cero(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
         _patch_session(monkeypatch, _FakeResponse(200, {}), lambda resp: resp)
         assert await executor._get_price_from_pumpfun(MINT_PUMP) == 0.0
 
-    async def test_status_no_200_devuelve_cero(self, executor: JupiterExecutor, monkeypatch) -> None:
+    async def test_status_no_200_devuelve_cero(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
         _patch_session(monkeypatch, _FakeResponse(500, {}), lambda resp: resp)
         assert await executor._get_price_from_pumpfun(MINT_PUMP) == 0.0
 
@@ -246,7 +277,9 @@ class TestCargarKeypair:
 
         monkeypatch.setattr(execution_mod, "Bip39SeedGenerator", _blow)
         with pytest.raises(SwapExecutionError, match="Mnemonic inválido"):
-            execution_mod.cargar_keypair("una dos tres cuatro cinco seis siete ocho nueve diez once doce")
+            execution_mod.cargar_keypair(
+                "una dos tres cuatro cinco seis siete ocho nueve diez once doce"
+            )
 
 
 class TestUtilities:
@@ -264,10 +297,17 @@ class TestUtilities:
 
     def test_decode_transaction_base58(self) -> None:
         b = b"\xde\xad\xbe\xef"
-        assert execution_mod.JupiterExecutor._decode_transaction(base58.b58encode(b).decode()) == b
+        assert (
+            execution_mod.JupiterExecutor._decode_transaction(
+                base58.b58encode(b).decode()
+            )
+            == b
+        )
 
     def test_decode_transaction_lista(self) -> None:
-        assert execution_mod.JupiterExecutor._decode_transaction([1, 2, 3]) == bytes([1, 2, 3])
+        assert execution_mod.JupiterExecutor._decode_transaction([1, 2, 3]) == bytes(
+            [1, 2, 3]
+        )
 
     def test_decode_transaction_invalida(self) -> None:
         with pytest.raises(SwapExecutionError, match="Formato"):
@@ -289,8 +329,11 @@ class TestUtilities:
     ) -> None:
         executor._request_quote = AsyncMock(side_effect=[OSError("a"), OSError("b")])
         quote = await executor._get_quote(
-            session=MagicMock(), input_mint="A", output_mint="B",
-            amount_lamports=1_000, simulate=True,
+            session=MagicMock(),
+            input_mint="A",
+            output_mint="B",
+            amount_lamports=1_000,
+            simulate=True,
         )
         assert quote["simulated"] is True
 
@@ -300,22 +343,32 @@ class TestUtilities:
         executor._request_quote = AsyncMock(side_effect=[OSError("a"), OSError("b")])
         with pytest.raises(OSError):
             await executor._get_quote(
-                session=MagicMock(), input_mint="A", output_mint="B", amount_lamports=1_000
+                session=MagicMock(),
+                input_mint="A",
+                output_mint="B",
+                amount_lamports=1_000,
             )
 
-    async def test_sol_usd_price_exitoso(self, executor: JupiterExecutor, monkeypatch) -> None:
+    async def test_sol_usd_price_exitoso(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
         payload = {"pairs": [{"priceUsd": "143.50"}]}
         _patch_session(monkeypatch, _FakeResponse(200, payload), lambda resp: resp)
         assert await executor._get_sol_usd_price() == pytest.approx(143.50)
 
-    async def test_sol_usd_price_fallback(self, executor: JupiterExecutor, monkeypatch) -> None:
+    async def test_sol_usd_price_fallback(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
         _patch_session(monkeypatch, _FakeResponse(500, {}), lambda resp: resp)
         assert await executor._get_sol_usd_price() == 180.0
 
-  async def test_get_token_decimals_parsed(self, executor: JupiterExecutor, monkeypatch) -> None:
+    async def test_get_token_decimals_parsed(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
         class _FakeResp:
             class _Inner:
                 decimals = 6
+
             value = _Inner()
 
         client = AsyncMock()
@@ -325,7 +378,9 @@ class TestUtilities:
         monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
         assert await executor._get_token_decimals(MINT_RAYDIUM) == 6
 
-    async def test_get_token_decimals_fallback(self, executor: JupiterExecutor, monkeypatch) -> None:
+    async def test_get_token_decimals_fallback(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
         class _FakeResp:
             value = None
 
@@ -392,7 +447,9 @@ class TestClosePosition:
             mint=mint, token_amount_ui=1.0, entry_price=0.001, sol_invested=0.05
         )
 
-    async def test_dry_run_solo_registra_y_elimina(self, executor: JupiterExecutor) -> None:
+    async def test_dry_run_solo_registra_y_elimina(
+        self, executor: JupiterExecutor
+    ) -> None:
         self._attach(executor)
         await executor.close_position(MINT_RAYDIUM, "TAKE_PROFIT", 100.0)
         assert MINT_RAYDIUM not in executor.positions
@@ -414,7 +471,9 @@ class TestClosePosition:
         await executor.close_position(MINT_RAYDIUM, "STOP_LOSS", -50.0)
         assert MINT_RAYDIUM in executor.positions
 
-    async def test_close_sin_posicion_no_hace_nada(self, executor: JupiterExecutor) -> None:
+    async def test_close_sin_posicion_no_hace_nada(
+        self, executor: JupiterExecutor
+    ) -> None:
         await executor.close_position(MINT_RAYDIUM, "TAKE_PROFIT", 10.0)
         assert MINT_RAYDIUM not in executor.positions
 
@@ -463,7 +522,9 @@ class TestMonitorPosition:
 
     async def test_error_de_precio_no_bloquea(self, executor: JupiterExecutor) -> None:
         self._attach(executor)
-        executor.get_token_price = AsyncMock(side_effect=SwapExecutionError("sin precio"))
+        executor.get_token_price = AsyncMock(
+            side_effect=SwapExecutionError("sin precio")
+        )
         reason, pnl = await executor.monitor_position(MINT_RAYDIUM)
         assert reason == ""
         assert pnl == 0.0
