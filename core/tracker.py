@@ -16,7 +16,7 @@ punto de entrada de la app la ponga a monitorear.
 from __future__ import annotations
 
 import asyncio
-import random
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -25,6 +25,10 @@ from loguru import logger
 
 # Intervalo del bucle de monitoreo de posiciones activas (segundos).
 CHECK_INTERVAL_SEC = 2.0
+
+# Tiempo máximo que una posición puede permanecer activa antes de forzar la
+# salida (TIME_EXPIRED), independientemente de su PnL. Configurable via .env.
+MAX_HOLD_TIME_SEC = int(os.getenv("MAX_HOLD_TIME_SEC", "180"))
 
 
 @dataclass
@@ -37,6 +41,9 @@ class TrackerPosition:
     amount: float  # SOL invertidos en la compra.
     created_at: float = field(default_factory=time.time)
     last_log_time: float = field(default_factory=time.time)
+    last_no_price_log: float = 0.0
+    sim_steps: int = 0          # Ciclos de precio simulado (DRY_RUN).
+    sim_direction: int = 1      # +1 drifta hacia TAKE_PROFIT, -1 hacia STOP_LOSS.
 
 
 class PositionTracker:
@@ -61,11 +68,14 @@ class PositionTracker:
         amount: float,
     ) -> None:
         """Registra una posición activa para que el monitor la vigile."""
+        # Dirección de la simulación determinista por mint (mitad a TP, mitad a SL).
+        sim_direction = 1 if (sum(ord(ch) for ch in mint) % 2 == 0) else -1
         self.positions[mint] = TrackerPosition(
             mint=mint,
             symbol=symbol,
             buy_price=buy_price,
             amount=amount,
+            sim_direction=sim_direction,
         )
 
     def remove_position(self, mint: str) -> bool:
@@ -104,7 +114,7 @@ class PositionTracker:
 
     # ------------------------------------------------------- Evaluación
     async def _evaluate(self, mint: str) -> None:
-        """Consulta precio y dispara TP/SL para una posición."""
+        """Consulta precio y dispara TP/SL / TIME_EXPIRED para una posición."""
         from core.websocket import process_sell_and_notify
 
         pos = self.positions.get(mint)
@@ -119,31 +129,21 @@ class PositionTracker:
             current_price = 0.0
             logger.warning("No se pudo obtener precio de {} ({}): {}", mint, pos.symbol, exc)
 
-        # --- DRY_RUN: venta simulada si no hay precio tras 3 minutos ---
-        if current_price <= 0 and self.config.trading.DRY_RUN:
-            elapsed = now - pos.created_at
-            if elapsed > 180:
-                reason = random.choice(["TAKE_PROFIT", "STOP_LOSS"])
-                if reason == "TAKE_PROFIT":
-                    pnl = 110.0
-                else:
-                    pnl = -35.0
-                logger.info(
-                    "[DRY_RUN] ⚡ Venta simulada de {} ({}) — sin precio tras {:.0f}s | PnL simulado: {:+.2f}%",
-                    mint, pos.symbol, elapsed, pnl,
-                )
-                ok = await process_sell_and_notify(
-                    pos.mint, pos.symbol, reason=reason, pnl=pnl
-                )
-                if ok:
-                    self.remove_position(mint)
-                return
-            else:
-                logger.debug(
-                    "Sin precio para {} ({}); esperando antes de simular ({:.0f}s / 180s).",
-                    mint, pos.symbol, elapsed,
-                )
-                return
+        # --- TIME_EXPIRED: cierre forzado sin importar el PnL actual ---
+        if now - pos.created_at > MAX_HOLD_TIME_SEC:
+            pnl_pct = (
+                (current_price - pos.buy_price) / pos.buy_price * 100.0
+            ) if pos.buy_price and current_price > 0 else 0.0
+            logger.info(
+                "⏳ TIME EXPIRED para {} ({}) tras {:.0f}s (PnL {:+.2f}%)",
+                mint, pos.symbol, MAX_HOLD_TIME_SEC, pnl_pct,
+            )
+            ok = await process_sell_and_notify(
+                pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=pnl_pct
+            )
+            if ok:
+                self.remove_position(mint)
+            return
 
         if current_price <= 0:
             return
@@ -184,20 +184,48 @@ class PositionTracker:
                 self.remove_position(mint)
 
     async def _get_current_price(self, mint: str) -> float:
-        """Precio actual vía el ejecutor (Jupiter → DexScreener → Pump.fun).
+        """Precio actual real vía el ejecutor (Jupiter → DexScreener → Pump.fun).
 
-        Devuelve 0.0 si ningún endpoint pudo proporcionar precio real, para que
-        el monitoreo detecte la ausencia de precio y (en DRY_RUN) genere la
-        venta simulada tras el tiempo de espera.
+        Si ningún endpoint entrega precio:
+        - En DRY_RUN: genera un precio simulado dinámico sobre el precio de
+          entrada (multiplicador progresivo por ciclo).
+        - En modo real: devuelve 0.0 (el bucle esperará al TIME_EXPIRED).
         """
+        pos = self.positions.get(mint)
         try:
-            return await self.executor.get_token_price(mint)
+            price = await self.executor.get_token_price(mint)
+            if price is not None and price > 0:
+                return price
         except Exception as exc:  # noqa: BLE001 - sin precio en ningún endpoint
-            logger.warning(
-                "Sin precio real para {} tras agotar fallbacks ({}).",
-                mint, exc,
-            )
+            # Throttle: como mucho 1 log de "sin precio" cada 30 segundos.
+            if pos is not None:
+                now = time.time()
+                if now - pos.last_no_price_log >= 30:
+                    logger.warning(
+                        "Sin precio real para {} ({}): {}",
+                        mint, pos.symbol, exc,
+                    )
+                    pos.last_no_price_log = now
+
+        if self.config.trading.DRY_RUN:
+            return self._simulated_price(mint)
+        return 0.0
+
+    def _simulated_price(self, mint: str) -> float:
+        """Precio simulado dinámico en DRY_RUN.
+
+        Aplica un multiplicador progresivo en cada ciclo sobre el precio de
+        entrada para emular volatilidad de memecoin. Según `sim_direction`,
+        el PnL alcanza TAKE_PROFIT (+100%) o STOP_LOSS (-30%) en pocos ciclos
+        de prueba (~9 ciclos al alza, ~5 a la baja con CHECK_INTERVAL_SEC=2s).
+        """
+        pos = self.positions.get(mint)
+        if pos is None or pos.buy_price <= 0:
             return 0.0
+        pos.sim_steps += 1
+        if pos.sim_direction > 0:
+            return pos.buy_price * (1.08 ** pos.sim_steps)
+        return pos.buy_price * (0.92 ** pos.sim_steps)
 
     async def check_position(self, token_mint: str) -> tuple[str, float]:
         """Evalúa una posición y ejecuta la salida si corresponde.
