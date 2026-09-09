@@ -25,8 +25,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - name: Instalar dependencias dev
-        run: pip install -r requirements-dev.txt
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
       - name: ruff (core, config y arranque)
         run: ruff check core/ config.py bot.py --select E4,E7,E9,F,I
       - name: mypy (core)
@@ -42,8 +44,10 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - name: Instalar dependencias dev
-        run: pip install -r requirements-dev.txt
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
       - name: pytest con fail-under=85% en core/
         run: pytest tests/
       - name: Subir cobertura como artefacto
@@ -63,9 +67,9 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-      - name: Instalar dependencias dev
-        run: pip install -r requirements-dev.txt
-      # Los paths a mutar salen de pyproject.toml ([tool.mutmut]).
-      # Con CI=true, mutmut falla si deja mutantes supervivientes.
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
       - name: mutmut sobre tracker + execution
         run: mutmut run --paths-to-mutate core/tracker.py
