@@ -72,6 +72,16 @@ class TradingSettings(BaseSettings):
         default=15.0, gt=0, description="Distancia de retroceso tolerada desde el máximo: -15%"
     )
     MAX_SOL_BALANCE: float = Field(default=1.0, gt=0, description="Máximo SOL a invertir por operación")
+    POSITION_UPDATE_INTERVAL_SECONDS: int = Field(
+        default=30,
+        gt=0,
+        description="Intervalo (s) entre notificaciones periódicas de progreso de posiciones",
+    )
+    PRICE_POLL_FALLBACK_SECONDS: int = Field(
+        default=5,
+        gt=0,
+        description="Intervalo (s) sin cotización fresca antes del fallback HTTP de precio",
+    )
     DRY_RUN: bool = Field(default=True, description="Si True, no ejecuta transacciones reales (simulación)")
     FORCE_TEST_BUY: bool = Field(
         default=False,

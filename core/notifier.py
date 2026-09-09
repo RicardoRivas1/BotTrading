@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import html
-from typing import Optional
+import time
+from typing import Any, Optional
 
 import aiohttp
 from loguru import logger
@@ -183,6 +184,51 @@ class TelegramNotifier:
             "<b>🛡️ TRAILING STOP EJECUTADO</b>\n\n"
             f"<b>Token:</b> <code>{html.escape(str(mint))}</code>\n"
             f"<b>Ganancia asegurada:</b> {html.escape(pnl_txt)}"
+        )
+        return await self.send(html_text)
+
+    async def notify_position_progress(
+        self,
+        position: Any,
+        *,
+        max_hold_seconds: float = 0.0,
+    ) -> bool:
+        """Notifica el estado/progreso de una posición abierta en espera.
+
+        Muestra el ticker y mint, el PnL% actual con emoji (📈 positivo,
+        📉 negativo), el precio de entrada vs. el actual, el tiempo transcurrido
+        frente al máximo de retención (⏱️) y el pico de PnL alcanzado.
+        `position` puede ser un `TrackerPosition` o cualquier objeto con los
+        atributos: symbol, mint, buy_price, current_price, latest_pnl_pct,
+        highest_pnl_pct, created_at y opcionalmente max_hold_seconds.
+        """
+        safe_symbol = html.escape(str(getattr(position, "symbol", "N/A")).upper() or "N/A")
+        safe_mint = html.escape(str(getattr(position, "mint", "") or ""))
+        pnl_pct = float(getattr(position, "latest_pnl_pct", 0.0) or 0.0)
+        highest_pnl = float(getattr(position, "highest_pnl_pct", 0.0) or 0.0)
+        entry_price = float(getattr(position, "buy_price", 0.0) or 0.0)
+        current_price = float(getattr(position, "current_price", 0.0) or 0.0)
+
+        created_at = getattr(position, "created_at", None)
+        elapsed = max(0.0, time.time() - float(created_at)) if created_at else 0.0
+        max_hold = max_hold_seconds or float(getattr(position, "max_hold_seconds", 0.0) or 0.0)
+
+        emoji = "📈" if pnl_pct >= 0 else "📉"
+        entry_txt = html.escape(f"{entry_price:.10g}")
+        current_txt = html.escape(f"{current_price:.10g}")
+        elapsed_txt = html.escape(f"{int(elapsed)}s")
+        max_hold_txt = html.escape(f"{int(max_hold)}s") if max_hold > 0 else "∞"
+        highest_txt = html.escape(f"{highest_pnl:+.2f}%")
+
+        html_text = (
+            "💰 <b>PROGRESO DE POSICIÓN</b>\n\n"
+            f"💎 ${safe_symbol}\n"
+            f"<code>{safe_mint}</code>\n\n"
+            f"{emoji} <b>PnL:</b> {html.escape(f'{pnl_pct:+.2f}%')}\n"
+            f"<b>Entrada:</b> {entry_txt} SOL\n"
+            f"<b>Actual:</b> {current_txt} SOL\n"
+            f"<b>Máx:</b> {highest_txt}\n"
+            f"⏱️ {elapsed_txt} / {max_hold_txt}"
         )
         return await self.send(html_text)
 

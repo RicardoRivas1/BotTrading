@@ -16,6 +16,7 @@ punto de entrada de la app la ponga a monitorear.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import time
 from dataclasses import dataclass, field
@@ -42,6 +43,13 @@ class TrackerPosition:
     created_at: float = field(default_factory=time.time)
     last_log_time: float = field(default_factory=time.time)
     last_no_price_log: float = 0.0
+    current_price: float = 0.0
+    current_price_updated_at: float = 0.0
+    latest_pnl_pct: float = 0.0
+    highest_pnl_pct: float = 0.0
+    max_hold_seconds: float = field(default_factory=lambda: float(MAX_HOLD_TIME_SEC))
+    last_progress_notify_at: float = 0.0
+    last_notified_pnl_pct: float = 0.0
 
 
 class PositionTracker:
@@ -126,10 +134,14 @@ class PositionTracker:
         now = time.time()
 
         try:
-            current_price = await self._get_current_price(mint)
+            current_price = await self._refresh_position_price(pos)
         except Exception as exc:  # noqa: BLE001
             current_price = 0.0
             logger.warning("No se pudo obtener precio de {} ({}): {}", mint, pos.symbol, exc)
+
+        if current_price is not None and current_price > 0:
+            pos.current_price = current_price
+            pos.current_price_updated_at = now
 
         # --- TIME_EXPIRED: cierre forzado sin importar el PnL actual ---
         if now - pos.created_at > MAX_HOLD_TIME_SEC:
@@ -167,6 +179,9 @@ class PositionTracker:
             return
 
         pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100.0
+        pos.latest_pnl_pct = pnl_pct
+        if pnl_pct > pos.highest_pnl_pct:
+            pos.highest_pnl_pct = pnl_pct
         take_profit_pct = float(self.config.trading.TAKE_PROFIT_PCT)
         stop_loss_pct = float(self.config.trading.STOP_LOSS_PCT)
 
@@ -193,6 +208,12 @@ class PositionTracker:
             if ok:
                 self.remove_position(mint)
 
+        # Progreso: si la posición sigue abierta (no se vendió por TP/SL), se
+        # reporta su estado de forma periódica o ante saltos de PnL ≥ ±2%.
+        if mint not in self.positions:
+            return
+        await self._maybe_notify_progress(pos, pnl_pct)
+
     async def _get_current_price(self, mint: str) -> float:
         """Precio actual real vía el ejecutor (Jupiter → DexScreener → Pump.fun).
 
@@ -217,6 +238,51 @@ class PositionTracker:
                     pos.last_no_price_log = now
 
         return 0.0
+
+    async def _refresh_position_price(self, pos: TrackerPosition) -> float:
+        """Precio real, con refresh vía HTTP cuando la cotización está obsoleta.
+
+        Si existe una cotización fresca reciente (menos de
+        PRICE_POLL_FALLBACK_SECONDS) se reutiliza sin golpear la red. En caso
+        contrario (p. ej. sin eventos de precio que la actualicen) se consulta
+        el fallback HTTP real vía el ejecutor (Jupiter → DexScreener → Pump.fun).
+        """
+        now = time.time()
+        fallback_gap = float(
+            getattr(self.config.trading, "PRICE_POLL_FALLBACK_SECONDS", 5.0)
+        )
+        if pos.current_price_updated_at:
+            fresh = pos.current_price > 0 and (now - pos.current_price_updated_at) < fallback_gap
+            if fresh:
+                return pos.current_price
+        return await self._get_current_price(pos.mint)
+
+    async def _maybe_notify_progress(self, pos: TrackerPosition, pnl_pct: float) -> None:
+        """Notifica el progreso de la posición de forma periódica o por salto de PnL.
+
+        Envía `notify_position_progress` cuando ha transcurrido el intervalo
+        POSITION_UPDATE_INTERVAL_SECONDS (default 30s) o cuando el PnL varía
+        ≥ ±2 puntos porcentuales respecto de la última notificación.
+        """
+        now = time.time()
+        interval = float(
+            getattr(self.config.trading, "POSITION_UPDATE_INTERVAL_SECONDS", 30.0)
+        )
+        if interval <= 0:
+            return
+        period_expired = (now - pos.last_progress_notify_at) >= interval
+        big_jump = abs(pnl_pct - pos.last_notified_pnl_pct) >= 2.0
+        if not (period_expired or big_jump):
+            return
+        result = self.notifier.notify_position_progress(pos)
+        if inspect.isawaitable(result):
+            await result
+        pos.last_progress_notify_at = now
+        pos.last_notified_pnl_pct = pnl_pct
+        logger.info(
+            "📣 Progreso de {}: PnL {:+.2f}% (máx {:+.2f}%)",
+            pos.symbol, pnl_pct, pos.highest_pnl_pct,
+        )
 
     async def check_position(self, token_mint: str) -> tuple[str, float]:
         """Evalúa una posición y ejecuta la salida si corresponde.
