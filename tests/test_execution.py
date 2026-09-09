@@ -532,6 +532,7 @@ def _patch_pumpportal(executor: JupiterExecutor, monkeypatch, captured: dict) ->
     def _spy_post(url: str = "", json: Optional[dict] = None, headers=None) -> _FakeResp:
         captured["url"] = url
         captured["payload"] = json
+        captured["headers"] = headers
         return _FakeResp()
 
     session = MagicMock()
@@ -614,16 +615,19 @@ class TestBuyPumpfun:
 
         assert sig == Signature.default()
         assert captured["url"] == execution_mod.PUMPPORTAL_TRADE_URL
+        assert captured["headers"]["Content-Type"] == "application/json"
         payload = captured["payload"]
         assert payload["publicKey"] == executor.wallet_pubkey
         assert payload["action"] == "buy"
         assert payload["mint"] == MINT_PUMP
+        assert payload["denominatedInSol"] == "true"
+        assert isinstance(payload["denominatedInSol"], str)
         assert payload["amount"] == 0.05
         assert isinstance(payload["amount"], float)
-        assert payload["denominatedInSol"] == "true"
         # Slippage de compra dentro de [15, 20]% (SLIPPAGE_BPS=500 → clampa a 15).
         assert 15.0 <= payload["slippage"] <= 20.0
         assert payload["priorityFee"] >= 0.0001
+        assert isinstance(payload["priorityFee"], float)
         assert payload["pool"] == "pump"
         assert len(captured["sent"]) == 1
         assert captured["sent"][0] == b"\x01" * 64

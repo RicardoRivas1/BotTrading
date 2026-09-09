@@ -450,19 +450,20 @@ class JupiterExecutor:
             "Comprando {} SOL de {} por PumpPortal (bonding curve, slippage {}%)",
             amount_sol, mint, slippage_pct,
         )
+        headers = {"Content-Type": "application/json", **_USER_AGENT_HEADERS}
         payload = {
-            "publicKey": str(self.wallet_pubkey),
+            "publicKey": str(self.wallet_pubkey).strip(),
             "action": "buy",
-            "mint": str(mint),
-            "amount": amount_sol,
+            "mint": str(mint).strip(),
             "denominatedInSol": "true",
+            "amount": amount_sol,
             "slippage": slippage_pct,
             "priorityFee": 0.0001,
             "pool": "pump",
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                PUMPPORTAL_TRADE_URL, json=payload, headers=_USER_AGENT_HEADERS
+                PUMPPORTAL_TRADE_URL, json=payload, headers=headers
             ) as resp:
                 if resp.status != 200:
                     text = await resp.text()
