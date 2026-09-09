@@ -105,18 +105,14 @@ def _cargar_desde_mnemonic(mnemonic: str) -> Keypair:
         raise SwapExecutionError(f"Mnemonic inválido: {exc}") from exc
 
 
-def _cargar_desde_base58(key_str: str) -> Keypair:
-    """Carga un Keypair desde una private key Base58 estándar de 64 bytes."""
-    try:
-        raw = base58.b58decode(key_str)
-        if len(raw) != 64:
-            raise ValueError(f"La clave Base58 debe ser de 64 bytes, se obtuvieron {len(raw)}.")
-        return Keypair.from_bytes(raw)
-    except Exception as exc:
-        logger.critical("Private key Base58 inválida: {}", exc)
-        raise SwapExecutionError(
-            "PRIVATE_KEY Base58 inválida. Verifica que sea una clave de 64 bytes."
-        ) from exc
+@staticmethod
+    def _decode_transaction(raw_tx: Any) -> bytes:
+        """Decodifica la transacción devuelta por Jupiter (str o lista)."""
+        if isinstance(raw_tx, str):
+            return bytes.fromhex(raw_tx[2:]) if raw_tx.startswith("0x") else base58.b58decode(raw_tx)
+        elif isinstance(raw_tx, list):
+            return bytes(raw_tx)
+        raise SwapExecutionError("Formato de transacción no soportado")
 
 
 @dataclass
