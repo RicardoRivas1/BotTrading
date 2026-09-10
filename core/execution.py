@@ -456,8 +456,8 @@ class JupiterExecutor:
             "action": "buy",
             "mint": str(mint).strip(),
             "denominatedInSol": "true",
-            "amount": amount_sol,
-            "slippage": slippage_pct,
+            "amount": float(amount_sol),
+            "slippage": float(slippage_pct),
             "priorityFee": 0.0001,
             "pool": "pump",
         }
