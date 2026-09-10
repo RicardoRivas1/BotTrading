@@ -94,7 +94,7 @@ def _cargar_desde_mnemonic(mnemonic: str) -> Keypair:
     try:
         seed = Bip39SeedGenerator(mnemonic).Generate()
         # Derivación oficial Phantom / Solana: m/44'/501'/0'/0'
-        return Keypair.from_seed_and_derivation_path(seed[:32], "m/44'/501'/0'/0'")
+        return Keypair.from_seed_and_derivation_path(seed, "m/44'/501'/0'/0'")
     except Exception as exc:
         logger.critical("Frase mnemonic inválida: {}", exc)
         raise SwapExecutionError(f"Mnemonic inválido: {exc}") from exc
