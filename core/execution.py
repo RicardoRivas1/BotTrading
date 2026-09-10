@@ -444,20 +444,23 @@ class JupiterExecutor:
         de 0.0001 SOL. La confirmación on-chain es obligatoria
         (`require_confirmation=True`).
         """
+        wallet_pubkey_str = str(self.wallet_pubkey).strip()
         amount_sol = float(self.buy_amount_sol if amount_sol is None else amount_sol)
-        slippage_pct = min(BUY_SLIPPAGE_MAX_PCT, max(BUY_SLIPPAGE_MIN_PCT, self.slippage_bps / 100.0))
+        slippage_pct = float(
+            min(BUY_SLIPPAGE_MAX_PCT, max(BUY_SLIPPAGE_MIN_PCT, self.slippage_bps / 100.0))
+        )
         logger.info(
             "Comprando {} SOL de {} por PumpPortal (bonding curve, slippage {}%)",
             amount_sol, mint, slippage_pct,
         )
         headers = {"Content-Type": "application/json", **_USER_AGENT_HEADERS}
         payload = {
-            "publicKey": str(self.wallet_pubkey).strip(),
+            "publicKey": wallet_pubkey_str,
             "action": "buy",
             "mint": str(mint).strip(),
             "denominatedInSol": "true",
-            "amount": float(amount_sol),
-            "slippage": float(slippage_pct),
+            "amount": amount_sol,
+            "slippage": slippage_pct,
             "priorityFee": 0.0001,
             "pool": "pump",
         }
@@ -567,24 +570,27 @@ class JupiterExecutor:
         """Venta directa en la bonding curve de Pump.fun vía PumpPortal.
 
         Realiza el POST a `https://pumpportal.fun/api/trade-local` con el
-        payload de venta, decodifica la transacción devuelta a
-        `VersionedTransaction`, la firma localmente con la clave privada y la
-        envía/confirma por el RPC configurado. Devuelve el txid (Signature).
+        payload de venta (tipos estrictos: string "true"/"false", float amount,
+        pool "pump"), decodifica la transacción, la firma localmente y la
+        envía/confirma por el RPC. Devuelve el txid (Signature).
         """
-        slippage_pct = (self.slippage_bps if slippage_bps is None else slippage_bps) / 100.0
+        wallet_pubkey_str = str(self.wallet_pubkey).strip()
+        slippage_pct = float((self.slippage_bps if slippage_bps is None else slippage_bps) / 100.0)
         logger.debug("Vendiendo balance de {} (100%) para {}", amount_ui, mint)
+        headers = {"Content-Type": "application/json", **_USER_AGENT_HEADERS}
         payload = {
-            "publicKey": self.wallet_pubkey,
+            "publicKey": wallet_pubkey_str,
             "action": "sell",
-            "mint": mint,
+            "mint": str(mint).strip(),
             "amount": "100%",
             "denominatedInSol": "false",
             "slippage": slippage_pct,
             "priorityFee": 0.00005,
+            "pool": "pump",
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                PUMPPORTAL_TRADE_URL, json=payload, headers=_USER_AGENT_HEADERS
+                PUMPPORTAL_TRADE_URL, json=payload, headers=headers
             ) as resp:
                 if resp.status != 200:
                     text = await resp.text()
