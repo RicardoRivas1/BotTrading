@@ -367,33 +367,22 @@ class JupiterExecutor:
                     sig = await self._build_and_send_swap(
                         session, quote, require_confirmation=True
                     )
-            except SwapExecutionError as exc:
-                if _is_rate_limit(exc):
-                    logger.warning(
-                        "Jupiter saturado comprando {} ({}). Pausa de 1s.",
-                        token_mint, exc,
-                    )
-                    await asyncio.sleep(1.0)
-                    if self._is_pump_fun_mint(token_mint):
-                        logger.info("Mint {} es Pump.fun: usando fallback PumpPortal.", token_mint)
-                        self.pump_bonding_tokens.add(token_mint)
-                        via_pumpfun = True
-                        sig = await self._buy_via_pumpportal(token_mint)
-                    else:
-                        raise
-                elif _is_route_not_found(exc):
+            except Exception as exc:
+                err = str(exc)
+                if "404" in err or "Route not found" in err or "Jupiter" in err:
                     if self._is_pump_fun_mint(token_mint):
                         logger.warning(
-                            "Jupiter sin ruta para comprar {} ({}): token en la "
-                            "bonding curve de Pump.fun. Comprando directo por PumpPortal.",
-                            token_mint, exc,
+                            "Jupiter sin ruta para {} (404/Route not found). "
+                            "Comprando directamente por PumpPortal...",
+                            token_mint,
                         )
                         self.pump_bonding_tokens.add(token_mint)
                         via_pumpfun = True
                         sig = await self._buy_via_pumpportal(token_mint)
                     else:
-                        logger.error("Jupiter sin ruta para {} (no es Pump.fun): no hay fallback disponible.", token_mint)
-                        raise
+                        raise SwapExecutionError(
+                            f"Token {token_mint} sin liquidez (Jupiter 404). No es Pump.fun."
+                        ) from exc
                 else:
                     raise
 
