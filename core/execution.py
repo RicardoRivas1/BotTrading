@@ -484,21 +484,20 @@ class JupiterExecutor:
         except Exception as exc:
             logger.warning("No se pudo verificar balance SOL pre-vuelo: {}", exc)
 
-        headers = {"Content-Type": "application/json", **_USER_AGENT_HEADERS}
         payload = {
             "publicKey": wallet_pubkey_str,
             "action": "buy",
             "mint": str(mint).strip(),
             "denominatedInSol": "true",
-            "amount": amount_sol,
+            "amount": float(amount_sol),
             "slippage": 15,
-            "priorityFee": 0.0001,
-            "pool": "pump",
+            "priorityFee": 0.0005,
+            "pool": "auto",
         }
         logger.debug("PumpPortal payload: {}", payload)
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                PUMPPORTAL_TRADE_URL, json=payload, headers=headers
+                PUMPPORTAL_TRADE_URL, data=payload, headers=_USER_AGENT_HEADERS
             ) as resp:
                 if resp.status != 200:
                     error_body = await resp.text()
@@ -607,7 +606,6 @@ class JupiterExecutor:
         wallet_pubkey_str = str(self.wallet_pubkey).strip()
         slippage_pct = float((self.slippage_bps if slippage_bps is None else slippage_bps) / 100.0)
         logger.debug("Vendiendo balance de {} (100%) para {}", amount_ui, mint)
-        headers = {"Content-Type": "application/json", **_USER_AGENT_HEADERS}
         payload = {
             "publicKey": wallet_pubkey_str,
             "action": "sell",
@@ -616,11 +614,11 @@ class JupiterExecutor:
             "denominatedInSol": "false",
             "slippage": slippage_pct,
             "priorityFee": 0.00005,
-            "pool": "pump",
+            "pool": "auto",
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                PUMPPORTAL_TRADE_URL, json=payload, headers=headers
+                PUMPPORTAL_TRADE_URL, data=payload, headers=_USER_AGENT_HEADERS
             ) as resp:
                 if resp.status != 200:
                     error_body = await resp.text()
