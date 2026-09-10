@@ -507,9 +507,7 @@ class JupiterExecutor:
                         f"PumpPortal buy falló ({resp.status}): {error_body}. "
                         f"Mint: {mint}, Amount: {amount_sol} SOL, Wallet: {wallet_pubkey_str}"
                     )
-                raw_tx = (await resp.read()).decode()
-
-        tx_bytes = self._decode_trade_local(raw_tx)
+                tx_bytes = self._decode_trade_local(await resp.read())
         tx = VersionedTransaction.from_bytes(tx_bytes)
         signature = self.keypair.sign_message(tx.message.to_bytes())
         signed_tx = VersionedTransaction.populate(tx.message, [signature])
@@ -628,9 +626,8 @@ class JupiterExecutor:
                     error_body = await resp.text()
                     logger.error("❌ PumpPortal API Error ({}): {}", resp.status, error_body)
                     raise SwapExecutionError(f"PumpPortal sell falló ({resp.status}): {error_body}")
-                raw_tx = (await resp.read()).decode()
+                tx_bytes = self._decode_trade_local(await resp.read())
 
-        tx_bytes = self._decode_trade_local(raw_tx)
         tx = VersionedTransaction.from_bytes(tx_bytes)
         signature = self.keypair.sign_message(tx.message.to_bytes())
         signed_tx = VersionedTransaction.populate(tx.message, [signature])
@@ -642,7 +639,9 @@ class JupiterExecutor:
 
     @staticmethod
     def _decode_trade_local(raw_tx: Any) -> bytes:
-        """Decodifica la transacción devuelta por PumpPortal (base64, hex o base58)."""
+        """Decodifica la transacción devuelta por PumpPortal (bytes, base64, hex o base58)."""
+        if isinstance(raw_tx, bytes):
+            return raw_tx
         if isinstance(raw_tx, list):
             return bytes(raw_tx)
         raw = str(raw_tx)
