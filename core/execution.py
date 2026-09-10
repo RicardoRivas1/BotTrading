@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 import aiohttp
 import base58
-from bip_utils import Bip39SeedGenerator, Bip44, Bip44Changes, Bip44Coins
+from bip_utils import Bip39SeedGenerator
 from loguru import logger
 from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
@@ -90,21 +90,11 @@ def cargar_keypair(key_str: str) -> Keypair:
 
 
 def _cargar_desde_mnemonic(mnemonic: str) -> Keypair:
-    """Deriva el Keypair desde una frase de 12/24 palabras (BIP44 / SLIP-0010)."""
+    """Deriva el Keypair desde una frase de 12/24 palabras (BIP39 + BIP44 Solana Standard)."""
     try:
         seed = Bip39SeedGenerator(mnemonic).Generate()
-        bip44_ctx = Bip44.FromSeed(seed, Bip44Coins.SOLANA)
-        private_bytes = (
-            bip44_ctx.Purpose()
-            .Coin()
-            .Account(0)
-            .Change(Bip44Changes.CHAIN_EXT)
-            .AddressIndex(0)
-            .PrivateKey()
-            .Raw()
-            .ToBytes()
-        )
-        return Keypair.from_seed(private_bytes)
+        # Derivación oficial Phantom / Solana: m/44'/501'/0'/0'
+        return Keypair.from_seed_and_derivation_path(seed[:32], "m/44'/501'/0'/0'")
     except Exception as exc:
         logger.critical("Frase mnemonic inválida: {}", exc)
         raise SwapExecutionError(f"Mnemonic inválido: {exc}") from exc
