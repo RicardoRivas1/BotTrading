@@ -440,18 +440,14 @@ class JupiterExecutor:
         """Compra directa en la bonding curve de Pump.fun vía PumpPortal.
 
         Payload en SOL (`denominatedInSol="true"`), con `pool: "pump"` para la
-        bonding curve, `slippage` de compra dentro de [15, 20]% y `priorityFee`
-        de 0.0001 SOL. La confirmación on-chain es obligatoria
-        (`require_confirmation=True`).
+        bonding curve, `slippage` 15% y `priorityFee` 0.0001 SOL. La
+        confirmación on-chain es obligatoria (`require_confirmation=True`).
         """
-        wallet_pubkey_str = str(self.wallet_pubkey).strip()
+        wallet_pubkey_str = str(self.keypair.pubkey()).strip()
         amount_sol = float(self.buy_amount_sol if amount_sol is None else amount_sol)
-        slippage_pct = float(
-            min(BUY_SLIPPAGE_MAX_PCT, max(BUY_SLIPPAGE_MIN_PCT, self.slippage_bps / 100.0))
-        )
         logger.info(
-            "Comprando {} SOL de {} por PumpPortal (bonding curve, slippage {}%)",
-            amount_sol, mint, slippage_pct,
+            "Comprando {} SOL de {} por PumpPortal (bonding curve, slippage 15%)",
+            amount_sol, mint,
         )
         headers = {"Content-Type": "application/json", **_USER_AGENT_HEADERS}
         payload = {
@@ -460,7 +456,7 @@ class JupiterExecutor:
             "mint": str(mint).strip(),
             "denominatedInSol": "true",
             "amount": amount_sol,
-            "slippage": slippage_pct,
+            "slippage": 15,
             "priorityFee": 0.0001,
             "pool": "pump",
         }
@@ -470,7 +466,8 @@ class JupiterExecutor:
             ) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    raise SwapExecutionError(f"PumpPortal buy falló ({resp.status}): {text[:200]}")
+                    logger.error("PumpPortal buy error {}: {}", resp.status, text)
+                    raise SwapExecutionError(f"PumpPortal buy falló ({resp.status}): {text[:500]}")
                 data = await resp.json()
 
         raw_tx = data.get("transaction")
