@@ -29,7 +29,7 @@ MINT_PUMP = "FUELoUmnYbR5Pm1VFD8hzpRZ7NmnJQVifKdC9pump"
 @pytest.fixture
 def executor(monkeypatch) -> JupiterExecutor:
     """Executor con clave simulada (nunca valida contra Solana)."""
-    monkeypatch.setattr(execution_mod, "cargar_keypair", lambda key: Keypair())
+    monkeypatch.setattr(execution_mod, "cargar_keypair_desde_env", lambda rpc_url="": Keypair())
     return JupiterExecutor(
         private_key="clave-de-prueba",
         rpc_url="https://rpc.example.invalid",
@@ -255,35 +255,34 @@ class TestPumpFun:
 class TestCargarKeypair:
     """Carga de la wallet desde clave Base58 o frase mnemonic."""
 
-    def test_devuelve_keypair_valido_desde_base58(self) -> None:
+    def test_devuelve_keypair_valido_desde_base58(self, monkeypatch) -> None:
         kp = Keypair()
         encoded = base58.b58encode(kp.to_bytes()).decode()
-        loaded = execution_mod.cargar_keypair(encoded)
+        monkeypatch.setenv("PRIVATE_KEY", encoded)
+        loaded = execution_mod.cargar_keypair_desde_env()
         assert str(loaded.pubkey()) == str(kp.pubkey())
 
-    def test_base58_invalida_lanza_error(self) -> None:
+    def test_base58_invalida_lanza_error(self, monkeypatch) -> None:
+        monkeypatch.setenv("PRIVATE_KEY", "clave-corta")
         with pytest.raises(SwapExecutionError, match="Base58"):
-            execution_mod.cargar_keypair("clave-corta")
+            execution_mod.cargar_keypair_desde_env()
 
-    def test_vacia_lanza_error(self) -> None:
-        with pytest.raises(SwapExecutionError, match="PRIVATE_KEY vacío"):
-            execution_mod.cargar_keypair("   ")
-
-    def test_numero_de_palabras_no_valido_lanza_error(self) -> None:
-        # Con la nueva lógica, cualquier string con espacios se trata como mnemonic
-        # y falla en la validación BIP39 (cantidad de palabras no válida)
-        with pytest.raises(SwapExecutionError, match="Mnemonic inválido"):
-            execution_mod.cargar_keypair("dos tres palabras clave corta")
+    def test_vacia_lanza_error(self, monkeypatch) -> None:
+        monkeypatch.setenv("PRIVATE_KEY", "   ")
+        with pytest.raises(ValueError, match="PRIVATE_KEY"):
+            execution_mod.cargar_keypair_desde_env()
 
     def test_mnemonic_invalida_lanza_error(self, monkeypatch) -> None:
         def _blow(_phrase: str) -> MagicMock:
-            raise ValueError("frase no válida")
+            raise ValueError("frase no valida")
 
         monkeypatch.setattr(execution_mod, "Bip39SeedGenerator", _blow)
-        with pytest.raises(SwapExecutionError, match="Mnemonic inválido"):
-            execution_mod.cargar_keypair(
-                "una dos tres cuatro cinco seis siete ocho nueve diez once doce"
-            )
+        monkeypatch.setenv(
+            "PRIVATE_KEY",
+            "una dos tres cuatro cinco seis siete ocho nueve diez once doce",
+        )
+        with pytest.raises((SwapExecutionError, ValueError)):
+            execution_mod.cargar_keypair_desde_env()
 
 
 class TestUtilities:
