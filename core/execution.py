@@ -443,6 +443,19 @@ class JupiterExecutor:
             "Comprando {} SOL de {} por PumpPortal (bonding curve, slippage 15%)",
             amount_sol, mint,
         )
+        # Pre-flight: verificar balance SOL de la wallet
+        try:
+            async with AsyncClient(self.rpc_url) as client:
+                balance_resp = await client.get_balance(Pubkey.from_string(wallet_pubkey_str))
+                wallet_sol = balance_resp.value / 1_000_000_000 if balance_resp.value else 0.0
+                logger.debug("Wallet SOL balance: {:.6f} SOL (necesario: ~{:.6f})", wallet_sol, amount_sol + 0.001)
+                if wallet_sol < amount_sol + 0.001:
+                    raise SwapExecutionError(
+                        f"Balance SOL insuficiente: {wallet_sol:.6f} SOL (requiere ~{amount_sol + 0.001:.6f} SOL)"
+                    )
+        except Exception as exc:
+            logger.warning("No se pudo verificar balance SOL pre-vuelo: {}", exc)
+
         headers = {"Content-Type": "application/json", **_USER_AGENT_HEADERS}
         payload = {
             "publicKey": wallet_pubkey_str,
@@ -454,14 +467,18 @@ class JupiterExecutor:
             "priorityFee": 0.0001,
             "pool": "pump",
         }
+        logger.debug("PumpPortal payload: {}", payload)
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 PUMPPORTAL_TRADE_URL, json=payload, headers=headers
             ) as resp:
                 if resp.status != 200:
                     error_body = await resp.text()
-                    logger.error("❌ PumpPortal API Error ({}): {}", resp.status, error_body)
-                    raise SwapExecutionError(f"PumpPortal buy falló ({resp.status}): {error_body}")
+                    logger.error("❌ PumpPortal API Error ({}): {} | Payload: {}", resp.status, error_body, payload)
+                    raise SwapExecutionError(
+                        f"PumpPortal buy falló ({resp.status}): {error_body}. "
+                        f"Mint: {mint}, Amount: {amount_sol} SOL, Wallet: {wallet_pubkey_str}"
+                    )
                 raw_tx = (await resp.read()).decode()
 
         tx_bytes = self._decode_trade_local(raw_tx)
