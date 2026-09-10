@@ -289,8 +289,8 @@ class JupiterExecutor:
         tx_bytes = self._decode_transaction(raw_tx)
 
         tx = VersionedTransaction.from_bytes(bytes(tx_bytes))
-        signature = self.keypair.sign_message(tx.message.to_bytes())
-        signed_tx = VersionedTransaction.populate(tx.message, [signature])
+        signature = self.keypair.sign_message(bytes(tx.message))
+        signed_tx = VersionedTransaction(tx.message, [signature])
 
         return await self._submit_signed_transaction(
             signed_tx, require_confirmation=require_confirmation
@@ -316,7 +316,7 @@ class JupiterExecutor:
         """
         async with AsyncClient(self.rpc_url) as client:
             res = await client.send_raw_transaction(
-                bytes(signed_tx.to_bytes()),
+                bytes(signed_tx),
                 opts={"skipPreflight": False},
             )
             if not res.value:
@@ -509,8 +509,8 @@ class JupiterExecutor:
                     )
                 tx_bytes = self._decode_trade_local(await resp.read())
         tx = VersionedTransaction.from_bytes(tx_bytes)
-        signature = self.keypair.sign_message(tx.message.to_bytes())
-        signed_tx = VersionedTransaction.populate(tx.message, [signature])
+        signature = self.keypair.sign_message(bytes(tx.message))
+        signed_tx = VersionedTransaction(tx.message, [signature])
 
         logger.info("Compra directa Pump.fun de {} enviada a la red.", mint)
         return await self._submit_signed_transaction(
@@ -629,8 +629,8 @@ class JupiterExecutor:
                 tx_bytes = self._decode_trade_local(await resp.read())
 
         tx = VersionedTransaction.from_bytes(tx_bytes)
-        signature = self.keypair.sign_message(tx.message.to_bytes())
-        signed_tx = VersionedTransaction.populate(tx.message, [signature])
+        signature = self.keypair.sign_message(bytes(tx.message))
+        signed_tx = VersionedTransaction(tx.message, [signature])
 
         logger.info("Venta directa Pump.fun de {} enviada a la red.", mint)
         return await self._submit_signed_transaction(
