@@ -50,8 +50,6 @@ _USER_AGENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
-WORD_COUNT_THRESHOLD = 11
-
 
 class SwapExecutionError(Exception):
     """Se lanza cuando un swap no puede completarse."""
@@ -75,24 +73,20 @@ def _is_rate_limit(exc: Exception) -> bool:
 
 
 def cargar_keypair(key_str: str) -> Keypair:
-    """Carga una wallet de Solana desde una clave Base58 o una frase mnemonic."""
+    """Carga una wallet de Solana desde una clave Base58 o una frase mnemonic (12/24 palabras)."""
     key_str = key_str.strip()
     if not key_str:
         logger.critical("PRIVATE_KEY vacío en configuración.")
         raise SwapExecutionError("PRIVATE_KEY vacío en configuración.")
 
-    words = key_str.split()
-    if len(words) > WORD_COUNT_THRESHOLD:
-        return _cargar_desde_mnemonic(key_str)
-    if len(words) == 1:
-        return _cargar_desde_base58(key_str)
+    # Detección simple: si hay espacios → mnemonic, si no → Base58
+    if " " in key_str:
+        keypair = _cargar_desde_mnemonic(key_str)
+    else:
+        keypair = _cargar_desde_base58(key_str)
 
-    logger.critical(
-        "Formato de PRIVATE_KEY no reconocido: "
-        "se esperaba Base58 (1 palabra) o mnemonic (12/24 palabras), "
-        "se recibieron {} palabras.", len(words)
-    )
-    raise SwapExecutionError(f"FORMATO DE CLAVE INVALIDO: {len(words)} palabras.")
+    logger.info("🔑 Wallet pública cargada con éxito: {}", keypair.pubkey())
+    return keypair
 
 
 def _cargar_desde_mnemonic(mnemonic: str) -> Keypair:
@@ -465,14 +459,10 @@ class JupiterExecutor:
                 PUMPPORTAL_TRADE_URL, json=payload, headers=headers
             ) as resp:
                 if resp.status != 200:
-                    text = await resp.text()
-                    logger.error("PumpPortal buy error {}: {}", resp.status, text)
-                    raise SwapExecutionError(f"PumpPortal buy falló ({resp.status}): {text[:500]}")
-                data = await resp.json()
-
-        raw_tx = data.get("transaction")
-        if not raw_tx:
-            raise SwapExecutionError("PumpPortal buy no devolvió una transacción en 'transaction'")
+                    error_body = await resp.text()
+                    logger.error("❌ PumpPortal API Error ({}): {}", resp.status, error_body)
+                    raise SwapExecutionError(f"PumpPortal buy falló ({resp.status}): {error_body}")
+                raw_tx = (await resp.read()).decode()
 
         tx_bytes = self._decode_trade_local(raw_tx)
         tx = VersionedTransaction.from_bytes(tx_bytes)
@@ -590,13 +580,10 @@ class JupiterExecutor:
                 PUMPPORTAL_TRADE_URL, json=payload, headers=headers
             ) as resp:
                 if resp.status != 200:
-                    text = await resp.text()
-                    raise SwapExecutionError(f"PumpPortal trade falló ({resp.status}): {text[:200]}")
-                data = await resp.json()
-
-        raw_tx = data.get("transaction")
-        if not raw_tx:
-            raise SwapExecutionError("PumpPortal no devolvió una transacción en 'transaction'")
+                    error_body = await resp.text()
+                    logger.error("❌ PumpPortal API Error ({}): {}", resp.status, error_body)
+                    raise SwapExecutionError(f"PumpPortal sell falló ({resp.status}): {error_body}")
+                raw_tx = (await resp.read()).decode()
 
         tx_bytes = self._decode_trade_local(raw_tx)
         tx = VersionedTransaction.from_bytes(tx_bytes)
