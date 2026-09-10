@@ -270,7 +270,9 @@ class TestCargarKeypair:
             execution_mod.cargar_keypair("   ")
 
     def test_numero_de_palabras_no_valido_lanza_error(self) -> None:
-        with pytest.raises(SwapExecutionError, match="FORMATO DE CLAVE INVALIDO"):
+        # Con la nueva lógica, cualquier string con espacios se trata como mnemonic
+        # y falla en la validación BIP39 (cantidad de palabras no válida)
+        with pytest.raises(SwapExecutionError, match="Mnemonic inválido"):
             execution_mod.cargar_keypair("dos tres palabras clave corta")
 
     def test_mnemonic_invalida_lanza_error(self, monkeypatch) -> None:
@@ -528,6 +530,9 @@ def _patch_pumpportal(executor: JupiterExecutor, monkeypatch, captured: dict) ->
 
         async def json(self) -> dict:
             return {"transaction": base64.b64encode(b"\x02\x00\x00\x00\x00\x00\x00").decode()}
+
+        async def read(self) -> bytes:
+            return base64.b64encode(b"\x02\x00\x00\x00\x00\x00\x00")
 
     def _spy_post(url: str = "", json: Optional[dict] = None, headers=None) -> _FakeResp:
         captured["url"] = url

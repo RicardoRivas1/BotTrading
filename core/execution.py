@@ -333,6 +333,12 @@ class JupiterExecutor:
         return txid
 
     # ------------------------------------------------------------ Public
+    @staticmethod
+    def _is_pump_fun_mint(mint: str) -> bool:
+        """True si el mint parece estar en la bonding curve de Pump.fun (termina en 'pump')."""
+        return str(mint).lower().endswith("pump")
+
+
     async def buy_token(self, token_mint: str, dry_run: Optional[bool] = None) -> Signature | str:
         simulate = self.dry_run if dry_run is None else dry_run
         amount_lamports = int(self.buy_amount_sol * 1_000_000_000)
@@ -364,23 +370,30 @@ class JupiterExecutor:
             except SwapExecutionError as exc:
                 if _is_rate_limit(exc):
                     logger.warning(
-                        "Jupiter saturado comprando {} ({}). Pausa de 1s y "
-                        "fallback por Pump.fun (bonding curve).",
+                        "Jupiter saturado comprando {} ({}). Pausa de 1s.",
                         token_mint, exc,
                     )
                     await asyncio.sleep(1.0)
-                    self.pump_bonding_tokens.add(token_mint)
-                    via_pumpfun = True
-                    sig = await self._buy_via_pumpportal(token_mint)
+                    if self._is_pump_fun_mint(token_mint):
+                        logger.info("Mint {} es Pump.fun: usando fallback PumpPortal.", token_mint)
+                        self.pump_bonding_tokens.add(token_mint)
+                        via_pumpfun = True
+                        sig = await self._buy_via_pumpportal(token_mint)
+                    else:
+                        raise
                 elif _is_route_not_found(exc):
-                    logger.warning(
-                        "Jupiter sin ruta para comprar {} ({}): token en la "
-                        "bonding curve de Pump.fun. Comprando directo por PumpPortal.",
-                        token_mint, exc,
-                    )
-                    self.pump_bonding_tokens.add(token_mint)
-                    via_pumpfun = True
-                    sig = await self._buy_via_pumpportal(token_mint)
+                    if self._is_pump_fun_mint(token_mint):
+                        logger.warning(
+                            "Jupiter sin ruta para comprar {} ({}): token en la "
+                            "bonding curve de Pump.fun. Comprando directo por PumpPortal.",
+                            token_mint, exc,
+                        )
+                        self.pump_bonding_tokens.add(token_mint)
+                        via_pumpfun = True
+                        sig = await self._buy_via_pumpportal(token_mint)
+                    else:
+                        logger.error("Jupiter sin ruta para {} (no es Pump.fun): no hay fallback disponible.", token_mint)
+                        raise
                 else:
                     raise
 
@@ -438,7 +451,12 @@ class JupiterExecutor:
         confirmación on-chain es obligatoria (`require_confirmation=True`).
         """
         wallet_pubkey_str = str(self.keypair.pubkey()).strip()
-        amount_sol = float(self.buy_amount_sol if amount_sol is None else amount_sol)
+        # Sanitizar amount: aceptar "0.005 SOL", 0.005, "0.005" → float puro
+        raw_amount = self.buy_amount_sol if amount_sol is None else amount_sol
+        if isinstance(raw_amount, str):
+            amount_sol = float(raw_amount.replace("SOL", "").strip())
+        else:
+            amount_sol = float(raw_amount)
         logger.info(
             "Comprando {} SOL de {} por PumpPortal (bonding curve, slippage 15%)",
             amount_sol, mint,
