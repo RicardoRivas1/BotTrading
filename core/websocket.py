@@ -132,6 +132,10 @@ async def process_buy_and_notify(
         await notifier.send_error(f"No se pudo comprar {mint} ({label}): {exc}")
         return
 
+    if sig is None:
+        logger.info(f"Compra de {mint} ({label}) omitida (sin liquidez).")
+        return
+
     # Captura del precio de entrada real (positivo) desde la posición abierta.
     entry_price = 0.0
     position = executor.positions.get(mint)

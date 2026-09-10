@@ -637,25 +637,20 @@ class TestBuyPumpfun:
         assert len(captured["sent"]) == 1
         assert captured["sent"][0] == b"\x01" * 64
 
-    async def test_buy_token_fallback_pumpportal_si_jupiter_sin_ruta(
-        self, executor: JupiterExecutor, monkeypatch
+    async def test_buy_token_pumpfun_bypass_jupiter_directo_pumpportal(
+        self, executor: JupiterExecutor
     ) -> None:
+        """Tokens Pump.fun saltan Jupiter y van directo a PumpPortal."""
         executor.dry_run = False
-        executor._get_quote = AsyncMock(
-            side_effect=SwapExecutionError("Jupiter quote falló en url (404): Route not found")
-        )
         executor._buy_via_pumpportal = AsyncMock(return_value=Signature.default())
         executor._get_token_balance_ui = AsyncMock(return_value=1000.0)
-        executor.get_token_price = AsyncMock(return_value=0.0)
 
         sig = await executor.buy_token(MINT_PUMP, dry_run=False)
 
         assert sig == Signature.default()
-        assert MINT_PUMP in executor.pump_bonding_tokens
         executor._buy_via_pumpportal.assert_awaited_once()
         assert executor._buy_via_pumpportal.await_args.args[0] == MINT_PUMP
         pos = executor.positions[MINT_PUMP]
-        # entry = 0.05 SOL / 1000 tokens
         assert pos.entry_price == pytest.approx(0.00005)
         assert pos.token_amount_ui == pytest.approx(1000.0)
 

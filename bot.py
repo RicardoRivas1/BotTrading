@@ -129,6 +129,10 @@ class MemecoinBot:
             await self.notifier.send_error(f"No se pudo comprar {mint}: {exc}")
             return
 
+        if sig is None:
+            logger.info("Compra de {} omitida (sin liquidez).", mint)
+            return
+
         await self.notifier.send_buy(
             mint,
             self.config.trading.BUY_AMOUNT_SOL,
