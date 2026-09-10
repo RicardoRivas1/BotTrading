@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import aiohttp
 import base58
+import httpx
 from bip_utils import Bip39SeedGenerator
 from loguru import logger
 from solana.rpc.async_api import AsyncClient
@@ -72,46 +74,75 @@ def _is_rate_limit(exc: Exception) -> bool:
     return any(phrase in message for phrase in ("429", "rate limit", "too many requests"))
 
 
-def cargar_keypair(key_str: str) -> Keypair:
-    """Carga una wallet de Solana desde una clave Base58 o una frase mnemonic (12/24 palabras)."""
-    key_str = key_str.strip()
-    if not key_str:
-        logger.critical("PRIVATE_KEY vacío en configuración.")
-        raise SwapExecutionError("PRIVATE_KEY vacío en configuración.")
+def cargar_keypair_desde_env(rpc_url: str = "") -> Keypair:
+    """Carga la wallet escaneando rutas BIP44 y seleccionando la que tenga saldo SOL."""
+    raw_key = (os.getenv("PRIVATE_KEY") or os.getenv("SOLANA_PRIVATE_KEY") or "").strip()
+    if not raw_key:
+        raise ValueError("No se encontro la variable PRIVATE_KEY en el entorno.")
 
-    # Detección simple: si hay espacios → mnemonic, si no → Base58
-    if " " in key_str:
-        keypair = _cargar_desde_mnemonic(key_str)
-    else:
-        keypair = _cargar_desde_base58(key_str)
+    # Clave Base58 directa
+    if " " not in raw_key:
+        try:
+            secret_key = base58.b58decode(raw_key)
+            if len(secret_key) == 32:
+                kp = Keypair.from_seed(secret_key)
+            elif len(secret_key) == 64:
+                kp = Keypair.from_bytes(secret_key)
+            else:
+                raise ValueError(f"Longitud de clave inesperada: {len(secret_key)} bytes")
+        except Exception as exc:
+            raise SwapExecutionError(f"Clave Base58 invalida: {exc}") from exc
+        logger.info("Wallet Base58 cargada: {}", kp.pubkey())
+        return kp
 
-    logger.info("🔑 Wallet pública cargada con éxito: {}", keypair.pubkey())
-    return keypair
+    # Mnemonic: escanear rutas candidatas en la red
+    seed = Bip39SeedGenerator(raw_key).Generate()
+    if not rpc_url:
+        rpc_url = os.getenv("HELIUS_RPC_URL", "https://api.mainnet-beta.solana.com")
 
+    rutas_candidatas = [f"m/44'/501'/{i}'/0'" for i in range(5)] + [f"m/44'/501'/{i}'" for i in range(5)]
 
-def _cargar_desde_mnemonic(mnemonic: str) -> Keypair:
-    """Deriva el Keypair desde una frase de 12/24 palabras (BIP39 + BIP44 Solana Standard)."""
-    try:
-        seed = Bip39SeedGenerator(mnemonic).Generate()
-        # Derivación oficial Phantom / Solana: m/44'/501'/0'/0'
-        return Keypair.from_seed_and_derivation_path(seed, "m/44'/501'/0'/0'")
-    except Exception as exc:
-        logger.critical("Frase mnemonic inválida: {}", exc)
-        raise SwapExecutionError(f"Mnemonic inválido: {exc}") from exc
+    candidato_seleccionado = None
+    max_balance: float = -1
 
+    logger.info("Escaneando subcuentas de las 24 palabras en la red Solana...")
 
-def _cargar_desde_base58(key_str: str) -> Keypair:
-    """Carga el Keypair desde una clave privada codificada en Base58."""
-    try:
-        secret_key = base58.b58decode(key_str)
-        if len(secret_key) == 32:
-            return Keypair.from_seed(secret_key)
-        elif len(secret_key) == 64:
-            return Keypair.from_bytes(secret_key)
-        raise ValueError(f"Longitud de clave inesperada: {len(secret_key)} bytes")
-    except Exception as exc:
-        logger.critical("Error al decodificar PRIVATE_KEY Base58: {}", exc)
-        raise SwapExecutionError(f"Clave Base58 inválida: {exc}") from exc
+    with httpx.Client(timeout=10) as client:
+        for path in rutas_candidatas:
+            try:
+                kp = Keypair.from_seed_and_derivation_path(seed, path)
+                pubkey = kp.pubkey()
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "getBalance",
+                    "params": [str(pubkey)],
+                }
+                resp = client.post(rpc_url, json=payload)
+                data = resp.json()
+                balance_lamports = data.get("result", {}).get("value", 0) or 0
+                balance_sol = balance_lamports / 1_000_000_000
+
+                logger.info("  Ruta `{}` -> Wallet: {} | Saldo: {} SOL", path, pubkey, balance_sol)
+
+                if balance_sol > max_balance:
+                    max_balance = balance_sol
+                    candidato_seleccionado = kp
+
+                if balance_sol > 0:
+                    break
+            except Exception:
+                continue
+
+    if not candidato_seleccionado:
+        candidato_seleccionado = Keypair.from_seed_and_derivation_path(seed, "m/44'/501'/0'/0'")
+
+    logger.info(
+        "WALLET SELECCIONADA: {} (Saldo: {} SOL)",
+        candidato_seleccionado.pubkey(),
+        max_balance if max_balance >= 0 else 0,
+    )
+    return candidato_seleccionado
 
 
 @dataclass
@@ -142,7 +173,7 @@ class JupiterExecutor:
         trailing_distance_pct: float = 15.0,
         dry_run: bool = True,
     ) -> None:
-        self.keypair: Keypair = cargar_keypair(private_key)
+        self.keypair: Keypair = cargar_keypair_desde_env(rpc_url)
         self.rpc_url = rpc_url
         self.slippage_bps = slippage_bps
         self.buy_amount_sol = buy_amount_sol
