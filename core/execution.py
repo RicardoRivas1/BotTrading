@@ -329,58 +329,64 @@ class JupiterExecutor:
         return str(mint).lower().endswith("pump")
 
 
-    async def buy_token(self, token_mint: str, dry_run: Optional[bool] = None) -> Signature | str:
+    async def buy_token(self, token_mint: str, dry_run: Optional[bool] = None) -> Signature | str | None:
+        """Compra un token. Ruteo estricto: Pump.fun → PumpPortal, resto → Jupiter.
+
+        - Si `mint_address` termina en "pump" → compra directa por PumpPortal.
+        - Si NO termina en "pump" → intenta Jupiter. Si Jupiter devuelve 404
+          (sin liquidez), **omite en silencio** (sin error a Telegram).
+        """
         simulate = self.dry_run if dry_run is None else dry_run
         amount_lamports = int(self.buy_amount_sol * 1_000_000_000)
-        sig: Signature | str
-        quote: Optional[dict[str, Any]] = None
-        via_pumpfun = False
 
+        # --- Ruteo estricto por sufijo ---
+        if self._is_pump_fun_mint(token_mint):
+            if simulate:
+                logger.info("[DRY_RUN] Compra simulada (Pump.fun) de {} | Monto: {} SOL", token_mint, self.buy_amount_sol)
+                await self._register_position(token_mint, None, via_pumpfun=True, simulate=True)
+                return "DRY_RUN"
+            logger.info("Token Pump.fun detectado: comprando directo por PumpPortal.", token_mint)
+            sig = await self._buy_via_pumpportal(token_mint)
+            await self._register_position(token_mint, None, via_pumpfun=True)
+            return sig
+
+        # --- Tokens normales: Jupiter ---
         if simulate:
-            logger.info(
-                "[DRY_RUN] Compra simulada de {} | Monto: {} SOL",
-                token_mint, self.buy_amount_sol,
-            )
+            logger.info("[DRY_RUN] Compra simulada de {} | Monto: {} SOL", token_mint, self.buy_amount_sol)
             async with aiohttp.ClientSession() as session:
-                quote = await self._get_quote(
-                    session, SOL_MINT, token_mint, amount_lamports,
-                    simulate=True,
-                )
-            sig = "DRY_RUN"
-        else:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    quote = await self._get_quote(
-                        session, SOL_MINT, token_mint, amount_lamports,
-                        simulate=False,
-                    )
-                    sig = await self._build_and_send_swap(
-                        session, quote, require_confirmation=True
-                    )
-            except Exception as exc:
-                err = str(exc)
-                if "404" in err or "Route not found" in err or "Jupiter" in err:
-                    if self._is_pump_fun_mint(token_mint):
-                        logger.warning(
-                            "Jupiter sin ruta para {} (404/Route not found). "
-                            "Comprando directamente por PumpPortal...",
-                            token_mint,
-                        )
-                        self.pump_bonding_tokens.add(token_mint)
-                        via_pumpfun = True
-                        sig = await self._buy_via_pumpportal(token_mint)
-                    else:
-                        raise SwapExecutionError(
-                            f"Token {token_mint} sin liquidez (Jupiter 404). No es Pump.fun."
-                        ) from exc
-                else:
-                    raise
+                quote = await self._get_quote(session, SOL_MINT, token_mint, amount_lamports, simulate=True)
+            if not quote:
+                logger.info("Omitiendo {}: token sin liquidez en Jupiter/DEX.", token_mint)
+                return None
+            await self._register_position(token_mint, quote, via_pumpfun=False, simulate=True)
+            return "DRY_RUN"
 
+        try:
+            async with aiohttp.ClientSession() as session:
+                quote = await self._get_quote(session, SOL_MINT, token_mint, amount_lamports, simulate=False)
+                if not quote:
+                    logger.info("Omitiendo {}: token sin liquidez en Jupiter/DEX.", token_mint)
+                    return None
+                sig = await self._build_and_send_swap(session, quote, require_confirmation=True)
+        except Exception as exc:
+            err = str(exc)
+            if "404" in err or "Route not found" in err or "no route" in err.lower():
+                logger.info("Omitiendo {}: token sin liquidez en Jupiter/DEX.", token_mint)
+                return None
+            raise
+
+        await self._register_position(token_mint, quote, via_pumpfun=False)
+        return sig
+
+    async def _register_position(
+        self, token_mint: str, quote: Optional[dict], *, via_pumpfun: bool, simulate: bool = False,
+    ) -> None:
+        """Registra la posición comprada en `self.positions`."""
         if via_pumpfun:
             token_qty_ui = await self._get_token_balance_ui(token_mint)
         else:
             out_amount = float(
-                quote.get("outAmount", quote.get("routePlan", [{}])[0].get("outAmount", 0)) or 0
+                (quote or {}).get("outAmount", (quote or {}).get("routePlan", [{}])[0].get("outAmount", 0)) or 0
             )
             decimals = await self._get_token_decimals(token_mint)
             token_qty_ui = out_amount / (10 ** decimals) if decimals else 0.0
@@ -389,34 +395,28 @@ class JupiterExecutor:
             entry_price_sol = 0.0
             try:
                 entry_price_sol = await self.get_token_price(token_mint)
-            except Exception as exc:
-                logger.warning("No se pudo obtener precio real de {} en DRY_RUN: {}", token_mint, exc)
-            if entry_price_sol <= 0:
-                entry_price_sol = 0.0
+            except Exception:
+                pass
         else:
             entry_price_sol = self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
-            if not entry_price_sol or entry_price_sol <= 0:
+            if entry_price_sol <= 0:
                 try:
                     entry_price_sol = await self.get_token_price(token_mint)
-                except Exception as exc:
-                    logger.warning("No se pudo obtener precio base de {}: {}", token_mint, exc)
-                if entry_price_sol <= 0:
-                    entry_price_sol = 0.0
-
+                except Exception:
+                    pass
         entry_price_sol = max(entry_price_sol, 0.0)
 
         self.positions[token_mint] = Position(
             mint=token_mint,
             token_amount_ui=token_qty_ui,
             entry_price=entry_price_sol,
-            peak_price=entry_price_sol if entry_price_sol > 0 else 0.0,
+            peak_price=entry_price_sol,
             sol_invested=self.buy_amount_sol,
         )
         if entry_price_sol > 0:
             logger.info("Posición registrada para {} @ entry={:.9f} SOL", token_mint, entry_price_sol)
         else:
             logger.warning("📌 Posición registrada con entry_price PENDIENTE para {}", token_mint)
-        return sig
 
     async def _buy_via_pumpportal(
         self,
