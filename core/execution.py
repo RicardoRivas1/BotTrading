@@ -316,7 +316,6 @@ class JupiterExecutor:
         async with AsyncClient(self.rpc_url) as client:
             res = await client.send_raw_transaction(
                 bytes(signed_tx),
-                opts={"skipPreflight": False},
             )
             if not res.value:
                 raise SwapExecutionError("Respuesta de envío sin firma")
