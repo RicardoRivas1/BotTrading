@@ -289,8 +289,7 @@ class JupiterExecutor:
         tx_bytes = self._decode_transaction(raw_tx)
 
         tx = VersionedTransaction.from_bytes(bytes(tx_bytes))
-        signature = self.keypair.sign_message(bytes(tx.message))
-        signed_tx = VersionedTransaction(tx.message, [signature])
+        signed_tx = VersionedTransaction(tx.message, [self.keypair])
 
         return await self._submit_signed_transaction(
             signed_tx, require_confirmation=require_confirmation
@@ -508,8 +507,7 @@ class JupiterExecutor:
                     )
                 tx_bytes = self._decode_trade_local(await resp.read())
         tx = VersionedTransaction.from_bytes(tx_bytes)
-        signature = self.keypair.sign_message(bytes(tx.message))
-        signed_tx = VersionedTransaction(tx.message, [signature])
+        signed_tx = VersionedTransaction(tx.message, [self.keypair])
 
         logger.info("Compra directa Pump.fun de {} enviada a la red.", mint)
         return await self._submit_signed_transaction(
@@ -627,8 +625,7 @@ class JupiterExecutor:
                 tx_bytes = self._decode_trade_local(await resp.read())
 
         tx = VersionedTransaction.from_bytes(tx_bytes)
-        signature = self.keypair.sign_message(bytes(tx.message))
-        signed_tx = VersionedTransaction(tx.message, [signature])
+        signed_tx = VersionedTransaction(tx.message, [self.keypair])
 
         logger.info("Venta directa Pump.fun de {} enviada a la red.", mint)
         return await self._submit_signed_transaction(
