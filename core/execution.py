@@ -22,7 +22,7 @@ from loguru import logger
 from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.rpc.config import RpcSendTransactionConfig
+from solana.rpc.models import TxOpts
 from solders.signature import Signature
 from solders.token.associated import get_associated_token_address
 from solders.transaction import VersionedTransaction
@@ -315,7 +315,7 @@ class JupiterExecutor:
         el txid recibido para evitar reintentos que dupliquen la salida.
         """
         async with AsyncClient(self.rpc_url) as client:
-            opts = RpcSendTransactionConfig(skip_preflight=True)
+            opts = TxOpts(skip_preflight=True, skip_confirmation=True)
             res = await client.send_raw_transaction(
                 bytes(signed_tx), opts=opts  # type: ignore[arg-type]
             )
