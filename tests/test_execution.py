@@ -11,7 +11,6 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
 
-
 import aiohttp
 import base58
 import pytest
@@ -699,6 +698,55 @@ class TestBuyPumpfun:
         with pytest.raises(SwapExecutionError):
             await executor.buy_token(MINT_RAYDIUM, dry_run=False)
         executor._buy_via_pumpportal.assert_not_called()
+
+    async def test_buy_token_reintenta_tras_rate_limit_429(
+        self, executor: JupiterExecutor
+    ) -> None:
+        executor.dry_run = False
+        quote_ok = {"inAmount": "100000000", "outAmount": "5000000"}
+        call_count = 0
+
+        async def _quote_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise SwapExecutionError("429: Rate limit exceeded")
+            return quote_ok
+
+        executor._get_quote = AsyncMock(side_effect=_quote_side_effect)
+        executor._build_and_send_swap = AsyncMock(return_value=Signature.default())
+
+        sig = await executor.buy_token(MINT_RAYDIUM, dry_run=False)
+
+        assert sig == Signature.default()
+        assert executor._get_quote.await_count == 2
+        executor._build_and_send_swap.assert_awaited_once()
+
+    async def test_buy_token_omite_tras_rate_limit_si_reintento_falla(
+        self, executor: JupiterExecutor
+    ) -> None:
+        executor.dry_run = False
+        executor._get_quote = AsyncMock(
+            side_effect=SwapExecutionError("429: Rate limit exceeded")
+        )
+
+        sig = await executor.buy_token(MINT_RAYDIUM, dry_run=False)
+
+        assert sig is None
+        assert executor._get_quote.await_count == 2
+
+    async def test_buy_token_omite_si_ruta_no_encontrada(
+        self, executor: JupiterExecutor
+    ) -> None:
+        executor.dry_run = False
+        executor._get_quote = AsyncMock(
+            side_effect=SwapExecutionError("Route not found")
+        )
+
+        sig = await executor.buy_token(MINT_RAYDIUM, dry_run=False)
+
+        assert sig is None
+        executor._get_quote.assert_awaited_once()
 
 
 class TestConfirmacionOnChain:
