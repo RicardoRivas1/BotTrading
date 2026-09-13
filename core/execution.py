@@ -490,9 +490,9 @@ class JupiterExecutor:
             "mint": str(mint).strip(),
             "denominatedInSol": "true",
             "amount": float(amount_sol),
-            "slippage": 15,
-            "priorityFee": 0.0005,
-            "pool": "auto",
+            "slippage": 20,
+            "priorityFee": 0.001,
+            "pool": "pump",
         }
         logger.debug("PumpPortal payload: {}", payload)
         async with aiohttp.ClientSession() as session:
