@@ -400,11 +400,20 @@ class JupiterExecutor:
                     return None
                 sig = await self._build_and_send_swap(session, quote, require_confirmation=True)
         except Exception as exc:
-            err = str(exc)
-            if "404" in err or "Route not found" in err or "no route" in err.lower():
+            if _is_rate_limit(exc):
+                logger.warning("Jupiter rate limit (429) al comprar {}. Reintentando tras pausa...", token_mint)
+                await asyncio.sleep(2.0)
+                async with aiohttp.ClientSession() as session:
+                    quote = await self._get_quote(session, SOL_MINT, token_mint, amount_lamports, simulate=False)
+                    if not quote:
+                        logger.info("Omitiendo {} tras reintento: sin liquidez.", token_mint)
+                        return None
+                    sig = await self._build_and_send_swap(session, quote, require_confirmation=True)
+            elif _is_route_not_found(exc):
                 logger.info("Omitiendo {}: token sin liquidez en Jupiter/DEX.", token_mint)
                 return None
-            raise
+            else:
+                raise
 
         await self._register_position(token_mint, quote, via_pumpfun=False)
         return sig
