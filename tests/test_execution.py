@@ -567,18 +567,18 @@ def _patch_pumpportal(executor: JupiterExecutor, monkeypatch, captured: dict) ->
 
     fake_tx = MagicMock()
     fake_tx.message.to_bytes.return_value = b"\x00" * 32
-    fake_signed = MagicMock()
-    fake_signed.to_bytes.return_value = b"\x01" * 64
-    monkeypatch.setattr(
-        execution_mod.VersionedTransaction,
-        "from_bytes",
-        MagicMock(return_value=fake_tx),
-    )
-    monkeypatch.setattr(
-        execution_mod.VersionedTransaction,
-        "populate",
-        MagicMock(return_value=fake_signed),
-    )
+
+    class _FakeSignedTx:
+        def __bytes__(self) -> bytes:
+            return b"\x01" * 64
+
+    fake_signed = _FakeSignedTx()
+
+    mock_vt = MagicMock()
+    mock_vt.from_bytes.return_value = fake_tx
+    mock_vt.return_value = fake_signed
+
+    monkeypatch.setattr(execution_mod, "VersionedTransaction", mock_vt)
 
     class _FakeClient:
         def __init__(self, url: str) -> None:
@@ -653,7 +653,7 @@ class TestBuyPumpfun:
 
         assert sig == Signature.default()
         assert captured["url"] == execution_mod.PUMPPORTAL_TRADE_URL
-        assert captured["headers"]["Content-Type"] == "application/json"
+        assert "User-Agent" in captured["headers"]
         payload = captured["payload"]
         assert payload["publicKey"] == executor.wallet_pubkey
         assert payload["action"] == "buy"
@@ -666,7 +666,7 @@ class TestBuyPumpfun:
         assert 15.0 <= payload["slippage"] <= 20.0
         assert payload["priorityFee"] >= 0.0001
         assert isinstance(payload["priorityFee"], float)
-        assert payload["pool"] == "pump"
+        assert payload["pool"] == "auto"
         assert len(captured["sent"]) == 1
         assert captured["sent"][0] == b"\x01" * 64
 
