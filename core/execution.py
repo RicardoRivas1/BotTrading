@@ -20,7 +20,7 @@ import httpx
 from bip_utils import Bip39SeedGenerator
 from loguru import logger
 from solana.rpc.async_api import AsyncClient
-from solana.rpc.types import TxOpts
+from solders.rpc.config import RpcSendTransactionConfig
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.signature import Signature
@@ -315,7 +315,7 @@ class JupiterExecutor:
         el txid recibido para evitar reintentos que dupliquen la salida.
         """
         async with AsyncClient(self.rpc_url) as client:
-            opts = TxOpts(skip_preflight=True, preflight_commitment="confirmed")
+            opts = RpcSendTransactionConfig(skip_preflight=True)
             res = await client.send_raw_transaction(
                 bytes(signed_tx), opts=opts
             )
