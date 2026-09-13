@@ -10,7 +10,7 @@ import base64
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
-from wsgiref import headers
+
 
 import aiohttp
 import base58
