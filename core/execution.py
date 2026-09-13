@@ -403,12 +403,16 @@ class JupiterExecutor:
             if _is_rate_limit(exc):
                 logger.warning("Jupiter rate limit (429) al comprar {}. Reintentando tras pausa...", token_mint)
                 await asyncio.sleep(2.0)
-                async with aiohttp.ClientSession() as session:
-                    quote = await self._get_quote(session, SOL_MINT, token_mint, amount_lamports, simulate=False)
-                    if not quote:
-                        logger.info("Omitiendo {} tras reintento: sin liquidez.", token_mint)
-                        return None
-                    sig = await self._build_and_send_swap(session, quote, require_confirmation=True)
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        quote = await self._get_quote(session, SOL_MINT, token_mint, amount_lamports, simulate=False)
+                        if not quote:
+                            logger.info("Omitiendo {} tras reintento: sin liquidez.", token_mint)
+                            return None
+                        sig = await self._build_and_send_swap(session, quote, require_confirmation=True)
+                except Exception as retry_exc:
+                    logger.warning("Reintento de compra de {} también falló: {}", token_mint, retry_exc)
+                    return None
             elif _is_route_not_found(exc):
                 logger.info("Omitiendo {}: token sin liquidez en Jupiter/DEX.", token_mint)
                 return None

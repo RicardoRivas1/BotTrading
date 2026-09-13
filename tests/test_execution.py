@@ -700,8 +700,9 @@ class TestBuyPumpfun:
         executor._buy_via_pumpportal.assert_not_called()
 
     async def test_buy_token_reintenta_tras_rate_limit_429(
-        self, executor: JupiterExecutor
+        self, executor: JupiterExecutor, monkeypatch
     ) -> None:
+        monkeypatch.setattr(execution_mod.asyncio, "sleep", AsyncMock())
         executor.dry_run = False
         quote_ok = {"inAmount": "100000000", "outAmount": "5000000"}
         call_count = 0
@@ -723,8 +724,9 @@ class TestBuyPumpfun:
         executor._build_and_send_swap.assert_awaited_once()
 
     async def test_buy_token_omite_tras_rate_limit_si_reintento_falla(
-        self, executor: JupiterExecutor
+        self, executor: JupiterExecutor, monkeypatch
     ) -> None:
+        monkeypatch.setattr(execution_mod.asyncio, "sleep", AsyncMock())
         executor.dry_run = False
         executor._get_quote = AsyncMock(
             side_effect=SwapExecutionError("429: Rate limit exceeded")
