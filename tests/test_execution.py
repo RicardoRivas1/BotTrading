@@ -10,6 +10,7 @@ import base64
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
+from wsgiref import headers
 
 import aiohttp
 import base58
@@ -29,7 +30,9 @@ MINT_PUMP = "FUELoUmnYbR5Pm1VFD8hzpRZ7NmnJQVifKdC9pump"
 @pytest.fixture
 def executor(monkeypatch) -> JupiterExecutor:
     """Executor con clave simulada (nunca valida contra Solana)."""
-    monkeypatch.setattr(execution_mod, "cargar_keypair_desde_env", lambda rpc_url="": Keypair())
+    monkeypatch.setattr(
+        execution_mod, "cargar_keypair_desde_env", lambda rpc_url="": Keypair()
+    )
     return JupiterExecutor(
         private_key="clave-de-prueba",
         rpc_url="https://rpc.example.invalid",
@@ -431,7 +434,10 @@ class TestCompraVenta:
         # entry = 0.05 SOL / 5000 tokens = 0.00001
         assert pos.entry_price == pytest.approx(0.00001)
         # Las compras reales exigen confirmación on-chain antes de notificar.
-        assert executor._build_and_send_swap.await_args.kwargs["require_confirmation"] is True
+        assert (
+            executor._build_and_send_swap.await_args.kwargs["require_confirmation"]
+            is True
+        )
 
     async def test_sell_token_usa_quote_y_swap(self, executor: JupiterExecutor) -> None:
         executor._get_quote = AsyncMock(return_value=self._quote("999"))
@@ -443,13 +449,18 @@ class TestCompraVenta:
         assert sig == Signature.default()
         executor._build_and_send_swap.assert_awaited_once()
         # En ventas la confirmación no es bloqueante (evita reintentos duplicados).
-        assert executor._build_and_send_swap.await_args.kwargs["require_confirmation"] is False
+        assert (
+            executor._build_and_send_swap.await_args.kwargs["require_confirmation"]
+            is False
+        )
 
     async def test_sell_token_fallback_pumpfun_si_jupiter_sin_ruta(
         self, executor: JupiterExecutor
     ) -> None:
         executor._get_quote = AsyncMock(
-            side_effect=SwapExecutionError("Jupiter quote falló en url (404): Route not found")
+            side_effect=SwapExecutionError(
+                "Jupiter quote falló en url (404): Route not found"
+            )
         )
         executor._sell_via_pumpportal = AsyncMock(return_value=Signature.default())
         executor._get_token_decimals = AsyncMock(return_value=6)
@@ -467,7 +478,9 @@ class TestCompraVenta:
         self, executor: JupiterExecutor, monkeypatch
     ) -> None:
         executor._get_quote = AsyncMock(
-            side_effect=SwapExecutionError("Jupiter quote falló en url (429): Rate limit exceeded")
+            side_effect=SwapExecutionError(
+                "Jupiter quote falló en url (429): Rate limit exceeded"
+            )
         )
         executor._sell_via_pumpportal = AsyncMock(return_value=Signature.default())
         executor._get_token_decimals = AsyncMock(return_value=6)
@@ -515,6 +528,7 @@ def _patch_pumpportal(executor: JupiterExecutor, monkeypatch, captured: dict) ->
     `captured` recibe "url", "payload" (cuerpo del POST) y "sent" (bytes
     enviados por el RPC). El RPC falso confirma la transacción con estado OK.
     """
+
     class _FakeResp:
         status = 200
 
@@ -528,14 +542,20 @@ def _patch_pumpportal(executor: JupiterExecutor, monkeypatch, captured: dict) ->
             return "ok"
 
         async def json(self) -> dict:
-            return {"transaction": base64.b64encode(b"\x02\x00\x00\x00\x00\x00\x00").decode()}
+            return {
+                "transaction": base64.b64encode(
+                    b"\x02\x00\x00\x00\x00\x00\x00"
+                ).decode()
+            }
 
         async def read(self) -> bytes:
             return base64.b64encode(b"\x02\x00\x00\x00\x00\x00\x00")
 
-    def _spy_post(url: str = "", json: Optional[dict] = None, headers=None) -> _FakeResp:
+    def _spy_post(
+        url: str = "", json: Optional[dict] = None, data=None, headers=None, **kwargs
+    ) -> _FakeResp:
         captured["url"] = url
-        captured["payload"] = json
+        captured["payload"] = json if json is not None else data
         captured["headers"] = headers
         return _FakeResp()
 
@@ -549,8 +569,16 @@ def _patch_pumpportal(executor: JupiterExecutor, monkeypatch, captured: dict) ->
     fake_tx.message.to_bytes.return_value = b"\x00" * 32
     fake_signed = MagicMock()
     fake_signed.to_bytes.return_value = b"\x01" * 64
-    monkeypatch.setattr(execution_mod.VersionedTransaction, "from_bytes", MagicMock(return_value=fake_tx))
-    monkeypatch.setattr(execution_mod.VersionedTransaction, "populate", MagicMock(return_value=fake_signed))
+    monkeypatch.setattr(
+        execution_mod.VersionedTransaction,
+        "from_bytes",
+        MagicMock(return_value=fake_tx),
+    )
+    monkeypatch.setattr(
+        execution_mod.VersionedTransaction,
+        "populate",
+        MagicMock(return_value=fake_signed),
+    )
 
     class _FakeClient:
         def __init__(self, url: str) -> None:
@@ -562,7 +590,9 @@ def _patch_pumpportal(executor: JupiterExecutor, monkeypatch, captured: dict) ->
         async def __aexit__(self, *exc_info: object) -> bool:
             return False
 
-        async def send_raw_transaction(self, raw_tx: bytes, opts: Optional[dict] = None):
+        async def send_raw_transaction(
+            self, raw_tx: bytes, opts: Optional[dict] = None
+        ):
             captured["sent"].append(raw_tx)
             return SimpleNamespace(value=Signature.default())
 
@@ -600,8 +630,12 @@ class TestSellPumpfun:
 
     async def test_decode_trade_local(self) -> None:
         raw = b"\x02\x00\x00\x00"
-        assert JupiterExecutor._decode_trade_local(base64.b64encode(raw).decode()) == raw
-        assert JupiterExecutor._decode_trade_local(base58.b58encode(raw).decode()) == raw
+        assert (
+            JupiterExecutor._decode_trade_local(base64.b64encode(raw).decode()) == raw
+        )
+        assert (
+            JupiterExecutor._decode_trade_local(base58.b58encode(raw).decode()) == raw
+        )
         assert JupiterExecutor._decode_trade_local("0x" + raw.hex()) == raw
         assert JupiterExecutor._decode_trade_local(list(raw)) == raw
 
@@ -670,7 +704,9 @@ class TestBuyPumpfun:
 class TestConfirmacionOnChain:
     """Confirmación obligatoria on-chain de las transacciones."""
 
-    def _fake_client(self, monkeypatch, *, confirm_result=None, confirm_side_effect=None) -> None:
+    def _fake_client(
+        self, monkeypatch, *, confirm_result=None, confirm_side_effect=None
+    ) -> None:
         class _FakeClient:
             def __init__(self, url: str) -> None:
                 self.url = url
@@ -681,7 +717,9 @@ class TestConfirmacionOnChain:
             async def __aexit__(self, *exc_info: object) -> bool:
                 return False
 
-            async def send_raw_transaction(self, raw_tx: bytes, opts: Optional[dict] = None):
+            async def send_raw_transaction(
+                self, raw_tx: bytes, opts: Optional[dict] = None
+            ):
                 return SimpleNamespace(value=Signature.default())
 
             async def confirm_transaction(self, txid, commitment: Optional[str] = None):
@@ -699,16 +737,23 @@ class TestConfirmacionOnChain:
     async def test_confirmacion_ok_devuelve_txid(
         self, executor: JupiterExecutor, monkeypatch
     ) -> None:
-        self._fake_client(monkeypatch, confirm_result=SimpleNamespace(value=[SimpleNamespace(err=None)]))
+        self._fake_client(
+            monkeypatch,
+            confirm_result=SimpleNamespace(value=[SimpleNamespace(err=None)]),
+        )
         sig = await executor._submit_signed_transaction(self._signed_tx(monkeypatch))
         assert sig == Signature.default()
 
     async def test_stricto_lanza_si_timeout_o_error_del_rpc(
         self, executor: JupiterExecutor, monkeypatch
     ) -> None:
-        self._fake_client(monkeypatch, confirm_side_effect=TimeoutError("sin confirmación en 30s"))
+        self._fake_client(
+            monkeypatch, confirm_side_effect=TimeoutError("sin confirmación en 30s")
+        )
         with pytest.raises(SwapExecutionError):
-            await executor._submit_signed_transaction(self._signed_tx(monkeypatch), require_confirmation=True)
+            await executor._submit_signed_transaction(
+                self._signed_tx(monkeypatch), require_confirmation=True
+            )
 
     async def test_stricto_lanza_si_revertida(
         self, executor: JupiterExecutor, monkeypatch
@@ -716,7 +761,9 @@ class TestConfirmacionOnChain:
         revert = SimpleNamespace(err="insufficient funds")
         self._fake_client(monkeypatch, confirm_result=SimpleNamespace(value=[revert]))
         with pytest.raises(SwapExecutionError, match="reversada"):
-            await executor._submit_signed_transaction(self._signed_tx(monkeypatch), require_confirmation=True)
+            await executor._submit_signed_transaction(
+                self._signed_tx(monkeypatch), require_confirmation=True
+            )
 
     async def test_venta_lenient_devuelve_txid_aunque_no_se_confirme(
         self, executor: JupiterExecutor, monkeypatch
