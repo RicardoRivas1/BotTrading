@@ -469,9 +469,10 @@ class JupiterExecutor:
     ) -> Signature:
         """Compra directa en la bonding curve de Pump.fun vía PumpPortal.
 
-        Payload en SOL (`denominatedInSol="true"`), con `pool: "pump"` para la
-        bonding curve, `slippage` 15% y `priorityFee` 0.0001 SOL. La
-        confirmación on-chain es obligatoria (`require_confirmation=True`).
+        Payload en SOL (`denominatedInSol="true"`), con `pool: "auto"` para
+        detectar automáticamente la mejor ruta, `slippage` 20% y
+        `priorityFee` 0.001 SOL. La confirmación on-chain es obligatoria
+        (`require_confirmation=True`).
         """
         wallet_pubkey_str = str(self.keypair.pubkey()).strip()
         # Sanitizar amount: aceptar "0.005 SOL", 0.005, "0.005" → float puro
@@ -505,12 +506,12 @@ class JupiterExecutor:
             "amount": float(amount_sol),
             "slippage": 20,
             "priorityFee": 0.001,
-            "pool": "pump",
+            "pool": "auto",
         }
         logger.debug("PumpPortal payload: {}", payload)
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                PUMPPORTAL_TRADE_URL, data=payload, headers=_USER_AGENT_HEADERS
+                PUMPPORTAL_TRADE_URL, json=payload, headers=_USER_AGENT_HEADERS
             ) as resp:
                 if resp.status != 200:
                     error_body = await resp.text()
@@ -612,7 +613,7 @@ class JupiterExecutor:
 
         Realiza el POST a `https://pumpportal.fun/api/trade-local` con el
         payload de venta (tipos estrictos: string "true"/"false", float amount,
-        pool "pump"), decodifica la transacción, la firma localmente y la
+        pool "auto"), decodifica la transacción, la firma localmente y la
         envía/confirma por el RPC. Devuelve el txid (Signature).
         """
         wallet_pubkey_str = str(self.wallet_pubkey).strip()
@@ -630,7 +631,7 @@ class JupiterExecutor:
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                PUMPPORTAL_TRADE_URL, data=payload, headers=_USER_AGENT_HEADERS
+                PUMPPORTAL_TRADE_URL, json=payload, headers=_USER_AGENT_HEADERS
             ) as resp:
                 if resp.status != 200:
                     error_body = await resp.text()

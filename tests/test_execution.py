@@ -665,7 +665,7 @@ class TestBuyPumpfun:
         assert 15.0 <= payload["slippage"] <= 20.0
         assert payload["priorityFee"] >= 0.0001
         assert isinstance(payload["priorityFee"], float)
-        assert payload["pool"] == "pump"
+        assert payload["pool"] == "auto"
         assert len(captured["sent"]) == 1
         assert captured["sent"][0] == b"\x01" * 64
 
