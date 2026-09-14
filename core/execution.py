@@ -427,7 +427,10 @@ class JupiterExecutor:
     ) -> None:
         """Registra la posición comprada en `self.positions`."""
         if via_pumpfun:
-            token_qty_ui = await self._get_token_balance_ui(token_mint)
+            if simulate:
+                token_qty_ui = 0.0
+            else:
+                token_qty_ui = await self._get_token_balance_ui(token_mint)
         else:
             out_amount = float(
                 (quote or {}).get("outAmount", (quote or {}).get("routePlan", [{}])[0].get("outAmount", 0)) or 0
