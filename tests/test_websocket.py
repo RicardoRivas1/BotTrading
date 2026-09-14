@@ -25,6 +25,7 @@ def _make_notifier() -> MagicMock:
         "send_status",
         "send_take_profit",
         "send_stop_loss",
+        "send_trailing_stop",
         "send_buy",
     ):
         setattr(notifier, name, AsyncMock(return_value=True))
@@ -194,12 +195,12 @@ class TestProcessBuyAndNotify:
         executor.positions = {
             "MINT123ABC": Position(mint="MINT123ABC", token_amount_ui=50.0, entry_price=0.001)
         }
-        monkeypatch.setattr("core.execution.JupiterExecutor", lambda **kwargs: executor)
 
         notifier = _make_notifier()
         monkeypatch.setattr("core.notifier.TelegramNotifier", lambda **kwargs: notifier)
 
         tracker = MagicMock()
+        tracker.executor = executor
         tracker.add_position = MagicMock()
         monkeypatch.setattr("core.tracker.get_global_tracker", lambda: tracker)
 
@@ -229,10 +230,13 @@ class TestProcessBuyAndNotify:
 
         executor = MagicMock()
         executor.buy_token = AsyncMock(side_effect=RuntimeError("swap falló"))
-        monkeypatch.setattr("core.execution.JupiterExecutor", lambda **kwargs: executor)
 
         notifier = _make_notifier()
         monkeypatch.setattr("core.notifier.TelegramNotifier", lambda **kwargs: notifier)
+
+        tracker = MagicMock()
+        tracker.executor = executor
+        monkeypatch.setattr("core.tracker.get_global_tracker", lambda: tracker)
 
         await ws_module.process_buy_and_notify("MINT123ABC")
 
@@ -265,10 +269,10 @@ class _Scaffold:
         self.executor = MagicMock()
         self.executor.buy_token = AsyncMock(return_value="DRY_RUN")
         self.executor.get_token_symbol = AsyncMock(return_value="MET")
-        monkeypatch.setattr("core.execution.JupiterExecutor", lambda **kwargs: self.executor)
         self.notifier = _make_notifier()
         monkeypatch.setattr("core.notifier.TelegramNotifier", lambda **kwargs: self.notifier)
         self.tracker = MagicMock()
+        self.tracker.executor = self.executor
         self.tracker.add_position = MagicMock()
         monkeypatch.setattr("core.tracker.get_global_tracker", lambda: self.tracker)
 
@@ -507,3 +511,122 @@ class TestFactory:
     def test_create_listener_con_uri_personalizada(self) -> None:
         listener = create_listener(uri="wss://custom.invalid")
         assert listener.uri == "wss://custom.invalid"
+
+
+class TestCheckLiquidity:
+    """Verificación de liquidez mínima antes de comprar tokens pump.fun."""
+
+    async def test_token_no_pump_devuelve_true(self, monkeypatch) -> None:
+        from core.websocket import check_liquidity
+
+        assert await check_liquidity("So11111111111111111111111111111111") is True
+
+    async def test_pump_con_liquidez_suficiente(self, monkeypatch) -> None:
+        from core.websocket import check_liquidity
+
+        class _FakeResp:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def json(self):
+                return {"virtual_sol_reserves": 10_000_000_000}  # 10 SOL
+
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.get = MagicMock(return_value=_FakeResp())
+        monkeypatch.setattr(aiohttp, "ClientSession", lambda **kw: session)
+
+        assert await check_liquidity("TEST123pump") is True
+
+    async def test_pump_con_liquidez_insuficiente(self, monkeypatch) -> None:
+        from core.websocket import check_liquidity
+
+        class _FakeResp:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def json(self):
+                return {"virtual_sol_reserves": 100_000}  # 0.0001 SOL
+
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.get = MagicMock(return_value=_FakeResp())
+        monkeypatch.setattr(aiohttp, "ClientSession", lambda **kw: session)
+
+        assert await check_liquidity("TEST123pump") is False
+
+    async def test_pump_api_error_devuelve_true(self, monkeypatch) -> None:
+        from core.websocket import check_liquidity
+
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(side_effect=RuntimeError("network"))
+        session.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(aiohttp, "ClientSession", lambda **kw: session)
+
+        assert await check_liquidity("TEST123pump") is True
+
+    async def test_pump_status_no_200_devuelve_true(self, monkeypatch) -> None:
+        from core.websocket import check_liquidity
+
+        class _FakeResp:
+            status = 500
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        session = MagicMock()
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        session.get = MagicMock(return_value=_FakeResp())
+        monkeypatch.setattr(aiohttp, "ClientSession", lambda **kw: session)
+
+        assert await check_liquidity("TEST123pump") is True
+
+
+class TestProcessBuySinLiquidez:
+    """Cuando buy_token devuelve None (sin liquidez)."""
+
+    async def test_sig_none_no_registra_posicion(self, monkeypatch) -> None:
+        s = _Scaffold(monkeypatch)
+        s.executor.buy_token = AsyncMock(return_value=None)
+        s.executor.get_token_price = AsyncMock(return_value=0.001)
+        s.executor.positions = {}
+
+        await ws_module.process_buy_and_notify("MINT123ABC", "MET", score=5.0)
+
+        s.tracker.add_position.assert_not_called()
+        s.notifier.send_buy.assert_not_awaited()
+
+
+class TestTrailingStopNotification:
+    """process_sell_and_notify con reason=TRAILING_STOP notifica correctamente."""
+
+    async def test_trailing_stop_dry_run(self, monkeypatch) -> None:
+        from core.websocket import process_sell_and_notify as real_sell
+
+        monkeypatch.setattr(ws_module.config, "load_config", lambda: _fake_buy_cfg(dry_run=True))
+        notifier = _make_notifier()
+        monkeypatch.setattr(
+            "core.notifier.TelegramNotifier",
+            lambda **kw: notifier,
+        )
+        tracker_mock = MagicMock()
+        tracker_mock.get_position.return_value = None
+        monkeypatch.setattr("core.tracker.get_global_tracker", lambda: tracker_mock)
+
+        await real_sell("MINT123", "MET", reason="TRAILING_STOP", pnl=25.0)

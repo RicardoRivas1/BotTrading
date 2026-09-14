@@ -443,3 +443,115 @@ class TestGlobalTracker:
         assert isinstance(tracker, PositionTracker)
         # La instancia queda cacheada para futuras llamadas.
         assert tracker_module.get_global_tracker() is tracker
+
+
+class TestTrailingStop:
+    """Trailing stop: activación en umbral y venta por retroceso desde pico."""
+
+    def _make_config(
+        self,
+        tp: float = 100.0,
+        sl: float = 30.0,
+        activation: float = 20.0,
+        distance: float = 15.0,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            trading=SimpleNamespace(
+                TAKE_PROFIT_PCT=tp,
+                STOP_LOSS_PCT=sl,
+                TRAILING_STOP_ACTIVATION_PCT=activation,
+                TRAILING_STOP_DISTANCE_PCT=distance,
+                DRY_RUN=True,
+            ),
+        )
+
+    async def test_trailing_activa_y_dispara(
+        self, monkeypatch: pytest.MonkeyPatch, patch_sell: AsyncMock
+    ) -> None:
+        """PnL supera umbral de activación y luego retroceso excede distancia."""
+        cfg = self._make_config(activation=20.0, distance=15.0)
+        cfg.trading.PRICE_POLL_FALLBACK_SECONDS = 0.0  # sin caché de precio
+        monkeypatch.setattr(tracker_module, "get_pumpfun_price", AsyncMock(return_value=None))
+        tracker = PositionTracker(
+            executor=MagicMock(), notifier=MagicMock(), config=cfg,
+        )
+        tracker.executor.get_token_price = AsyncMock(return_value=0.001)
+        tracker.add_position("MINT1", "MET", 0.001, 0.05)
+
+        # Primer evaluate: precio actual = 0.0013 → PnL 30% → activa trailing
+        tracker.executor.get_token_price.return_value = 0.0013
+        await tracker._evaluate("MINT1")
+        pos = tracker.get_position("MINT1")
+        assert pos is not None
+        assert pos.trailing_active is True
+        patch_sell.assert_not_awaited()
+
+        # Segundo evaluate: precio cae a 0.0011 → PnL 10% → drawdown 20% > 15%
+        tracker.executor.get_token_price.return_value = 0.0011
+        await tracker._evaluate("MINT1")
+        patch_sell.assert_awaited_once()
+        assert patch_sell.await_args.kwargs["reason"] == "TRAILING_STOP"
+
+    async def test_trailing_no_activa_si_no_alcanza_umbral(
+        self, monkeypatch: pytest.MonkeyPatch, patch_sell: AsyncMock
+    ) -> None:
+        """PnL no llega al umbral de activación: trailing permanece inactivo."""
+        cfg = self._make_config(activation=20.0, distance=15.0)
+        cfg.trading.PRICE_POLL_FALLBACK_SECONDS = 0.0
+        monkeypatch.setattr(tracker_module, "get_pumpfun_price", AsyncMock(return_value=None))
+        tracker = PositionTracker(
+            executor=MagicMock(), notifier=MagicMock(), config=cfg,
+        )
+        tracker.executor.get_token_price = AsyncMock(return_value=0.001)
+        tracker.add_position("MINT1", "MET", 0.001, 0.05)
+
+        # PnL = 10% < 20% activation → no activa trailing
+        tracker.executor.get_token_price.return_value = 0.0011
+        await tracker._evaluate("MINT1")
+        pos = tracker.get_position("MINT1")
+        assert pos is not None
+        assert pos.trailing_active is False
+        patch_sell.assert_not_awaited()
+
+
+class TestTimeExpiredSinPrecio:
+    """TIME_EXPIRED para tokens muertos sin precio conocido."""
+
+    async def test_time_expired_sin_precio_cierra(
+        self, tracker: PositionTracker, patch_sell: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tracker_module, "MAX_HOLD_TIME_SEC", 1)
+        # Sin precio de ninguna fuente
+        tracker_module.get_pumpfun_price = AsyncMock(return_value=None)
+        tracker.executor.get_token_price = AsyncMock(side_effect=RuntimeError("sin API"))
+        tracker.add_position("MINT1", "MET", 0.001, 0.05)
+        pos = tracker.get_position("MINT1")
+        pos.created_at = time.time() - 60
+        await tracker._evaluate("MINT1")
+        patch_sell.assert_awaited_once()
+        assert patch_sell.await_args.kwargs["reason"] == "TIME_EXPIRED"
+
+    async def test_time_expired_sin_precio_no_cierra_si_vigente(
+        self, tracker: PositionTracker, patch_sell: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tracker_module, "MAX_HOLD_TIME_SEC", 9999)
+        tracker_module.get_pumpfun_price = AsyncMock(return_value=None)
+        tracker.executor.get_token_price = AsyncMock(side_effect=RuntimeError("sin API"))
+        tracker.add_position("MINT1", "MET", 0.001, 0.05)
+        await tracker._evaluate("MINT1")
+        patch_sell.assert_not_awaited()
+
+
+class TestRefreshException:
+    """Excepción en _refresh_position_price no bloquea el monitor."""
+
+    async def test_excepcion_en_refresh_retorna_cero(
+        self, tracker: PositionTracker, patch_sell: AsyncMock
+    ) -> None:
+        tracker_module.get_pumpfun_price = AsyncMock(side_effect=RuntimeError("boom"))
+        tracker.executor.get_token_price = AsyncMock(side_effect=RuntimeError("boom"))
+        tracker.add_position("MINT1", "MET", 0.001, 0.05)
+        await tracker._evaluate("MINT1")
+        pos = tracker.get_position("MINT1")
+        assert pos is not None
+        assert pos.current_price == 0.0

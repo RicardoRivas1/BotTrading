@@ -228,8 +228,8 @@ class TestPumpFun:
 
         price = await executor._get_price_from_pumpfun(MINT_PUMP)
 
-        # 100000 / 1000000000 = 0.0001 SOL
-        assert price == pytest.approx(0.0001)
+        # 100000/1e9 / 1000000000/1e6 = 0.0000001 / 1000 = 1e-7
+        assert price == pytest.approx(1e-7)
 
     async def test_fallback_a_reservas_reales(
         self, executor: JupiterExecutor, monkeypatch
@@ -239,7 +239,8 @@ class TestPumpFun:
 
         price = await executor._get_price_from_pumpfun(MINT_PUMP)
 
-        assert price == pytest.approx(0.00005)
+        # 50000/1e9 / 1000000000/1e6 = 5e-5 / 1000 = 5e-8
+        assert price == pytest.approx(5e-8)
 
     async def test_sin_precio_devuelve_cero(
         self, executor: JupiterExecutor, monkeypatch
@@ -580,14 +581,8 @@ def _patch_pumpportal(executor: JupiterExecutor, monkeypatch, captured: dict) ->
     monkeypatch.setattr(execution_mod, "VersionedTransaction", mock_vt)
 
     class _FakeClient:
-        def __init__(self, url: str) -> None:
-            self.url = url
-
-        async def __aenter__(self) -> "_FakeClient":
-            return self
-
-        async def __aexit__(self, *exc_info: object) -> bool:
-            return False
+        def __init__(self) -> None:
+            pass
 
         async def send_raw_transaction(
             self, raw_tx: bytes, opts: Optional[dict] = None
@@ -599,7 +594,7 @@ def _patch_pumpportal(executor: JupiterExecutor, monkeypatch, captured: dict) ->
             return SimpleNamespace(value=[SimpleNamespace(err=None)])
 
     captured["sent"] = []
-    monkeypatch.setattr(execution_mod, "AsyncClient", _FakeClient)
+    executor._rpc_client = _FakeClient()
 
 
 class TestSellPumpfun:
@@ -755,17 +750,11 @@ class TestConfirmacionOnChain:
     """Confirmación obligatoria on-chain de las transacciones."""
 
     def _fake_client(
-        self, monkeypatch, *, confirm_result=None, confirm_side_effect=None
+        self, executor: JupiterExecutor, *, confirm_result=None, confirm_side_effect=None
     ) -> None:
         class _FakeClient:
-            def __init__(self, url: str) -> None:
-                self.url = url
-
-            async def __aenter__(self) -> "_FakeClient":
-                return self
-
-            async def __aexit__(self, *exc_info: object) -> bool:
-                return False
+            def __init__(self) -> None:
+                pass
 
             async def send_raw_transaction(
                 self, raw_tx: bytes, opts: Optional[dict] = None
@@ -777,7 +766,7 @@ class TestConfirmacionOnChain:
                     raise confirm_side_effect
                 return confirm_result
 
-        monkeypatch.setattr(execution_mod, "AsyncClient", _FakeClient)
+        executor._rpc_client = _FakeClient()  # type: ignore[assignment]
 
     def _signed_tx(self, monkeypatch) -> MagicMock:
         fake_signed = MagicMock()
@@ -788,7 +777,7 @@ class TestConfirmacionOnChain:
         self, executor: JupiterExecutor, monkeypatch
     ) -> None:
         self._fake_client(
-            monkeypatch,
+            executor,
             confirm_result=SimpleNamespace(value=[SimpleNamespace(err=None)]),
         )
         sig = await executor._submit_signed_transaction(self._signed_tx(monkeypatch))
@@ -798,7 +787,7 @@ class TestConfirmacionOnChain:
         self, executor: JupiterExecutor, monkeypatch
     ) -> None:
         self._fake_client(
-            monkeypatch, confirm_side_effect=TimeoutError("sin confirmación en 30s")
+            executor, confirm_side_effect=TimeoutError("sin confirmación en 30s")
         )
         with pytest.raises(SwapExecutionError):
             await executor._submit_signed_transaction(
@@ -809,7 +798,7 @@ class TestConfirmacionOnChain:
         self, executor: JupiterExecutor, monkeypatch
     ) -> None:
         revert = SimpleNamespace(err="insufficient funds")
-        self._fake_client(monkeypatch, confirm_result=SimpleNamespace(value=[revert]))
+        self._fake_client(executor, confirm_result=SimpleNamespace(value=[revert]))
         with pytest.raises(SwapExecutionError, match="reversada"):
             await executor._submit_signed_transaction(
                 self._signed_tx(monkeypatch), require_confirmation=True
@@ -818,7 +807,7 @@ class TestConfirmacionOnChain:
     async def test_venta_lenient_devuelve_txid_aunque_no_se_confirme(
         self, executor: JupiterExecutor, monkeypatch
     ) -> None:
-        self._fake_client(monkeypatch, confirm_side_effect=TimeoutError("no confirmó"))
+        self._fake_client(executor, confirm_side_effect=TimeoutError("no confirmó"))
         sig = await executor._submit_signed_transaction(
             self._signed_tx(monkeypatch), require_confirmation=False
         )
