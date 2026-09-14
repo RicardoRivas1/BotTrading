@@ -42,6 +42,10 @@ _ERROR_RESUBSCRIBE_SECONDS = 5.0
 # Solo se usa la clave soportada 'method' (sin 'op' ni 'action').
 _SUBSCRIBE_PAYLOAD = {"method": "subscribeNewToken"}
 
+# Liquidez mínima en SOL para aceptar un token en Pump.fun bonding curve.
+# Tokens con menos de esto son demasiado ilíquidos para tradeo rentable.
+_MIN_LIQUIDITY_SOL = float(os.getenv("MIN_LIQUIDITY_SOL", "0.5"))
+
 # User-Agent de navegador para eludir bloqueos básicos de Cloudflare.
 _USER_AGENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -79,25 +83,57 @@ def resolve_symbol(symbol: Any, mint: Any = None) -> str:
     return "N/A"
 
 
+async def check_liquidity(mint: str) -> bool:
+    """Verifica que el token tenga liquidez mínima en la bonding curve.
+
+    Para tokens de Pump.fun (sufijo 'pump') consulta las reservas virtuales
+    de SOL. Para otros tokens consulta DexScreener. Devuelve False si la
+    liquidez es insuficiente o la API no responde.
+    """
+    if not str(mint).lower().endswith("pump"):
+        return True
+
+    try:
+        url = f"https://frontend-api.pump.fun/coins/{mint}"
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger.debug("Pump.fun no respondió para liquidez de {}", mint)
+                    return True
+                data = await resp.json()
+
+        virtual_sol = data.get("virtual_sol_reserves")
+        if virtual_sol:
+            sol_liquidity = float(virtual_sol) / 1e9
+            if sol_liquidity < _MIN_LIQUIDITY_SOL:
+                logger.info(
+                    "💧 Liquidez insuficiente para {}: {:.4f} SOL (mínimo: {:.4f} SOL)",
+                    mint, sol_liquidity, _MIN_LIQUIDITY_SOL,
+                )
+                return False
+            logger.debug("Liquidez de {}: {:.4f} SOL ✓", mint, sol_liquidity)
+    except Exception as exc:
+        logger.debug("No se pudo verificar liquidez de {}: {}", mint, exc)
+
+    return True
+
+
 async def process_buy_and_notify(
     mint: str, symbol: str = "N/A", score: Optional[float] = None
 ) -> None:
-    """Ejecuta una compra de prueba (simulada) y notifica a Telegram."""
-    from core.execution import JupiterExecutor
+    """Ejecuta una compra (real o simulada) y notifica a Telegram.
+
+    Reutiliza el executor global del tracker en lugar de crear uno nuevo
+    cada vez, lo que evita escaneos BIP44 redundantes y mantiene el estado
+    de posiciones centralizado.
+    """
     from core.notifier import TelegramNotifier
+    from core.tracker import get_global_tracker
 
     cfg = config.load_config()
-    executor = JupiterExecutor(
-        private_key=cfg.solana.PRIVATE_KEY,
-        rpc_url=cfg.solana.HELIUS_RPC_URL,
-        slippage_bps=cfg.trading.SLIPPAGE_BPS,
-        buy_amount_sol=cfg.trading.BUY_AMOUNT_SOL,
-        take_profit_pct=cfg.trading.TAKE_PROFIT_PCT,
-        stop_loss_pct=cfg.trading.STOP_LOSS_PCT,
-        trailing_activation_pct=cfg.trading.TRAILING_STOP_ACTIVATION_PCT,
-        trailing_distance_pct=cfg.trading.TRAILING_STOP_DISTANCE_PCT,
-        dry_run=cfg.trading.DRY_RUN,
-    )
+    tracker = get_global_tracker()
+    executor = tracker.executor
 
     # Nunca registrar ni notificar symbol "N/A": si el ticker no viene en la
     # señal, se consulta DexScreener/Pump.fun (baseToken.symbol -> ej: "MET")
@@ -148,8 +184,6 @@ async def process_buy_and_notify(
             logger.warning(f"No se pudo consultar precio de entrada de {mint}: {exc}")
 
     if not entry_price or entry_price <= 0:
-        # Entrada PENDIENTE (sin precio real en ningún endpoint): no es un error
-        # operativo. El tracker la fijará como BASE con el primer precio real.
         logger.warning(
             f"📌 Precio de entrada PENDIENTE para {symbol} ({mint}); "
             f"el tracker fijará el entry base real."
@@ -164,11 +198,6 @@ async def process_buy_and_notify(
         dry_run=cfg.trading.DRY_RUN,
     )
 
-    # Registro de la posición activa en la memoria global del tracker para que
-    # el bucle de monitoreo (TP/SL) la vigile en segundo plano.
-    from core.tracker import get_global_tracker
-
-    tracker = get_global_tracker()
     tracker.add_position(
         mint=mint,
         symbol=symbol,
@@ -227,6 +256,8 @@ async def process_sell_and_notify(
         await notifier.send_take_profit(mint, pnl)
     elif reason == "STOP_LOSS":
         await notifier.send_stop_loss(mint, pnl)
+    elif reason == "TRAILING_STOP":
+        await notifier.send_trailing_stop(mint, pnl)
     else:
         await notifier.send_status(f"Venta de {symbol} ({mint}) por {reason} (PnL {pnl:.2f}%)")
     return True
@@ -314,8 +345,12 @@ class TokenWebSocket:
                         # FORCE_TEST_BUY: disparo único de compra de prueba (modo diagnóstico).
                         if os.getenv("FORCE_TEST_BUY", "False").lower() == "true":
                             logger.info(f"🚀 [FORCE_TEST_BUY ACTIVADO] Forzando compra de prueba para {mint} ({symbol})")
+                            if not await check_liquidity(mint):
+                                logger.info(f"Omitiendo {mint} por liquidez insuficiente.")
+                                os.environ["FORCE_TEST_BUY"] = "False"
+                                continue
                             try:
-                                await process_buy_and_notify(mint, symbol)  # Llama a tu función de simulación/Jupiter y Telegram
+                                await process_buy_and_notify(mint, symbol)
                             except Exception as exc:  # noqa: BLE001 - nunca colgar el listener
                                 logger.error(f"❌ Error al forzar compra de prueba para {mint}: {exc}")
                             os.environ["FORCE_TEST_BUY"] = "False"
@@ -331,6 +366,8 @@ class TokenWebSocket:
                                     f"⚠️ Token con Score 0 (sin analizar en RugCheck) para {mint}. Omitiendo por seguridad..."
                                 )
                             elif score <= max_score:
+                                if not await check_liquidity(mint):
+                                    continue
                                 logger.info(
                                     f"✅ Token APROBADO por RugCheck (Score: {score} <= {max_score}). Ejecutando compra..."
                                 )

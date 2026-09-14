@@ -186,6 +186,10 @@ class JupiterExecutor:
         self.trailing_distance_pct = trailing_distance_pct
         self.dry_run = dry_run
 
+        # Cliente RPC persistente: se reutiliza en todas las llamadas en vez
+        # de crear un nuevo AsyncClient (y su pool HTTP) por cada petición.
+        self._rpc_client: AsyncClient = AsyncClient(rpc_url)
+
         self.positions: dict[str, Position] = {}
         # Tokens detectados en la bonding curve de Pump.fun (sin ruta en
         # Jupiter/Raydium): para ellos se salta Jupiter y se vende directo.
@@ -314,41 +318,41 @@ class JupiterExecutor:
         En modo venta (`require_confirmation=False`) no se re-lanza: se devuelve
         el txid recibido para evitar reintentos que dupliquen la salida.
         """
-        async with AsyncClient(self.rpc_url) as client:
-            opts = TxOpts(skip_preflight=True, skip_confirmation=True)
-            res = await client.send_raw_transaction(
-                bytes(signed_tx), opts=opts  # type: ignore[arg-type]
+        client = self._rpc_client
+        opts = TxOpts(skip_preflight=True, skip_confirmation=True)
+        res = await client.send_raw_transaction(
+            bytes(signed_tx), opts=opts  # type: ignore[arg-type]
+        )
+        if not res.value:
+            raise SwapExecutionError("Respuesta de envío sin firma")
+        txid = res.value
+
+        try:
+            confirmation = await client.confirm_transaction(txid, commitment="confirmed")
+        except Exception as exc:  # noqa: BLE001 - timeout/RPC del proveedor
+            logger.error(
+                "No se pudo confirmar la transacción {} (timeout/RPC): {}", txid, exc
             )
-            if not res.value:
-                raise SwapExecutionError("Respuesta de envío sin firma")
-            txid = res.value
+            if require_confirmation:
+                raise SwapExecutionError(
+                    f"Transacción NO confirmada on-chain ({txid}): {exc}"
+                ) from exc
+            logger.success("Swap enviado pero sin confirmar: {}", txid)
+            return txid
 
-            try:
-                confirmation = await client.confirm_transaction(txid, commitment="confirmed")
-            except Exception as exc:  # noqa: BLE001 - timeout/RPC del proveedor
-                logger.error(
-                    "No se pudo confirmar la transacción {} (timeout/RPC): {}", txid, exc
+        status = confirmation.value[0] if confirmation.value else None
+        if status is None or status.err is not None:
+            logger.error(
+                "Transacción NO confirmada/revertida on-chain (estado={}): {}",
+                status.err if status else "sin estado", txid,
+            )
+            if require_confirmation:
+                raise SwapExecutionError(
+                    f"Transacción reversada/descartada ({txid}): "
+                    f"{status.err if status else 'sin estado'}"
                 )
-                if require_confirmation:
-                    raise SwapExecutionError(
-                        f"Transacción NO confirmada on-chain ({txid}): {exc}"
-                    ) from exc
-                logger.success("Swap enviado pero sin confirmar: {}", txid)
-                return txid
-
-            status = confirmation.value[0] if confirmation.value else None
-            if status is None or status.err is not None:
-                logger.error(
-                    "Transacción NO confirmada/revertida on-chain (estado={}): {}",
-                    status.err if status else "sin estado", txid,
-                )
-                if require_confirmation:
-                    raise SwapExecutionError(
-                        f"Transacción reversada/descartada ({txid}): "
-                        f"{status.err if status else 'sin estado'}"
-                    )
-                logger.success("Swap enviado: {}", txid)
-                return txid
+            logger.success("Swap enviado: {}", txid)
+            return txid
 
         logger.success("Transacción confirmada on-chain: {}", txid)
         return txid
@@ -441,7 +445,10 @@ class JupiterExecutor:
         if simulate:
             entry_price_sol = 0.0
             try:
-                entry_price_sol = await self.get_token_price(token_mint)
+                if via_pumpfun:
+                    entry_price_sol = await self._get_price_from_pumpfun(token_mint)
+                else:
+                    entry_price_sol = await self.get_token_price(token_mint)
             except Exception:
                 pass
         else:
@@ -490,14 +497,13 @@ class JupiterExecutor:
         )
         # Pre-flight: verificar balance SOL de la wallet
         try:
-            async with AsyncClient(self.rpc_url) as client:
-                balance_resp = await client.get_balance(Pubkey.from_string(wallet_pubkey_str))
-                wallet_sol = balance_resp.value / 1_000_000_000 if balance_resp.value else 0.0
-                logger.debug("Wallet SOL balance: {:.6f} SOL (necesario: ~{:.6f})", wallet_sol, amount_sol + 0.001)
-                if wallet_sol < amount_sol + 0.001:
-                    raise SwapExecutionError(
-                        f"Balance SOL insuficiente: {wallet_sol:.6f} SOL (requiere ~{amount_sol + 0.001:.6f} SOL)"
-                    )
+            balance_resp = await self._rpc_client.get_balance(Pubkey.from_string(wallet_pubkey_str))
+            wallet_sol = balance_resp.value / 1_000_000_000 if balance_resp.value else 0.0
+            logger.debug("Wallet SOL balance: {:.6f} SOL (necesario: ~{:.6f})", wallet_sol, amount_sol + 0.001)
+            if wallet_sol < amount_sol + 0.001:
+                raise SwapExecutionError(
+                    f"Balance SOL insuficiente: {wallet_sol:.6f} SOL (requiere ~{amount_sol + 0.001:.6f} SOL)"
+                )
         except Exception as exc:
             logger.warning("No se pudo verificar balance SOL pre-vuelo: {}", exc)
 
@@ -541,11 +547,10 @@ class JupiterExecutor:
         ata = get_associated_token_address(
             self.keypair.pubkey(), Pubkey.from_string(token_mint)
         )
-        async with AsyncClient(self.rpc_url) as client:
-            resp = await client.get_token_account_balance(ata)
-            if not resp.value or resp.value.ui_amount is None:
-                return 0.0
-            return float(resp.value.ui_amount)
+        resp = await self._rpc_client.get_token_account_balance(ata)
+        if not resp.value or resp.value.ui_amount is None:
+            return 0.0
+        return float(resp.value.ui_amount)
 
     async def sell_token(
         self,
@@ -768,8 +773,8 @@ class JupiterExecutor:
         virtual_tokens = data.get("virtual_token_reserves")
         if virtual_sol and virtual_tokens:
             try:
-                vsol = float(virtual_sol)
-                vtok = float(virtual_tokens)
+                vsol = float(virtual_sol) / 1e9
+                vtok = float(virtual_tokens) / 1e6
                 if vtok > 0:
                     return vsol / vtok
             except (ValueError, TypeError):
@@ -779,18 +784,10 @@ class JupiterExecutor:
         token_reserves = data.get("token_reserves")
         if sol_reserves and token_reserves:
             try:
-                sol_r = float(sol_reserves)
-                tok_r = float(token_reserves)
+                sol_r = float(sol_reserves) / 1e9
+                tok_r = float(token_reserves) / 1e6
                 if tok_r > 0:
                     return sol_r / tok_r
-            except (ValueError, TypeError):
-                pass
-
-        sol_supply = data.get("sol_supply")
-        token_supply = data.get("token_supply")
-        if sol_supply and token_supply:
-            try:
-                return float(sol_supply) / float(token_supply)
             except (ValueError, TypeError):
                 pass
 
@@ -927,10 +924,9 @@ class JupiterExecutor:
     async def _get_token_decimals(self, token_mint: str) -> int:
         """Consulta los decimales del token vía RPC mediante get_token_supply."""
         try:
-            async with AsyncClient(self.rpc_url) as client:
-                resp = await client.get_token_supply(Pubkey.from_string(token_mint))
-                if resp.value and resp.value.decimals is not None:
-                    return resp.value.decimals
+            resp = await self._rpc_client.get_token_supply(Pubkey.from_string(token_mint))
+            if resp.value and resp.value.decimals is not None:
+                return resp.value.decimals
         except Exception as exc:
             logger.warning("No se pudieron obtener decimales para {}: {}", token_mint, exc)
 

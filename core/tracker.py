@@ -94,6 +94,7 @@ class TrackerPosition:
     current_price_updated_at: float = 0.0
     latest_pnl_pct: float = 0.0
     highest_pnl_pct: float = 0.0
+    trailing_active: bool = False
     max_hold_seconds: float = field(default_factory=lambda: float(MAX_HOLD_TIME_SEC))
     last_progress_notify_at: float = 0.0
     last_notified_pnl_pct: float = 0.0
@@ -255,6 +256,30 @@ class PositionTracker:
             if ok:
                 self.remove_position(mint)
             return
+
+        # --- TRAILING STOP: proteger ganancias cuando el precio retrocede ---
+        trailing_activation = float(
+            getattr(self.config.trading, "TRAILING_STOP_ACTIVATION_PCT", 0.0) or 0.0
+        )
+        trailing_distance = float(
+            getattr(self.config.trading, "TRAILING_STOP_DISTANCE_PCT", 0.0) or 0.0
+        )
+        if trailing_activation > 0 and trailing_distance > 0:
+            if pnl_pct >= trailing_activation:
+                pos.trailing_active = True
+            if pos.trailing_active and pos.highest_pnl_pct > 0:
+                drawdown = pos.highest_pnl_pct - pnl_pct
+                if drawdown >= trailing_distance:
+                    logger.info(
+                        "🛡️ TRAILING STOP (desde pico {:+.2f}%, retroceso {:.2f}%) para {} ({})",
+                        pos.highest_pnl_pct, drawdown, mint, pos.symbol,
+                    )
+                    ok = await process_sell_and_notify(
+                        pos.mint, pos.symbol, reason="TRAILING_STOP", pnl=pnl_pct,
+                    )
+                    if ok:
+                        self.remove_position(mint)
+                    return
 
         # --- TIME_EXPIRED: cierre forzado si se superó el hold máximo ---
         if now - pos.created_at > MAX_HOLD_TIME_SEC:
