@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from typing import Optional
 
 from aiohttp import web
 from loguru import logger
@@ -24,9 +23,8 @@ from core.engine import StrategyEngine
 from core.execution import JupiterExecutor
 from core.notifier import TelegramNotifier
 from core.tracker import PositionTracker, set_global_tracker
-from strategies.memecoin import MemecoinSniper
-from strategies.copy_trading import CopyTradingStrategy
 from strategies.arbitrage import ArbitrageStrategy
+from strategies.copy_trading import CopyTradingStrategy
 from strategies.dca import DCAStrategy
 
 # -- Configuracion inicial de loguru ------------------------------------------

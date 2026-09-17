@@ -13,8 +13,6 @@ Flujo:
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import os
 import time
 from dataclasses import dataclass, field
@@ -125,7 +123,7 @@ class CopyTrader:
         labels_str = os.getenv("COPY_TRADE_WALLET_LABELS", "")
         if addresses_str:
             addresses = [a.strip() for a in addresses_str.split(",") if a.strip()]
-            labels = [l.strip() for l in labels_str.split(",")] if labels_str else []
+            labels = [lbl.strip() for lbl in labels_str.split(",")] if labels_str else []
             for i, addr in enumerate(addresses):
                 label = labels[i] if i < len(labels) else f"Trader-{i+1}"
                 if addr not in self.wallets:
@@ -173,7 +171,7 @@ class CopyTrader:
         tx_type = tx.get("type", "")
         fee_payer = tx.get("feePayer", "")
         signature = tx.get("signature", "")
-        timestamp = tx.get("timestamp", 0)
+        _timestamp = tx.get("timestamp", 0)
 
         # Solo procesar tipos de swap/compra/venta
         if tx_type not in COPY_TRADE_TYPES:
@@ -214,7 +212,7 @@ class CopyTrader:
         # Analizar tokenTransfers para determinar la accion
         token_transfers = tx.get("tokenTransfers", [])
         native_transfers = tx.get("nativeTransfers", [])
-        account_data = tx.get("accountData", [])
+        _account_data = tx.get("accountData", [])
 
         # Buscar transfers de SOL del fee_payer (indicador de compra)
         sol_spent = 0.0
@@ -286,7 +284,6 @@ class CopyTrader:
 
     async def _execute_copy_trade(self, signal: CopyTradeSignal) -> None:
         """Ejecuta un copy trade basado en la senal detectada."""
-        from core.websocket import process_buy_and_notify
 
         async with self._lock:
             # Verificar si ya tenemos posicion en este token

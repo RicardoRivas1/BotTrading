@@ -6,7 +6,7 @@ su lifecycle (start, stop, pause, resume) dentro del bot.
 
 from __future__ import annotations
 
-from core.engine.strategy import Strategy, StrategyState
 from core.engine.engine import StrategyEngine
+from core.engine.strategy import Strategy, StrategyState
 
 __all__ = ["Strategy", "StrategyState", "StrategyEngine"]
