@@ -52,3 +52,189 @@
 2026-08-31 23:54:08.996 | INFO     | __main__:run:92 - Iniciando bot de memecoins en Solana...
 2026-08-31 23:54:09.189 | INFO     | core.websocket:_connect_and_listen:59 - Conectado al WebSocket: wss://pumpportal.fun/api/data
 2026-08-31 23:54:09.190 | INFO     | core.websocket:_connect_and_listen:64 - Suscrito exitosamente al feed de nuevos tokens (subscribeNewToken).
+2026-09-16 18:42:44.710 | INFO     | core.execution:cargar_keypair_desde_env:109 - Escaneando subcuentas de las 24 palabras en la red Solana...
+2026-09-16 18:42:46.093 | INFO     | core.execution:cargar_keypair_desde_env:141 - WALLET SELECCIONADA: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF (Saldo: 0 SOL)
+2026-09-16 18:42:46.342 | INFO     | __main__:run:162 - === TradingBot Framework Modular ===
+2026-09-16 18:42:46.342 | INFO     | __main__:run:163 - Wallet: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF
+2026-09-16 18:42:46.342 | INFO     | __main__:run:164 - RPC: 9a3e97db-abca-4bc8-bc9d-a4c2295c2738
+2026-09-16 18:42:46.342 | INFO     | __main__:run:165 - Estrategias: []
+2026-09-16 18:42:46.343 | INFO     | core.engine.engine:start_all:77 - Engine iniciado: 0 estrategias activas
+2026-09-16 18:42:46.343 | INFO     | core.notifier:start_heartbeat:258 - Heartbeat iniciado cada 30 min.
+2026-09-16 18:42:46.343 | INFO     | core.tracker:monitor_positions:158 - Monitoreo de posiciones iniciado (cada 2s)
+2026-09-16 18:43:38.170 | INFO     | core.execution:cargar_keypair_desde_env:109 - Escaneando subcuentas de las 24 palabras en la red Solana...
+2026-09-16 18:43:38.552 | INFO     | core.execution:cargar_keypair_desde_env:141 - WALLET SELECCIONADA: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF (Saldo: 0 SOL)
+2026-09-16 18:43:38.575 | INFO     | __main__:run:162 - === TradingBot Framework Modular ===
+2026-09-16 18:43:38.575 | INFO     | __main__:run:163 - Wallet: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF
+2026-09-16 18:43:38.575 | INFO     | __main__:run:164 - RPC: 9a3e97db-abca-4bc8-bc9d-a4c2295c2738
+2026-09-16 18:43:38.575 | INFO     | __main__:run:165 - Estrategias: []
+2026-09-16 18:43:38.575 | INFO     | core.engine.engine:start_all:77 - Engine iniciado: 0 estrategias activas
+2026-09-16 18:43:38.576 | INFO     | core.notifier:start_heartbeat:258 - Heartbeat iniciado cada 30 min.
+2026-09-16 18:43:38.576 | INFO     | core.tracker:monitor_positions:158 - Monitoreo de posiciones iniciado (cada 2s)
+2026-09-16 18:44:49.430 | INFO     | core.execution:cargar_keypair_desde_env:109 - Escaneando subcuentas de las 24 palabras en la red Solana...
+2026-09-16 18:44:49.748 | INFO     | core.execution:cargar_keypair_desde_env:141 - WALLET SELECCIONADA: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF (Saldo: 0 SOL)
+2026-09-16 18:44:49.768 | INFO     | strategies.copy_trading:_load_wallets:114 - CopyTrading: wallet cargada: Cupsey (6NwarBvD...)
+2026-09-16 18:44:49.768 | INFO     | strategies.copy_trading:_load_wallets:114 - CopyTrading: wallet cargada: J777Crypto (4UrFSCrG...)
+2026-09-16 18:44:49.768 | INFO     | strategies.copy_trading:_load_wallets:125 - CopyTrading: 2 wallets monitoreadas
+2026-09-16 18:44:49.768 | INFO     | core.engine.engine:register:48 - Estrategia registrada: CopyTrading
+2026-09-16 18:44:49.768 | INFO     | __main__:run:162 - === TradingBot Framework Modular ===
+2026-09-16 18:44:49.768 | INFO     | __main__:run:163 - Wallet: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF
+2026-09-16 18:44:49.768 | INFO     | __main__:run:164 - RPC: 9a3e97db-abca-4bc8-bc9d-a4c2295c2738
+2026-09-16 18:44:49.768 | INFO     | __main__:run:165 - Estrategias: ['CopyTrading']
+2026-09-16 18:44:49.768 | WARNING  | __main__:_setup_helius_webhook:239 - URL publica no detectada. Configura WEBHOOK_BASE_URL en .env
+2026-09-16 18:44:49.769 | INFO     | __main__:shutdown:244 - Apagando bot...
+2026-09-16 18:44:49.769 | INFO     | strategies.copy_trading:stop:137 - CopyTrading: estrategia detenida
+2026-09-16 18:44:49.769 | INFO     | core.engine.engine:stop_all:100 - Engine detenido.
+2026-09-16 18:44:49.769 | INFO     | __main__:main:258 - Bot finalizado.
+2026-09-16 18:46:03.517 | INFO     | core.execution:cargar_keypair_desde_env:109 - Escaneando subcuentas de las 24 palabras en la red Solana...
+2026-09-16 18:46:03.828 | INFO     | core.execution:cargar_keypair_desde_env:141 - WALLET SELECCIONADA: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF (Saldo: 0 SOL)
+2026-09-16 18:46:03.848 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: Cupsey (6NwarBvD...)
+2026-09-16 18:46:03.848 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: J777Crypto (4UrFSCrG...)
+2026-09-16 18:46:03.848 | INFO     | strategies.copy_trading:_load_wallets:129 - CopyTrading: 2 wallets monitoreadas
+2026-09-16 18:46:03.848 | INFO     | core.engine.engine:register:48 - Estrategia registrada: CopyTrading
+2026-09-16 18:46:03.848 | INFO     | __main__:run:162 - === TradingBot Framework Modular ===
+2026-09-16 18:46:03.848 | INFO     | __main__:run:163 - Wallet: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF
+2026-09-16 18:46:03.848 | INFO     | __main__:run:164 - RPC: 9a3e97db-abca-4bc8-bc9d-a4c2295c2738
+2026-09-16 18:46:03.848 | INFO     | __main__:run:165 - Estrategias: ['CopyTrading']
+2026-09-16 18:46:03.848 | WARNING  | __main__:_setup_helius_webhook:239 - URL publica no detectada. Configura WEBHOOK_BASE_URL en .env
+2026-09-16 18:46:03.849 | INFO     | __main__:shutdown:244 - Apagando bot...
+2026-09-16 18:46:03.849 | INFO     | strategies.copy_trading:stop:141 - CopyTrading: estrategia detenida
+2026-09-16 18:46:03.849 | INFO     | core.engine.engine:stop_all:100 - Engine detenido.
+2026-09-16 18:46:03.849 | INFO     | __main__:main:258 - Bot finalizado.
+2026-09-16 18:46:25.566 | INFO     | core.execution:cargar_keypair_desde_env:109 - Escaneando subcuentas de las 24 palabras en la red Solana...
+2026-09-16 18:46:25.869 | INFO     | core.execution:cargar_keypair_desde_env:141 - WALLET SELECCIONADA: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF (Saldo: 0 SOL)
+2026-09-16 18:46:25.888 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: Cupsey (6NwarBvD...)
+2026-09-16 18:46:25.888 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: J777Crypto (4UrFSCrG...)
+2026-09-16 18:46:25.888 | INFO     | strategies.copy_trading:_load_wallets:129 - CopyTrading: 2 wallets monitoreadas
+2026-09-16 18:46:25.889 | INFO     | core.engine.engine:register:48 - Estrategia registrada: CopyTrading
+2026-09-16 18:46:25.889 | INFO     | __main__:run:162 - === TradingBot Framework Modular ===
+2026-09-16 18:46:25.889 | INFO     | __main__:run:163 - Wallet: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF
+2026-09-16 18:46:25.889 | INFO     | __main__:run:164 - RPC: 9a3e97db-abca-4bc8-bc9d-a4c2295c2738
+2026-09-16 18:46:25.889 | INFO     | __main__:run:165 - Estrategias: ['CopyTrading']
+2026-09-16 18:46:25.889 | WARNING  | __main__:_setup_helius_webhook:239 - URL publica no detectada. Configura WEBHOOK_BASE_URL en .env
+2026-09-16 18:46:25.889 | INFO     | core.engine.engine:start_all:77 - Engine iniciado: 1 estrategias activas
+2026-09-16 18:46:25.889 | INFO     | strategies.copy_trading:start:136 - CopyTrading: estrategia iniciada (2 wallets)
+2026-09-16 18:46:25.889 | INFO     | core.notifier:start_heartbeat:258 - Heartbeat iniciado cada 30 min.
+2026-09-16 18:46:25.889 | INFO     | core.tracker:monitor_positions:158 - Monitoreo de posiciones iniciado (cada 2s)
+2026-09-16 19:00:58.458 | INFO     | core.execution:cargar_keypair_desde_env:109 - Escaneando subcuentas de las 24 palabras en la red Solana...
+2026-09-16 19:00:58.799 | INFO     | core.execution:cargar_keypair_desde_env:141 - WALLET SELECCIONADA: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF (Saldo: 0 SOL)
+2026-09-16 19:00:58.825 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: Cupsey (6NwarBvD...)
+2026-09-16 19:00:58.826 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: J777Crypto (4UrFSCrG...)
+2026-09-16 19:00:58.826 | INFO     | strategies.copy_trading:_load_wallets:129 - CopyTrading: 2 wallets monitoreadas
+2026-09-16 19:00:58.826 | INFO     | core.engine.engine:register:48 - Estrategia registrada: CopyTrading
+2026-09-16 19:00:58.826 | INFO     | __main__:run:162 - === TradingBot Framework Modular ===
+2026-09-16 19:00:58.826 | INFO     | __main__:run:163 - Wallet: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF
+2026-09-16 19:00:58.826 | INFO     | __main__:run:164 - RPC: 9a3e97db-abca-4bc8-bc9d-a4c2295c2738
+2026-09-16 19:00:58.826 | INFO     | __main__:run:165 - Estrategias: ['CopyTrading']
+2026-09-16 19:00:58.826 | INFO     | __main__:_setup_helius_webhook:229 - Configurando Helius webhook...
+2026-09-16 19:00:58.826 | WARNING  | strategies.copy_trading:setup_helius_webhook:398 - CopyTrading: no se encontro HELIUS_API_KEY
+2026-09-16 19:00:58.826 | WARNING  | __main__:_setup_helius_webhook:234 - No se pudo crear webhook. Crea manualmente en https://dashboard.helius.dev/webhooks
+2026-09-16 19:00:58.827 | INFO     | core.engine.engine:start_all:77 - Engine iniciado: 1 estrategias activas
+2026-09-16 19:00:58.827 | INFO     | strategies.copy_trading:start:136 - CopyTrading: estrategia iniciada (2 wallets)
+2026-09-16 19:00:58.827 | INFO     | core.notifier:start_heartbeat:258 - Heartbeat iniciado cada 30 min.
+2026-09-16 19:00:58.827 | INFO     | core.tracker:monitor_positions:158 - Monitoreo de posiciones iniciado (cada 2s)
+2026-09-16 19:02:06.187 | INFO     | core.execution:cargar_keypair_desde_env:109 - Escaneando subcuentas de las 24 palabras en la red Solana...
+2026-09-16 19:02:06.508 | INFO     | core.execution:cargar_keypair_desde_env:141 - WALLET SELECCIONADA: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF (Saldo: 0 SOL)
+2026-09-16 19:02:06.534 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: Cupsey (6NwarBvD...)
+2026-09-16 19:02:06.535 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: J777Crypto (4UrFSCrG...)
+2026-09-16 19:02:06.535 | INFO     | strategies.copy_trading:_load_wallets:129 - CopyTrading: 2 wallets monitoreadas
+2026-09-16 19:02:06.535 | INFO     | core.engine.engine:register:48 - Estrategia registrada: CopyTrading
+2026-09-16 19:02:06.535 | INFO     | __main__:run:162 - === TradingBot Framework Modular ===
+2026-09-16 19:02:06.535 | INFO     | __main__:run:163 - Wallet: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF
+2026-09-16 19:02:06.536 | INFO     | __main__:run:164 - RPC: 9a3e97db-abca-4bc8-bc9d-a4c2295c2738
+2026-09-16 19:02:06.536 | INFO     | __main__:run:165 - Estrategias: ['CopyTrading']
+2026-09-16 19:02:06.536 | INFO     | __main__:_setup_helius_webhook:229 - Configurando Helius webhook...
+2026-09-16 19:02:07.127 | ERROR    | strategies.copy_trading:setup_helius_webhook:440 - Error creando webhook: {"message":["Each transaction type must be a valid TransactionType"],"error":"Bad Request","statusCode":400}
+2026-09-16 19:02:07.136 | WARNING  | __main__:_setup_helius_webhook:234 - No se pudo crear webhook. Crea manualmente en https://dashboard.helius.dev/webhooks
+2026-09-16 19:02:07.136 | INFO     | core.engine.engine:start_all:77 - Engine iniciado: 1 estrategias activas
+2026-09-16 19:02:07.136 | INFO     | strategies.copy_trading:start:136 - CopyTrading: estrategia iniciada (2 wallets)
+2026-09-16 19:02:07.137 | INFO     | core.notifier:start_heartbeat:258 - Heartbeat iniciado cada 30 min.
+2026-09-16 19:02:07.137 | INFO     | core.tracker:monitor_positions:158 - Monitoreo de posiciones iniciado (cada 2s)
+2026-09-16 19:02:56.672 | INFO     | core.execution:cargar_keypair_desde_env:109 - Escaneando subcuentas de las 24 palabras en la red Solana...
+2026-09-16 19:02:56.972 | INFO     | core.execution:cargar_keypair_desde_env:141 - WALLET SELECCIONADA: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF (Saldo: 0 SOL)
+2026-09-16 19:02:56.992 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: Cupsey (6NwarBvD...)
+2026-09-16 19:02:56.992 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: J777Crypto (4UrFSCrG...)
+2026-09-16 19:02:56.992 | INFO     | strategies.copy_trading:_load_wallets:129 - CopyTrading: 2 wallets monitoreadas
+2026-09-16 19:02:56.992 | INFO     | core.engine.engine:register:48 - Estrategia registrada: CopyTrading
+2026-09-16 19:02:56.992 | INFO     | __main__:run:162 - === TradingBot Framework Modular ===
+2026-09-16 19:02:56.992 | INFO     | __main__:run:163 - Wallet: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF
+2026-09-16 19:02:56.992 | INFO     | __main__:run:164 - RPC: 9a3e97db-abca-4bc8-bc9d-a4c2295c2738
+2026-09-16 19:02:56.992 | INFO     | __main__:run:165 - Estrategias: ['CopyTrading']
+2026-09-16 19:02:56.993 | INFO     | __main__:_setup_helius_webhook:229 - Configurando Helius webhook...
+2026-09-16 19:02:57.551 | ERROR    | strategies.copy_trading:setup_helius_webhook:440 - Error creando webhook: {"message":["Transaction status must be one of: all, success, or failed"],"error":"Bad Request","statusCode":400}
+2026-09-16 19:02:57.551 | WARNING  | __main__:_setup_helius_webhook:234 - No se pudo crear webhook. Crea manualmente en https://dashboard.helius.dev/webhooks
+2026-09-16 19:02:57.552 | INFO     | core.engine.engine:start_all:77 - Engine iniciado: 1 estrategias activas
+2026-09-16 19:02:57.552 | INFO     | strategies.copy_trading:start:136 - CopyTrading: estrategia iniciada (2 wallets)
+2026-09-16 19:02:57.552 | INFO     | core.notifier:start_heartbeat:258 - Heartbeat iniciado cada 30 min.
+2026-09-16 19:02:57.552 | INFO     | core.tracker:monitor_positions:158 - Monitoreo de posiciones iniciado (cada 2s)
+2026-09-16 19:03:50.198 | INFO     | core.execution:cargar_keypair_desde_env:109 - Escaneando subcuentas de las 24 palabras en la red Solana...
+2026-09-16 19:03:50.507 | INFO     | core.execution:cargar_keypair_desde_env:141 - WALLET SELECCIONADA: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF (Saldo: 0 SOL)
+2026-09-16 19:03:50.527 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: Cupsey (6NwarBvD...)
+2026-09-16 19:03:50.528 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: J777Crypto (4UrFSCrG...)
+2026-09-16 19:03:50.528 | INFO     | strategies.copy_trading:_load_wallets:129 - CopyTrading: 2 wallets monitoreadas
+2026-09-16 19:03:50.528 | INFO     | core.engine.engine:register:48 - Estrategia registrada: CopyTrading
+2026-09-16 19:03:50.528 | INFO     | __main__:run:162 - === TradingBot Framework Modular ===
+2026-09-16 19:03:50.528 | INFO     | __main__:run:163 - Wallet: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF
+2026-09-16 19:03:50.528 | INFO     | __main__:run:164 - RPC: 9a3e97db-abca-4bc8-bc9d-a4c2295c2738
+2026-09-16 19:03:50.528 | INFO     | __main__:run:165 - Estrategias: ['CopyTrading']
+2026-09-16 19:03:50.528 | INFO     | __main__:_setup_helius_webhook:229 - Configurando Helius webhook...
+2026-09-16 19:03:51.055 | ERROR    | strategies.copy_trading:setup_helius_webhook:440 - Error creando webhook: {"webhookID":"da82f913-040c-46d6-952b-080f1543bb3b","project":"bf25e306-c988-45c1-8b41-9adc0f2fbf72","wallet":"bf25e306-c988-45c1-8b41-9adc0f2fbf72","webhookURL":"https://violet-cups-buy.loca.lt/webhook/copy-trading","accountAddresses":["6NwarBvDkXhByqVp2Qkq5i9XbtA2B3Bwe8SWGu9vpump","4UrFSCrGxgoCtCUBAEZq7ZmPK3Pczkxx7PwYnkBMi1KR"],"transactionTypes":["SWAP"],"webhookType":"enhanced","txnStatus":"success","active":true}
+2026-09-16 19:03:51.055 | WARNING  | __main__:_setup_helius_webhook:234 - No se pudo crear webhook. Crea manualmente en https://dashboard.helius.dev/webhooks
+2026-09-16 19:03:51.056 | INFO     | core.engine.engine:start_all:77 - Engine iniciado: 1 estrategias activas
+2026-09-16 19:03:51.056 | INFO     | strategies.copy_trading:start:136 - CopyTrading: estrategia iniciada (2 wallets)
+2026-09-16 19:03:51.056 | INFO     | core.notifier:start_heartbeat:258 - Heartbeat iniciado cada 30 min.
+2026-09-16 19:03:51.056 | INFO     | core.tracker:monitor_positions:158 - Monitoreo de posiciones iniciado (cada 2s)
+2026-09-16 19:05:42.248 | INFO     | core.execution:cargar_keypair_desde_env:109 - Escaneando subcuentas de las 24 palabras en la red Solana...
+2026-09-16 19:05:42.635 | INFO     | core.execution:cargar_keypair_desde_env:141 - WALLET SELECCIONADA: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF (Saldo: 0 SOL)
+2026-09-16 19:05:42.656 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: Cupsey (6NwarBvD...)
+2026-09-16 19:05:42.656 | INFO     | strategies.copy_trading:_load_wallets:118 - CopyTrading: wallet cargada: J777Crypto (4UrFSCrG...)
+2026-09-16 19:05:42.656 | INFO     | strategies.copy_trading:_load_wallets:129 - CopyTrading: 2 wallets monitoreadas
+2026-09-16 19:05:42.656 | INFO     | core.engine.engine:register:48 - Estrategia registrada: CopyTrading
+2026-09-16 19:05:42.657 | INFO     | __main__:run:162 - === TradingBot Framework Modular ===
+2026-09-16 19:05:42.657 | INFO     | __main__:run:163 - Wallet: D1hdMJF8QY3zxHFnaccCGLZRdbpLjFZj5sR7e5pQsEYF
+2026-09-16 19:05:42.657 | INFO     | __main__:run:164 - RPC: 9a3e97db-abca-4bc8-bc9d-a4c2295c2738
+2026-09-16 19:05:42.657 | INFO     | __main__:run:165 - Estrategias: ['CopyTrading']
+2026-09-16 19:05:42.657 | INFO     | __main__:_setup_helius_webhook:229 - Configurando Helius webhook...
+2026-09-16 19:05:43.385 | SUCCESS  | strategies.copy_trading:setup_helius_webhook:428 - Helius webhook actualizado: da82f913-040c-46d6-952b-080f1543bb3b
+2026-09-16 19:05:43.386 | SUCCESS  | __main__:_setup_helius_webhook:232 - Helius webhook listo: da82f913-040c-46d6-952b-080f1543bb3b
+2026-09-16 19:05:43.387 | INFO     | core.engine.engine:start_all:77 - Engine iniciado: 1 estrategias activas
+2026-09-16 19:05:43.387 | INFO     | strategies.copy_trading:start:136 - CopyTrading: estrategia iniciada (2 wallets)
+2026-09-16 19:05:43.387 | INFO     | core.notifier:start_heartbeat:258 - Heartbeat iniciado cada 30 min.
+2026-09-16 19:05:43.387 | INFO     | core.tracker:monitor_positions:158 - Monitoreo de posiciones iniciado (cada 2s)
+2026-09-16 19:06:43.388 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 60s
+2026-09-16 19:07:43.388 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 120s
+2026-09-16 19:08:43.389 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 180s
+2026-09-16 19:09:43.391 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 240s
+2026-09-16 19:10:43.392 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 300s
+2026-09-16 19:11:43.394 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 360s
+2026-09-16 19:12:43.394 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 420s
+2026-09-16 19:13:43.395 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 480s
+2026-09-16 19:14:43.396 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 540s
+2026-09-16 19:15:43.398 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 600s
+2026-09-16 19:16:43.398 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 660s
+2026-09-16 19:17:43.400 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 720s
+2026-09-16 19:18:43.401 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 780s
+2026-09-16 19:19:43.401 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 840s
+2026-09-16 19:20:43.402 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 900s
+2026-09-16 19:21:43.403 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 960s
+2026-09-16 19:22:43.404 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1020s
+2026-09-16 19:23:43.405 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1080s
+2026-09-16 19:24:43.406 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1140s
+2026-09-16 19:25:43.407 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1200s
+2026-09-16 19:26:43.408 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1260s
+2026-09-16 19:27:43.409 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1320s
+2026-09-16 19:28:43.411 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1380s
+2026-09-16 19:29:43.412 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1440s
+2026-09-16 19:30:43.414 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1500s
+2026-09-16 19:31:43.415 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1560s
+2026-09-16 19:32:43.416 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1620s
+2026-09-16 19:33:43.417 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1680s
+2026-09-16 19:34:43.419 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1740s
+2026-09-16 19:35:43.421 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1800s
+2026-09-16 19:35:45.425 | ERROR    | core.notifier:send:71 - Telegram error 401: {"ok":false,"error_code":401,"description":"Unauthorized"}
+2026-09-16 19:35:45.425 | WARNING  | core.notifier:start_heartbeat:263 - Heartbeat no pudo enviarse a Telegram.
+2026-09-16 19:36:43.422 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1860s
+2026-09-16 19:37:43.424 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1920s
+2026-09-16 19:38:43.425 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 1980s
+2026-09-16 19:39:43.426 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 2040s
+2026-09-16 19:40:43.427 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 2100s
+2026-09-16 19:41:43.428 | DEBUG    | __main__:run:191 - Engine: 1 estrategias activas/1 | Uptime: 2160s

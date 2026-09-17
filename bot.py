@@ -1,13 +1,12 @@
-"""Orquestador principal asíncrono del bot de memecoins en Solana.
+"""Orquestador principal del bot de trading en Solana.
 
-Responsabilidades:
-1. Arrancar el listener de WebSocket de nuevos tokens.
-2. Validar la seguridad de cada token detectado.
-3. Ejecutar compra/venta a través de Jupiter.
-4. Notificar a Telegram cada operación.
+Framework modular con estrategias intercambiables:
+- MemecoinSniper: snipeo de nuevos tokens
+- CopyTrading: copia trades de wallets conocidas
+- Arbitrage: arbitraje entre DEXs
+- DCA: Dollar Cost Averaging periodico
 
-Todo el flujo es asíncrono y nunca bloquea el event loop de asyncio.
-Los fallos de red se capturan por módulo y se registran con loguru.
+El StrategyEngine gestiona el lifecycle de todas las estrategias activas.
 """
 
 from __future__ import annotations
@@ -15,27 +14,69 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from typing import Optional
 
 from aiohttp import web
 from loguru import logger
 
 from config import AppConfig, load_config
+from core.engine import StrategyEngine
 from core.execution import JupiterExecutor
 from core.notifier import TelegramNotifier
-from core.security import SecurityValidationError, TokenSecurityValidator
 from core.tracker import PositionTracker, set_global_tracker
-from core.websocket import TokenWebSocket, create_listener
+from strategies.memecoin import MemecoinSniper
+from strategies.copy_trading import CopyTradingStrategy
+from strategies.arbitrage import ArbitrageStrategy
+from strategies.dca import DCAStrategy
 
-# -- Configuración inicial de loguru ------------------------------------------
+# -- Configuracion inicial de loguru ------------------------------------------
 logger.remove()
 logger.add(sys.stdout, level="INFO", colorize=True)
 logger.add("bot_memecoin.log", rotation="5 MB", retention=3, level="DEBUG")
 
 
-async def start_health_server() -> None:
-    """Servidor HTTP de salud para el port scan de Render."""
+async def start_health_server(engine: StrategyEngine) -> None:
+    """Servidor HTTP de salud, webhooks y stats.
+
+    Endpoints:
+    - GET /: Health check
+    - POST /webhook/copy-trading: Webhook de Helius para copy trading
+    - GET /stats: Estadisticas del engine y todas las estrategias
+    """
     app = web.Application()
-    app.router.add_get("/", lambda _: web.Response(text="Bot running"))
+
+    async def health_handler(request: web.Request) -> web.Response:
+        return web.Response(text="Bot running")
+
+    async def copy_trade_webhook(request: web.Request) -> web.Response:
+        # Buscar la estrategia de copy trading
+        copy_strategy = None
+        for name, strategy in engine.strategies.items():
+            if isinstance(strategy, CopyTradingStrategy):
+                copy_strategy = strategy
+                break
+
+        if copy_strategy is None:
+            return web.json_response(
+                {"error": "Copy trading not enabled"}, status=404
+            )
+        try:
+            payload = await request.json()
+            result = await copy_strategy.handle_webhook(payload)
+            return web.json_response(result)
+        except Exception as exc:
+            logger.error("Error en webhook de copy trading: {}", exc)
+            return web.json_response(
+                {"status": "error", "message": str(exc)}, status=500
+            )
+
+    async def stats_handler(request: web.Request) -> web.Response:
+        return web.json_response(engine.get_stats())
+
+    app.router.add_get("/", health_handler)
+    app.router.add_post("/webhook/copy-trading", copy_trade_webhook)
+    app.router.add_get("/stats", stats_handler)
+
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", 8080))
@@ -43,18 +84,13 @@ async def start_health_server() -> None:
     await site.start()
 
 
-class MemecoinBot:
-    """Orquesta el lifecycle completo del bot de trading."""
+class TradingBot:
+    """Bot de trading modular con motor de estrategias."""
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
 
-        # Componentes (dependencias inyectadas desde config).
-        self.listener: TokenWebSocket = create_listener()
-        self.validator = TokenSecurityValidator(
-            rpc_url=config.solana.HELIUS_RPC_URL,
-            security=config.security,
-        )
+        # -- Componentes compartidos (inyectados en todas las estrategias)
         self.executor = JupiterExecutor(
             private_key=config.solana.PRIVATE_KEY,
             rpc_url=config.solana.HELIUS_RPC_URL,
@@ -75,108 +111,145 @@ class MemecoinBot:
             notifier=self.notifier,
             config=config,
         )
-        # Comparte el tracker con los flujos de compra (websocket).
         set_global_tracker(self.tracker)
 
-    # ------------------------------------------------------------ Trading
-    async def _process_new_token(self, mint: str, ticker: str = "N/A") -> None:
-        """Flujo completo: validar -> comprar si es seguro."""
-        logger.info("Procesando nuevo token: {} ({})", mint, ticker)
+        # -- Motor de estrategias
+        self.engine = StrategyEngine()
+        self._register_strategies()
 
-        # Nota: FORCE_TEST_BUY se maneja exclusivamente en el websocket handler
-        # (core/websocket.py) que usa process_buy_and_notify() y registra la
-        # posición en el tracker para TP/SL. No duplicar aquí.
+    def _register_strategies(self) -> None:
+        """Registra las estrategias habilitadas en el engine."""
+        # 1. Memecoin Sniper - DESHABILITADO (muy riesgoso para pruebas)
+        # Para activar: descomentar la siguiente linea
+        # self.engine.register(MemecoinSniper(
+        #     executor=self.executor,
+        #     notifier=self.notifier,
+        #     tracker=self.tracker,
+        #     config=self.config,
+        # ))
 
-        # Paso 1: Seguridad. Cualquier rechazo se registra y se descarta.
-        try:
-            is_safe = await self.validator.is_token_safe(mint, ticker)
-        except SecurityValidationError as exc:
-            logger.warning("Token {} rechazado: {}", mint, exc)
-            return
-        if not is_safe:
-            logger.warning("Token {} falló la validación de seguridad.", mint)
-            return
+        # 2. Copy Trading (si esta habilitado)
+        if self.config.copy_trading.COPY_TRADING_ENABLED:
+            self.engine.register(CopyTradingStrategy(
+                executor=self.executor,
+                notifier=self.notifier,
+                tracker=self.tracker,
+                config=self.config,
+            ))
 
-        # Paso 2: Compra.
-        try:
-            sig = await self.executor.buy_token(mint)
-        except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
-            logger.error("Error comprando {}: {}", mint, exc)
-            await self.notifier.send_error(f"No se pudo comprar {mint}: {exc}")
-            return
+        # 3. Arbitrage (si hay tokens configurados)
+        arb_tokens = os.getenv("ARBITRAGE_TOKENS", "")
+        if arb_tokens:
+            self.engine.register(ArbitrageStrategy(
+                executor=self.executor,
+                notifier=self.notifier,
+                tracker=self.tracker,
+                config=self.config,
+            ))
 
-        if sig is None:
-            logger.info("Compra de {} omitida (sin liquidez).", mint)
-            return
+        # 4. DCA (si hay tokens configurados)
+        dca_tokens = os.getenv("DCA_TOKENS", "")
+        if dca_tokens:
+            self.engine.register(DCAStrategy(
+                executor=self.executor,
+                notifier=self.notifier,
+                tracker=self.tracker,
+                config=self.config,
+            ))
 
-        await self.notifier.send_buy(
-            mint,
-            self.config.trading.BUY_AMOUNT_SOL,
-            symbol=ticker,
-            dry_run=self.config.trading.DRY_RUN,
-        )
-        logger.success("Compra de {} ejecutada: {}", mint, sig)
-
-    # ------------------------------------------------------------ Loop
     async def run(self) -> None:
-        """Lanza el listener, el heartbeat y el monitor de posiciones."""
-        logger.info("Iniciando bot de memecoins en Solana...")
-        # Verificación de wallet al arrancar: la dirección pública se deriva
-        # de SOLANA_PRIVATE_KEY para validar que la wallet en uso es la esperada.
-        logger.info("👛 Wallet activa (derivada de SOLANA_PRIVATE_KEY): {}", self.executor.wallet_pubkey)
-        logger.info("🔗 RPC configurado: {}", self.executor.rpc_url)
+        """Inicia el bot con todas las estrategias."""
+        logger.info("=== TradingBot Framework Modular ===")
+        logger.info("Wallet: {}", self.executor.wallet_pubkey)
+        logger.info("RPC: {}", self.executor.rpc_url)
+        logger.info("Estrategias: {}", list(self.engine.strategies.keys()))
 
-        # Tareas de fondo concurrentes (ninguna bloquea el loop principal).
-        listener_task = asyncio.create_task(self.listener.run())
+        # Configurar webhook de Helius para copy trading
+        await self._setup_helius_webhook()
+
+        # Lanzar servidor HTTP (health + webhooks + stats)
+        await start_health_server(self.engine)
+
+        # Iniciar todas las estrategias
+        await self.engine.start_all()
+
+        # Heartbeat periodico
         heartbeat_task = asyncio.create_task(
             self.notifier.start_heartbeat(interval_minutes=30.0)
         )
+
+        # Monitor de posiciones
         monitor_task = asyncio.create_task(self.tracker.start_monitoring())
 
         try:
-            # Consumimos los eventos que llegan de forma asíncrona.
-            async for event in self.listener.events():
-                mint = (
-                    event.get("mint")
-                    or event.get("token", {}).get("mint")
-                    or event.get("address")
+            # Mantener el bot vivo
+            while True:
+                await asyncio.sleep(60)
+                stats = self.engine.get_stats()
+                active = stats.get("active_strategies", 0)
+                total = stats.get("total_strategies", 0)
+                logger.debug(
+                    "Engine: {} estrategias activas/{} | Uptime: {:.0f}s",
+                    active, total, stats.get("uptime_seconds", 0),
                 )
-                if not mint:
-                    logger.debug("Evento sin mint, ignorado: {}", event)
-                    continue
-
-                ticker = (
-                    event.get("symbol")
-                    or event.get("ticker")
-                    or event.get("token", {}).get("symbol")
-                    or event.get("token", {}).get("ticker")
-                    or "N/A"
-                )
-
-                # Procesamiento concurrente: permite varios tokens en paralelo
-                # mientras seguimos escuchando (no bloquea el loop).
-                asyncio.create_task(self._process_new_token(mint, ticker))
+        except asyncio.CancelledError:
+            pass
         finally:
-            self.listener.stop()
-            for task in (listener_task, heartbeat_task, monitor_task):
-                task.cancel()
-            await asyncio.gather(*(
-                task for task in (listener_task, heartbeat_task, monitor_task)
-            ), return_exceptions=True)
+            await self.engine.stop_all()
+            heartbeat_task.cancel()
+            monitor_task.cancel()
+            await asyncio.gather(heartbeat_task, monitor_task, return_exceptions=True)
+
+    async def _setup_helius_webhook(self) -> None:
+        """Configura el webhook de Helius para copy trading."""
+        copy_strategy = None
+        for name, strategy in self.engine.strategies.items():
+            if isinstance(strategy, CopyTradingStrategy):
+                copy_strategy = strategy
+                break
+
+        if not copy_strategy or not self.config.copy_trading.AUTO_SETUP_WEBHOOK:
+            return
+
+        base_url = self.config.copy_trading.WEBHOOK_BASE_URL
+        if not base_url:
+            render_url = os.getenv("RENDER_EXTERNAL_URL", "")
+            if render_url:
+                base_url = render_url.rstrip("/")
+            else:
+                public_host = os.getenv("PUBLIC_HOST", "")
+                public_port = os.getenv("PUBLIC_PORT", "443")
+                if public_host:
+                    scheme = "https" if public_port == "443" else "http"
+                    base_url = f"{scheme}://{public_host}"
+                    if public_port not in ("80", "443"):
+                        base_url += f":{public_port}"
+
+        if base_url:
+            logger.info("Configurando Helius webhook...")
+            wh_id = await copy_strategy.setup_helius_webhook(base_url)
+            if wh_id:
+                logger.success("Helius webhook listo: {}", wh_id)
+            else:
+                logger.warning(
+                    "No se pudo crear webhook. Crea manualmente en "
+                    "https://dashboard.helius.dev/webhooks"
+                )
+        else:
+            logger.warning(
+                "URL publica no detectada. Configura WEBHOOK_BASE_URL en .env"
+            )
 
     async def shutdown(self) -> None:
-        """Apagado ordenado."""
         logger.info("Apagando bot...")
-        self.listener.stop()
+        await self.engine.stop_all()
 
 
 async def main() -> None:
-    """Punto de entrada asíncrono."""
     config = load_config()
-    bot = MemecoinBot(config)
+    bot = TradingBot(config)
 
     try:
-        asyncio.create_task(start_health_server())
         await bot.run()
     except KeyboardInterrupt:
         pass
@@ -189,4 +262,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Interrupción del usuario.")
+        logger.info("Interrupcion del usuario.")

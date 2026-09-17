@@ -196,6 +196,39 @@ class TelegramSettings(BaseSettings):
         return bool(self.TELEGRAM_BOT_TOKEN) and bool(self.TELEGRAM_CHAT_ID)
 
 
+class CopyTradingSettings(BaseSettings):
+    """Configuracion del modulo de copy trading."""
+
+    model_config = BASE_SETTINGS
+
+    COPY_TRADING_ENABLED: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COPY_TRADING_ENABLED", "ENABLED"),
+        description="Activar/desactivar copy trading",
+    )
+    MAX_COPY_TRADE_SOL: float = Field(
+        default=0.01,
+        gt=0,
+        description="Monto maximo por copy trade en SOL",
+    )
+    COPY_TRADE_BUY_AMOUNT_SOL: float = Field(
+        default=0.005,
+        gt=0,
+        description="Monto fijo por compra en copy trading (SOL)",
+    )
+    AUTO_SETUP_WEBHOOK: bool = Field(
+        default=True,
+        description="Crear webhook de Helius automaticamente al iniciar",
+    )
+    WEBHOOK_BASE_URL: str = Field(
+        default="",
+        description=(
+            "URL publica del bot para el webhook de Helius. "
+            "Si esta vacio, se intenta detectar de la variable PUBLIC_URL o PORT."
+        ),
+    )
+
+
 class BotSettings(BaseSettings):
     """Comportamiento general del bot."""
 
@@ -216,6 +249,7 @@ class AppConfig:
         self.trading = TradingSettings()
         self.security = SecuritySettings()
         self.telegram = TelegramSettings()
+        self.copy_trading = CopyTradingSettings()
         self.bot = BotSettings()
 
 
