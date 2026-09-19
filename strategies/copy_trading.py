@@ -27,7 +27,7 @@ from core.engine.strategy import Strategy, StrategyState
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
 # Tipos de transaccion que nos interesan
-COPY_TRADE_TYPES = {"SWAP", "BUY", "SELL", "TRANSFER"}
+COPY_TRADE_TYPES = {"SWAP", "TRANSFER"}
 
 # Programas DEX conocidos
 DEX_PROGRAMS = {
@@ -479,13 +479,12 @@ class CopyTradingStrategy(Strategy):
         if not self.wallets:
             return None
 
-        # Usar raw webhook para capturar pump.fun transactions
         payload = {
             "webhookURL": webhook_url + self.webhook_path,
-            "transactionTypes": ["SWAP"],
+            "transactionTypes": ["SWAP", "TRANSFER"],
             "accountAddresses": list(self.wallets.keys()),
             "webhookType": "enhanced",
-            "txnStatus": "success",
+            "txnStatus": "all",
         }
 
         try:
