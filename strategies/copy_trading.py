@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -130,6 +131,63 @@ class CopyTradingStrategy(Strategy):
                 "CopyTrading: {} wallets monitoreadas", len(self.wallets),
             )
 
+    # ----------------------------------------------------------- Mint extraction helpers
+    _KNOWN_ADDRESSES: set[str] = {SOL_MINT} | set(DEX_PROGRAMS.values())
+
+    def _extract_mint_from_account_data(
+        self, account_data: list[dict[str, Any]], fee_payer: str
+    ) -> Optional[str]:
+        """Intenta encontrar el mint del token que compro/vendio el fee_payer
+        analizando tokenBalanceChanges en accountData de Helius Enhanced."""
+        for acct in account_data:
+            for tbc in acct.get("tokenBalanceChanges", []):
+                user = tbc.get("userAccount", "")
+                if user != fee_payer:
+                    continue
+                mint = tbc.get("mint", "")
+                if not mint or mint in self._KNOWN_ADDRESSES:
+                    continue
+                raw = tbc.get("rawTokenAmount", {})
+                amount_str = raw.get("tokenAmount", "0")
+                try:
+                    amount = int(amount_str)
+                except (ValueError, TypeError):
+                    amount = 0
+                if amount > 0:
+                    return mint
+        return None
+
+    def _extract_mint_from_sent_tokens(
+        self, account_data: list[dict[str, Any]], fee_payer: str
+    ) -> Optional[str]:
+        """Extrae el mint del token que envio (vendio) el fee_payer."""
+        for acct in account_data:
+            for tbc in acct.get("tokenBalanceChanges", []):
+                user = tbc.get("userAccount", "")
+                if user != fee_payer:
+                    continue
+                mint = tbc.get("mint", "")
+                if not mint or mint in self._KNOWN_ADDRESSES:
+                    continue
+                raw = tbc.get("rawTokenAmount", {})
+                amount_str = raw.get("tokenAmount", "0")
+                try:
+                    amount = int(amount_str)
+                except (ValueError, TypeError):
+                    amount = 0
+                if amount < 0:
+                    return mint
+        return None
+
+    def _extract_mint_from_description(self, description: str) -> Optional[str]:
+        """Busca un mint en la descripcion de la transaccion, excluyendo
+        direcciones conocidas (programas DEX, SOL mint)."""
+        candidates = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,44}', description)
+        for candidate in candidates:
+            if candidate not in self._KNOWN_ADDRESSES:
+                return candidate
+        return None
+
     async def start(self) -> None:
         """Inicia la estrategia de copy trading."""
         self._set_state(StrategyState.RUNNING)
@@ -198,7 +256,6 @@ class CopyTradingStrategy(Strategy):
         token_transfers = tx.get("tokenTransfers", [])
         native_transfers = tx.get("nativeTransfers", [])
         account_data = tx.get("accountData", [])
-        description = tx.get("description", "").lower()
 
         # Detectar si es transaccion de Pump.fun
         is_pump_fun = False
@@ -254,24 +311,42 @@ class CopyTradingStrategy(Strategy):
 
         # Caso 3: Solo envio de SOL (posible compra en bonding curve)
         elif sol_spent > 0 and not tokens_received:
-            # Buscar mint en la descripcion o en los logs
-            import re
-            mint_match = re.search(r'[1-9A-HJ-NP-Za-km-z]{32,44}', tx.get("description", ""))
-            if mint_match:
-                token_mint = mint_match.group(0)
+            # 1) Intentar desde accountData (tokenBalanceChanges)
+            token_mint = self._extract_mint_from_account_data(account_data, fee_payer)
+            if token_mint:
                 action = "buy"
                 amount_sol = sol_spent
+            else:
+                # 2) Fallback: descripcion de la transaccion
+                token_mint = self._extract_mint_from_description(
+                    tx.get("description", "")
+                )
+                if token_mint:
+                    action = "buy"
+                    amount_sol = sol_spent
 
         # Caso 4: Solo recibe SOL (posible venta en bonding curve)
         elif sol_received > 0 and not tokens_sent:
-            import re
-            mint_match = re.search(r'[1-9A-HJ-NP-Za-km-z]{32,44}', tx.get("description", ""))
-            if mint_match:
-                token_mint = mint_match.group(0)
+            token_mint = self._extract_mint_from_sent_tokens(account_data, fee_payer)
+            if token_mint:
                 action = "sell"
                 amount_sol = sol_received
+            else:
+                token_mint = self._extract_mint_from_description(
+                    tx.get("description", "")
+                )
+                if token_mint:
+                    action = "sell"
+                    amount_sol = sol_received
 
         if not action or not token_mint:
+            logger.debug(
+                "CopyTrading: no se pudo determinar mint para {} | "
+                "accounts={} | tokenTransfers={} | "
+                "sol_spent={:.6f} | sol_received={:.6f}",
+                signature[:16] + "...", len(account_data),
+                len(token_transfers), sol_spent, sol_received,
+            )
             return None
 
         # Filtrar transfers de SOL minimos (fees de red)
