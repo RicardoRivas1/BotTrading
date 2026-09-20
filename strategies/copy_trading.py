@@ -82,6 +82,7 @@ class CopyTradingStrategy(Strategy):
         super().__init__(executor, notifier, tracker, config)
         self.wallets: dict[str, TrackedWallet] = {}
         self._recent_signals: dict[str, float] = {}
+        self._recent_buys: dict[str, float] = {}  # (wallet:mint) -> timestamp
         self._lock = asyncio.Lock()
         self.webhook_path = "/webhook/copy-trading"
         self._load_wallets()
@@ -501,6 +502,26 @@ class CopyTradingStrategy(Strategy):
             k: v for k, v in self._recent_signals.items() if v > cutoff
         }
 
+        # Cooldown: si acabamos de comprar este token (Pump.fun entrega tokens via TRANSFER ~2s despues)
+        # Ignorar TRANSFER que son settlement de compra reciente
+        if tx_type == "TRANSFER":
+            now = time.time()
+            cooled_off = {k: v for k, v in self._recent_buys.items() if now - v < 30}
+            self._recent_buys = cooled_off
+            trader_addr = wallet_address or fee_payer
+            for tt in tx.get("tokenTransfers", []):
+                mint = tt.get("mint", "")
+                if not mint:
+                    continue
+                key = f"{trader_addr}:{mint}"
+                if key in self._recent_buys:
+                    logger.info(
+                        "CopyTrading: TRANSFER ignorado (settlement post-compra) {} | mint={} | {}s despues del BUY",
+                        signature[:16] + "...", mint[:12] + "...",
+                        int(now - self._recent_buys[key]),
+                    )
+                    return
+
         self._inc_stat("trades_executed")
         logger.info(
             "CopyTrading: trade detectado de {} ({}) | type={} | sig={}",
@@ -509,35 +530,15 @@ class CopyTradingStrategy(Strategy):
 
         signal = self._parse_trade(tx, tracked, wallet_address=wallet_address)
 
-        # DUMP every failed parse for debugging
-        if not signal:
-            import json
-            tt = tx.get("tokenTransfers", [])
-            nt = tx.get("nativeTransfers", [])
-            ad = tx.get("accountData", [])
-            desc = tx.get("description", "")[:200]
-            tbc_summary = []
-            for acct in ad[:5]:
-                for tbc in acct.get("tokenBalanceChanges", []):
-                    tbc_summary.append({
-                        "acct": acct.get("account", "")[:12],
-                        "mint": tbc.get("mint", "")[:12],
-                        "tokenAmt": tbc.get("tokenAmount", 0),
-                        "mintAmt": tbc.get("mintAmount", 0),
-                    })
-            logger.warning(
-                "PARSE_FAIL type={} fp={} trader={} sig={}\n"
-                "  tt_count={} nt_count={} ad_count={}\n"
-                "  tt={}\n  nt={}\n  tbc={}\n  desc={}",
-                tx_type, fee_payer[:12],
-                (wallet_address or fee_payer)[:12],
-                signature[:16],
-                len(tt), len(nt), len(ad),
-                json.dumps(tt[:2], default=str)[:400],
-                json.dumps(nt[:3], default=str)[:400],
-                json.dumps(tbc_summary[:5], default=str)[:400],
-                desc,
+        # Registrar BUY para cooldown de TRANSFER post-compra
+        if signal and signal.action == "buy" and signal.token_mint:
+            buy_key = f"{signal.wallet}:{signal.token_mint}"
+            self._recent_buys[buy_key] = time.time()
+            logger.debug(
+                "CopyTrading: BUY cooldown registrado para {} (30s)",
+                buy_key[:20] + "...",
             )
+
         if signal:
             await self._execute_copy_trade(signal)
 
@@ -635,7 +636,7 @@ class CopyTradingStrategy(Strategy):
         token_mint = None
         amount_sol = 0.0
 
-        logger.info(
+        logger.debug(
             "CopyTrade classify: trader={} tokens_sent={} tokens_rcvd={} sol_spent={:.6f} sol_rcvd={:.6f} is_pump={}",
             trader[:8] + "..." if trader else "?",
             [(t["mint"][:8] + "...", t["amount"]) for t in tokens_sent[:2]],
@@ -666,7 +667,7 @@ class CopyTradingStrategy(Strategy):
             token_mint = tokens_sent[0]["mint"]
             amount_sol = sol_spent
             sell_pct = self._calc_sell_pct(token_mint, tokens_sent[0]["amount"], tracked.address)
-            logger.info(
+            logger.debug(
                 "CopyTrade CASE2b: sell_pct={:.1f}% is_pump={} | mint={} | tokens_amt={}",
                 sell_pct, is_pump_fun, token_mint[:12] + "...", tokens_sent[0]["amount"],
             )
@@ -966,6 +967,19 @@ class CopyTradingStrategy(Strategy):
                             "PnL calculado: entry={:.10g} current={:.10g} => {:.2f}% for {}",
                             entry, current_price, pnl_pct, signal.token_mint[:12] + "...",
                         )
+                    elif entry > 0 and current_price <= 0 and signal.amount_sol > 0:
+                        # Fallback para tokens nuevos sin precio: estimar PnL con sol_invested vs sell SOL
+                        sol_invested = 0.0
+                        if position:
+                            sol_invested = getattr(position, "sol_invested", 0.0) or 0.0
+                        if sol_invested <= 0 and tracker_pos:
+                            sol_invested = getattr(tracker_pos, "amount", 0.0) or 0.0
+                        if sol_invested > 0:
+                            pnl_pct = (signal.amount_sol - sol_invested) / sol_invested * 100
+                            logger.info(
+                                "PnL estimado (sin precio): sell={:.6f} vs invested={:.6f} => {:.2f}%",
+                                signal.amount_sol, sol_invested, pnl_pct,
+                            )
                     elif current_price > 0 and not entry:
                         sol_invested = 0.0
                         token_held = 0.0
