@@ -64,21 +64,24 @@ async def _get_price_from_pool(token_mint: str, session: aiohttp.ClientSession) 
         def _safe_liquidity(p: dict) -> float:
             try:
                 val = p.get("attributes", {}).get("reserve_in_usd")
-                return float(val) if val is not None else 0.0
+                if val is None:
+                    return 0.0
+                return float(val)
             except (ValueError, TypeError):
                 return 0.0
 
         pools.sort(key=_safe_liquidity, reverse=True)
 
         best = pools[0]
-        price_native = (
-            best.get("attributes", {}).get("base_token_price_native")
-            or best.get("attributes", {}).get("quote_token_price_native")
-        )
-        if price_native:
-            return float(price_native)
+        attrs = best.get("attributes", {})
+        price_native = attrs.get("base_token_price_native") or attrs.get("quote_token_price_native")
+        if price_native is not None:
+            try:
+                return float(price_native)
+            except (ValueError, TypeError):
+                pass
 
-    except (aiohttp.ClientError, ValueError, TypeError) as exc:
+    except Exception as exc:
         logger.debug("GeckoTerminal pool error for {}: {}", token_mint, exc)
 
     return None

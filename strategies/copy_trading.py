@@ -481,6 +481,19 @@ class CopyTradingStrategy(Strategy):
             if nt.get("toUserAccount") == trader
         )
 
+        # Fallback: si no hay nativeTransfers del trader, usar accountData.nativeBalanceChange
+        # Esto captura ventas en bonding curve donde el SOL viene via programa
+        if sol_spent == 0 and sol_received == 0:
+            for acct in account_data:
+                if acct.get("account") != trader:
+                    continue
+                nbc = acct.get("nativeBalanceChange", 0)
+                if nbc > 0:
+                    sol_received = nbc / 1e9
+                elif nbc < 0:
+                    sol_spent = abs(nbc) / 1e9
+                break
+
         # Analizar transfers de tokens (excluyendo SOL, stablecoins y wallets)
         excluded = self._get_all_excluded_addresses()
         tokens_received = []
@@ -505,7 +518,6 @@ class CopyTradingStrategy(Strategy):
                 tbc_mint = tbc.get("mint", "")
                 if not tbc_mint or tbc_mint in excluded:
                     continue
-                # tokenAmount = balance DESPUES de la tx
                 # mintAmount = tokens ganados (>0) o perdidos (<0)
                 mint_delta = tbc.get("mintAmount", 0)
                 final_balance = tbc.get("tokenAmount", 0)
@@ -558,7 +570,7 @@ class CopyTradingStrategy(Strategy):
                     action = "buy"
                     amount_sol = sol_spent
 
-        # Caso 4: Solo recibe SOL (posible venta en bonding curve)
+        # Caso 4: Solo recibe SOL (posible venta en bonding curve / Axiom)
         elif sol_received > 0 and not tokens_sent:
             # Usar sell_mint_from_balance si se detecto
             if sell_mint_from_balance:
@@ -579,6 +591,25 @@ class CopyTradingStrategy(Strategy):
                     if token_mint:
                         action = "sell"
                         amount_sol = sol_received
+                    elif tracked.address:
+                        # Axiom sells: no token data, match by wallet position
+                        wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
+                        if wallet_positions:
+                            pos = wallet_positions[-1]
+                            token_mint = pos.mint
+                            action = "sell"
+                            amount_sol = sol_received
+                            sell_pct = 100.0
+                            logger.info(
+                                "CopyTrading: SELL by wallet match {} -> {} ({}) | {:.6f} SOL",
+                                tracked.label, pos.symbol, pos.mint[:12] + "...", sol_received,
+                            )
+
+        # Caso 5: tokenBalanceChanges muestra trader perdiendo tokens (venta via programa)
+        elif sell_mint_from_balance and sell_pct > 0:
+            action = "sell"
+            token_mint = sell_mint_from_balance
+            amount_sol = sol_received if sol_received > 0 else 0.0
 
         if not action or not token_mint:
             logger.warning(
