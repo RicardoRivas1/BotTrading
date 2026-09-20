@@ -69,6 +69,8 @@ class TradeStats:
         self.wallets: dict[str, WalletStats] = {}
         self.total_buys: int = 0
         self.total_sells: int = 0
+        self.positions_opened: int = 0
+        self.positions_closed: int = 0
         self._load()
 
     def _load(self) -> None:
@@ -76,8 +78,17 @@ class TradeStats:
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
+            # Migracion: stats legacy (antes de "positions_opened") contaban cada
+            # BUY de acumulacion DCA como compra, inflando total_buys/open_positions
+            # y el PnL (fórmula vieja comparaba SOL del trader vs inversión del bot).
+            # Se descartan para arrancar desde cero con métricas correctas.
+            if "positions_opened" not in data:
+                self.path.unlink(missing_ok=True)
+                return
             self.total_buys = data.get("total_buys", 0)
             self.total_sells = data.get("total_sells", 0)
+            self.positions_opened = data.get("positions_opened", 0)
+            self.positions_closed = data.get("positions_closed", 0)
             for t in data.get("trades", []):
                 self.trades.append(TradeRecord(**t))
             for w_data in data.get("wallets", {}).values():
@@ -91,6 +102,8 @@ class TradeStats:
             data = {
                 "total_buys": self.total_buys,
                 "total_sells": self.total_sells,
+                "positions_opened": self.positions_opened,
+                "positions_closed": self.positions_closed,
                 "trades": [asdict(t) for t in self.trades[-500:]],  # keep last 500
                 "wallets": {w: asdict(ws) for w, ws in self.wallets.items()},
             }
@@ -98,11 +111,20 @@ class TradeStats:
         except Exception:
             pass
 
-    def record_buy(self, wallet: str) -> None:
-        """Record that a buy signal was received from a wallet."""
+    def record_buy(self, wallet: str, new_position: bool = True) -> None:
+        """Record that a buy signal was received from a wallet.
+
+        Args:
+            wallet: wallet that triggered the buy.
+            new_position: True si abre una posición NUEVA (default). False para
+                acumulaciones DCA (se registran en total_buys pero NO abren una
+                nueva posición abierta).
+        """
         self.total_buys += 1
         ws = self._get_wallet(wallet)
-        ws.buys += 1
+        if new_position:
+            self.positions_opened += 1
+            ws.buys += 1
         self._save()
 
     def record_sell(
@@ -137,6 +159,8 @@ class TradeStats:
         )
         self.trades.append(trade)
         self.total_sells += 1
+        if sell_pct >= 99.0:
+            self.positions_closed += 1
 
         ws = self._get_wallet(wallet)
         ws.sells += 1
@@ -195,10 +219,11 @@ class TradeStats:
         """Return a dict summary of all stats."""
         wins = sum(1 for t in self.trades if t.pnl_pct >= 0)
         losses = sum(1 for t in self.trades if t.pnl_pct < 0)
+        open_positions = self.positions_opened - self.positions_closed
         return {
-            "total_buys": self.total_buys,
+            "total_buys": self.positions_opened,
             "total_sells": self.total_sells,
-            "open_positions": self.total_buys - self.total_sells,
+            "open_positions": max(0, open_positions),
             "wins": wins,
             "losses": losses,
             "win_rate_pct": round(wins / self.total_sells * 100, 1) if self.total_sells > 0 else 0.0,

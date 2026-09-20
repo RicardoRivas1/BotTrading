@@ -211,6 +211,14 @@ class CopyTradingSettings(BaseSettings):
         gt=0,
         description="Monto maximo por copy trade en SOL",
     )
+    MAX_COPY_TRADE_POSITIONS: int = Field(
+        default=50,
+        gt=0,
+        description=(
+            "Maximo de posiciones abiertas simultaneas del copy trading. "
+            "Independiente de MAX_OPEN_POSITIONS del bot general."
+        ),
+    )
     COPY_TRADE_BUY_AMOUNT_SOL: float = Field(
         default=0.005,
         gt=0,

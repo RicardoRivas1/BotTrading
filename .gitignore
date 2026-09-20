@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 venv/
 .pytest_cache/
+*.log
+.coverage
+exec_positions.json
+open_positions.json
+trade_stats.json

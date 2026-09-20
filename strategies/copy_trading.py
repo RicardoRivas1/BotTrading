@@ -55,6 +55,8 @@ class CopyTradeSignal:
     sell_pct: float = 0.0  # 0-100: percentage to sell (100 = full, 25 = quarter)
     trader_label: str = ""  # nombre del trader copiado (ej: cupsey)
     sell_sol_raw: float = 0.0  # SOL real recibido en la venta (sin cap MAX_COPY_TRADE_SOL)
+    trade_token_amount: float = 0.0  # cantidad real de tokens del mint involucrados
+    buy_sol_raw: float = 0.0  # SOL real gastado por el trader en el BUY (sin cap)
 
 
 @dataclass
@@ -85,6 +87,9 @@ class CopyTradingStrategy(Strategy):
         self.wallets: dict[str, TrackedWallet] = {}
         self._recent_signals: dict[str, float] = {}
         self._recent_buys: dict[str, float] = {}  # (wallet:mint) -> timestamp
+        self._traded_mints: set[str] = set()  # mints que el bot ha comprado alguna vez
+        self._wallet_mint_tokens: dict[tuple[str, str], float] = {}  # (wallet,mint)->tokens acumulados (SUMA via BUY)
+        self._wallet_mint_sol: dict[tuple[str, str], float] = {}  # (wallet,mint)->SOL invertido acumulado (sin cap)
         self._lock = asyncio.Lock()
         self.webhook_path = "/webhook/copy-trading"
         self._load_wallets()
@@ -967,16 +972,33 @@ class CopyTradingStrategy(Strategy):
         )
         # Capturar el SOL real de la venta ANTES del cap (para PnL real)
         sell_sol_raw = amount_sol if action == "sell" else 0.0
+        buy_sol_raw = amount_sol if action == "buy" else 0.0
         if amount_sol > max_amount:
             amount_sol = max_amount
 
         source_label = "pump.fun" if is_pump_fun else "dex"
         sell_info = f" | sell_pct={sell_pct:.0f}%" if action == "sell" and sell_pct > 0 else ""
         chosen_delta = trader_delta_by_mint.get(token_mint, 0.0)
+
+        # Cantidad real de tokens del mint elegido (para calcular % real vendido
+        # contra lo que EL TRADER acumulo, no contra nuestra posicion pequena).
+        trade_token_amount = 0.0
+        if action == "sell":
+            for t in tokens_sent:
+                if t["mint"] == token_mint:
+                    trade_token_amount = t["amount"]
+                    break
+        elif action == "buy":
+            for t in tokens_received:
+                if t["mint"] == token_mint:
+                    trade_token_amount = t["amount"]
+                    break
+
         logger.info(
-            "CopyTrading: signal {} {} | mint={} | {:.6f} SOL | trader={} | src={}{} | delta={:+.4f}",
+            "CopyTrading: signal {} {} | mint={} | {:.6f} SOL | trader={} | src={}{} | delta={:+.4f} | tk={:.4g}",
             action.upper(), signature[:16] + "...", token_mint[:12] + "...",
             amount_sol, trader[:8] + "...", source_label, sell_info, chosen_delta,
+            trade_token_amount,
         )
         return CopyTradeSignal(
             wallet=tracked.address,
@@ -990,6 +1012,8 @@ class CopyTradingStrategy(Strategy):
             sell_pct=sell_pct,
             trader_label=tracked.label,
             sell_sol_raw=sell_sol_raw,
+            trade_token_amount=trade_token_amount,
+            buy_sol_raw=buy_sol_raw,
         )
 
     async def _execute_copy_trade(self, signal: CopyTradeSignal) -> None:
@@ -1001,6 +1025,20 @@ class CopyTradingStrategy(Strategy):
                 if signal.action == "buy":
                     existing = self.executor.positions.get(signal.token_mint)
                     tracker_pos = self.tracker.positions.get(signal.token_mint)
+
+                    # Tracking de tokens acumulados por (wallet, mint). Esto es lo
+                    # que permite calcular el % REAL vendido del trader (vendio
+                    # "tantos de los X que acumulo"), no comparado contra nuestra
+                    # posicion copiada (que es mucho mas pequena).
+                    wt_key = (signal.wallet, signal.token_mint)
+                    acc_before = self._wallet_mint_tokens.get(wt_key, 0.0)
+                    if signal.trade_token_amount > 0:
+                        self._wallet_mint_tokens[wt_key] = (
+                            acc_before + signal.trade_token_amount
+                        )
+                    sol_before = self._wallet_mint_sol.get(wt_key, 0.0)
+                    if signal.buy_sol_raw > 0:
+                        self._wallet_mint_sol[wt_key] = sol_before + signal.buy_sol_raw
 
                     # Accumulate if same token bought again (distributed buys)
                     if existing or tracker_pos:
@@ -1022,7 +1060,7 @@ class CopyTradingStrategy(Strategy):
                             existing.sol_invested if existing else tracker_pos.amount,
                         )
                         from core.stats import get_trade_stats
-                        get_trade_stats().record_buy(signal.wallet)
+                        get_trade_stats().record_buy(signal.wallet, new_position=False)
                         await self.notifier.send_buy(
                             signal.token_mint,
                             signal.amount_sol,
@@ -1032,7 +1070,9 @@ class CopyTradingStrategy(Strategy):
                         )
                         return
 
-                    max_pos = int(getattr(self.config.trading, "MAX_OPEN_POSITIONS", 10))
+                    max_pos = int(
+                        getattr(self.config.copy_trading, "MAX_COPY_TRADE_POSITIONS", 50)
+                    )
                     if len(self.executor.positions) >= max_pos:
                         logger.info(
                             "CopyTrading: BUY ignorado {} - max posiciones ({})",
@@ -1049,6 +1089,8 @@ class CopyTradingStrategy(Strategy):
 
                     if sig is None:
                         return
+
+                    self._traded_mints.add(signal.token_mint)
 
                     try:
                         symbol = await self.executor.get_token_symbol(signal.token_mint)
@@ -1093,9 +1135,13 @@ class CopyTradingStrategy(Strategy):
                     tracker_pos = self.tracker.positions.get(signal.token_mint)
 
                     if not position and not tracker_pos:
+                        if signal.token_mint in self._traded_mints:
+                            motivo = "ya vendida por el bot antes"
+                        else:
+                            motivo = "el bot nunca la compro"
                         logger.info(
-                            "CopyTrading: SELL ignorado {} ({}) - posicion no encontrada (ya vendida o no existe)",
-                            signal.source, signal.token_mint[:8] + "...",
+                            "CopyTrading: SELL ignorado {} ({}) - posicion no encontrada: {}",
+                            signal.source, signal.token_mint[:8] + "...", motivo,
                         )
                         return
 
@@ -1133,6 +1179,36 @@ class CopyTradingStrategy(Strategy):
                             si = signal.amount_sol
                         return si
 
+                    # Default to 100% if sell_pct not detected
+                    pct = signal.sell_pct if signal.sell_pct > 0 else 100.0
+
+                    # Calcular el porcentaje REAL vendido por el trader usando los
+                    # tokens que acumulo (via BUY) para ese mint. El signal.sell_pct
+                    # normalmente es 0 (sin accountData), y asumir 100% confunde:
+                    # los traders venden 20-40% de su posicion, no todo.
+                    wm_key = (signal.wallet, signal.token_mint)
+                    accumulated = self._wallet_mint_tokens.get(wm_key, 0.0)
+                    if signal.trade_token_amount > 0 and accumulated > 0:
+                        real_pct = (signal.trade_token_amount / accumulated) * 100.0
+                        real_pct = min(real_pct, 100.0)
+                        if real_pct > 1.0:
+                            pct = real_pct
+                            logger.info(
+                                "CopyTrading: sell pct recalculado {:.1f}% (trader acumulo {:.4g} tk, vendio {:.4g}) para {}",
+                                real_pct, accumulated, signal.trade_token_amount,
+                                signal.token_mint[:8] + "...",
+                            )
+                        # Descontar lo vendido del acumulado del trader para
+                        # proximas ventas parciales del mismo trader/token.
+                        self._wallet_mint_tokens[wm_key] = max(
+                            0.0, accumulated - signal.trade_token_amount
+                        )
+                    elif signal.trade_token_amount > 0:
+                        logger.debug(
+                            "CopyTrading: sin tracking de tokens acumulados para {:.4g} tk de {} (posiblemente compro de la mano de otra)",
+                            signal.trade_token_amount, signal.token_mint[:8] + "...",
+                        )
+
                     if entry > 0 and current_price > 0:
                         pnl_pct = (current_price - entry) / entry * 100
                         logger.debug(
@@ -1158,17 +1234,48 @@ class CopyTradingStrategy(Strategy):
                                 signal.token_mint[:12] + "...", si,
                             )
                     elif sell_proceeds > 0:
-                        # Fallback final: SOL recibido (sin cap) vs invertido
-                        si = _sol_invested()
-                        if si > 0:
-                            pnl_pct = (sell_proceeds - si) / si * 100
-                            logger.info(
-                                "PnL estimado (SOL): sell={:.6f} vs invested={:.6f} => {:.2f}%",
-                                sell_proceeds, si, pnl_pct,
-                            )
-
-                    # Default to 100% if sell_pct not detected
-                    pct = signal.sell_pct if signal.sell_pct > 0 else 100.0
+                        # Fallback final: SOL recibido (sin cap) vs el COSTO del
+                        # trader para esos tokens vendidos. Usamos sus numeros reales:
+                        # costo_por_tk = SOL_invertido_total / tokens_acumulados.
+                        # asi el PnL refleja la venta PARCIAL real (20-40%), no
+                        # "vendio todo lo que metio" como asumiamos antes.
+                        # `accumulated` ya fue capturado ANTES del descuento en el
+                        # bloque de pct, asi usamos la base correcta del costo.
+                        w_sol = self._wallet_mint_sol.get(wm_key, 0.0)
+                        sold_tok = (
+                            signal.trade_token_amount
+                            if signal.trade_token_amount > 0
+                            else 0.0
+                        )
+                        if accumulated > 0 and sold_tok > 0:
+                            cost_per_tk = w_sol / accumulated if w_sol > 0 else 0.0
+                            sold_cost = cost_per_tk * sold_tok
+                            if sold_cost > 0:
+                                pnl_pct = (sell_proceeds - sold_cost) / sold_cost * 100
+                                logger.info(
+                                    "PnL estimado (costo trader): sell={:.6f} vs costo vendido={:.6f} ({} tk) => {:.2f}%",
+                                    sell_proceeds, sold_cost, f"{sold_tok:.6g}", pnl_pct,
+                                )
+                            else:
+                                si = _sol_invested()
+                                if si > 0:
+                                    sold_port = si * (pct / 100.0)
+                                    if sold_port > 0:
+                                        pnl_pct = (sell_proceeds - sold_port) / sold_port * 100
+                                        logger.info(
+                                            "PnL estimado (SOL/inv parcial): sell={:.6f} vs {:.1f}% vendido (inv={:.6f}) => {:.2f}%",
+                                            sell_proceeds, pct, sold_port, pnl_pct,
+                                        )
+                        else:
+                            si = _sol_invested()
+                            if si > 0:
+                                sold_port = si * (pct / 100.0)
+                                if sold_port > 0:
+                                    pnl_pct = (sell_proceeds - sold_port) / sold_port * 100
+                                    logger.info(
+                                        "PnL estimado (SOL/inv): sell={:.6f} vs {:.1f}% vendido (inv={:.6f}) => {:.2f}%",
+                                        sell_proceeds, pct, sold_port, pnl_pct,
+                                    )
 
                     # Record sell in stats before cleaning positions
                     from core.stats import get_trade_stats
