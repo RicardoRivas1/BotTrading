@@ -606,6 +606,40 @@ class CopyTradingStrategy(Strategy):
             elif tt.get("fromUserAccount") == trader:
                 tokens_sent.append({"mint": mint, "amount": amount})
 
+        # Eliminar "hops neutrales": el MISMO mint con el MISMO monto aparece en
+        # ambos lados (sent y received). Es un salto intermedio del agregador/loop
+        # (bounce in/out de la pool con impacto neto cero para el trader), NO una
+        # venta real. Es la causa de buys con wrapping clasificados como SELL
+        # cuando accountData no trae balances (deltas={}).
+        def _same_amount(a: float, b: float) -> bool:
+            return abs(a - b) <= max(1e-6, abs(a) * 1e-6)
+
+        neutral_sent: list[dict] = []
+        neutral_rcvd_idx: set[int] = set()
+        for sent_item in tokens_sent:
+            match_idx = next(
+                (
+                    i for i, r in enumerate(tokens_received)
+                    if i not in neutral_rcvd_idx
+                    and r["mint"] == sent_item["mint"]
+                    and _same_amount(r["amount"], sent_item["amount"])
+                ),
+                None,
+            )
+            if match_idx is not None:
+                neutral_rcvd_idx.add(match_idx)
+                logger.debug(
+                    "CopyTrade: hop neutral eliminado {} ({:.4f})",
+                    sent_item["mint"][:12] + "...", sent_item["amount"],
+                )
+            else:
+                neutral_sent.append(sent_item)
+        tokens_sent = neutral_sent
+        tokens_received = [
+            r for i, r in enumerate(tokens_received) if i not in neutral_rcvd_idx
+        ]
+        n_hops_neutral = len(neutral_rcvd_idx)
+
         # Detectar porcentaje de venta desde tokenBalanceChanges
         # Usamos el CAMBIO DE BALANCE DEL TRADER (no nuestra posicion) como
         # señal fiel de compra/venta. mintAmount > 0 = balance subio = compra
@@ -642,12 +676,13 @@ class CopyTradingStrategy(Strategy):
         amount_sol = 0.0
 
         logger.info(
-            "CopyTrade classify: trader={} tokens_sent={} tokens_rcvd={} sol_spent={:.6f} sol_rcvd={:.6f} is_pump={} deltas={}",
+            "CopyTrade classify: trader={} tokens_sent={} tokens_rcvd={} sol_spent={:.6f} sol_rcvd={:.6f} is_pump={} deltas={} neutral_hops={}",
             trader[:8] + "..." if trader else "?",
             [(t["mint"][:8] + "...", t["amount"]) for t in tokens_sent[:2]],
             [(t["mint"][:8] + "...", t["amount"]) for t in tokens_received[:2]],
             sol_spent, sol_received, is_pump_fun,
             {m[:8] + "...": round(d, 4) for m, d in list(trader_delta_by_mint.items())[:3]},
+            n_hops_neutral,
         )
 
         # IMPORTANT: Check tokens_sent FIRST (sells) before tokens_received (buys)
