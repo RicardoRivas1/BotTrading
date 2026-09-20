@@ -726,13 +726,42 @@ class CopyTradingStrategy(Strategy):
                 )
             else:
                 sol_ratio = sol_spent / sol_received if sol_received > 0 else 999
-                if is_pump_fun and sol_ratio > 10 and tokens_received:
+                # Compra multi-hop: el trader GASTO SOL neto y RECIBE tokens.
+                # (cubre pump.fun wrapping, agregadores y hops asimetricos cuando
+                # accountData no trae balances). Guard rotacion: si ya tenemos
+                # posicion del token ENVIADO, es una rotacion -> vender la nuestra.
+                if tokens_received and sol_spent > sol_received:
+                    sent_held = (
+                        self.executor.positions.get(sent_mint)
+                        or self.tracker.positions.get(sent_mint)
+                    )
+                    rcvd_held = (
+                        self.executor.positions.get(tokens_received[0]["mint"])
+                        or self.tracker.positions.get(tokens_received[0]["mint"])
+                    )
+                    if sent_held and not rcvd_held:
+                        token_mint = sent_mint
+                        action = "sell"
+                        amount_sol = sol_received if sol_received > 0 else sol_spent
+                        logger.info(
+                            "CopyTrade: rotacion (vendo algo que tenemos) {} | mint={} | SOL_rcvd={:.6f}",
+                            signature[:16] + "...", token_mint[:12] + "...", sol_received,
+                        )
+                    else:
+                        token_mint = tokens_received[0]["mint"]
+                        action = "buy"
+                        amount_sol = sol_spent if sol_spent > 0 else sol_received
+                        logger.info(
+                            "CopyTrade: multi-hop buy (SOL neto gastado) {} | mint={} | SOL_spent={:.6f} sol_rcvd={:.6f} ratio={:.0f}x",
+                            signature[:16] + "...", token_mint[:12] + "...", sol_spent, sol_received, sol_ratio,
+                        )
+                elif sol_ratio > 10 and tokens_received:
                     token_mint = tokens_received[0]["mint"]
                     action = "buy"
                     amount_sol = sol_spent
                     logger.info(
-                        "CopyTrade: pump.fun buy (wrapping intermedio) {} | mint={} | SOL_spent={:.6f} sol_rcvd={:.6f} ratio={:.0f}x",
-                        signature[:16] + "...", token_mint[:12] + "...", sol_spent, sol_received, sol_ratio,
+                        "CopyTrade: buy con wrapper (ratio {:.0f}x) {} | mint={} | SOL_spent={:.6f} sol_rcvd={:.6f}",
+                        sol_ratio, signature[:16] + "...", token_mint[:12] + "...", sol_spent, sol_received,
                     )
                 else:
                     token_mint = sent_mint
@@ -970,12 +999,25 @@ class CopyTradingStrategy(Strategy):
                             existing.sol_invested += signal.amount_sol
                             if existing.entry_price and existing.entry_price > 0:
                                 existing.token_amount_ui += signal.amount_sol / existing.entry_price
+                                existing.token_amount_ui = max(
+                                    existing.token_amount_ui,
+                                    existing.sol_invested / existing.entry_price,
+                                )
                         if tracker_pos:
                             tracker_pos.amount += signal.amount_sol
                         logger.info(
-                            "CopyTrading: BUY acumulado {} | +{:.6f} SOL ({})",
+                            "CopyTrading: BUY acumulado {} | +{:.6f} SOL ({}) | total_investido={:.6f}",
                             signal.source, signal.amount_sol,
                             signal.token_mint[:8] + "...",
+                            existing.sol_invested if existing else tracker_pos.amount,
+                        )
+                        from core.stats import get_trade_stats
+                        get_trade_stats().record_buy(signal.wallet)
+                        await self.notifier.send_buy(
+                            signal.token_mint,
+                            signal.amount_sol,
+                            symbol=signal.token_symbol or signal.token_mint[:6].upper(),
+                            dry_run=self.config.trading.DRY_RUN,
                         )
                         return
 
@@ -1101,6 +1143,21 @@ class CopyTradingStrategy(Strategy):
                             logger.debug(
                                 "PnL no disponible: sin token_amount_ui para {} | sol_invested={:.6f}",
                                 signal.token_mint[:12] + "...", sol_invested,
+                            )
+                    else:
+                        # Sin entry ni precio actual: estimar con SOL invertido vs recibido
+                        sol_invested = 0.0
+                        if position:
+                            sol_invested = getattr(position, "sol_invested", 0.0) or 0.0
+                        if sol_invested <= 0 and tracker_pos:
+                            sol_invested = getattr(tracker_pos, "amount", 0.0) or 0.0
+                        if sol_invested <= 0:
+                            sol_invested = signal.amount_sol
+                        if sol_invested > 0:
+                            pnl_pct = (signal.amount_sol - sol_invested) / sol_invested * 100
+                            logger.info(
+                                "PnL estimado (sin entry/precio): sell={:.6f} vs invested={:.6f} => {:.2f}%",
+                                signal.amount_sol, sol_invested, pnl_pct,
                             )
 
                     # Default to 100% if sell_pct not detected
