@@ -299,23 +299,17 @@ class CopyTradingStrategy(Strategy):
         asyncio.create_task(self._rpc_poll_loop())
 
     async def _rpc_poll_loop(self) -> None:
-        """Poll wallets via getSignaturesForAddress to detect trades faster than webhooks.
+        """Poll wallets via getSignaturesForAddress to detect trades.
 
-        Uses a persistent session, distributes requests across the interval,
-        and applies exponential backoff on 429 rate limits.
+        Rotates 1 wallet per cycle to stay within Helius rate limits.
+        On persistent 429, disables RPC polling and relies on webhooks.
         """
         from config import load_config
 
         cfg = load_config()
         rpc_url = cfg.solana.HELIUS_RPC_URL
 
-        # Auto-fix: if rpc_url is just an API key (no URL), build the full URL
         if rpc_url and not rpc_url.startswith("http"):
-            logger.warning(
-                "CopyTrading: HELIUS_RPC_URL parece ser solo un API key ('{}...'), "
-                "auto-detectando URL completa...",
-                rpc_url[:8],
-            )
             rpc_url = f"https://mainnet.helius-rpc.com/?api-key={rpc_url}"
 
         helius_api_key = os.getenv("HELIUS_API_KEY", "")
@@ -323,127 +317,100 @@ class CopyTradingStrategy(Strategy):
             helius_api_key = rpc_url.split("api-key=")[-1].split("&")[0]
 
         if not rpc_url or not rpc_url.startswith("http"):
-            logger.error("CopyTrading: RPC URL invalida '{}'. Polling deshabilitado.", rpc_url)
+            logger.error("CopyTrading: RPC URL invalida. Polling deshabilitado.")
             return
 
-        logger.info("CopyTrading: RPC polling con URL: {}...", rpc_url[:60])
-
-        # Track last seen signature per wallet
-        last_sig: dict[str, str] = {}
-
-        # Base interval between full poll cycles (seconds)
-        BASE_INTERVAL = 10.0
-        # Max backoff on 429 errors (seconds)
-        MAX_BACKOFF = 120.0
-        backoff = 0.0
+        last_sig = {}
+        POLL_INTERVAL = 30.0
+        MAX_429_BEFORE_DISABLE = 3
+        consecutive_429 = 0
+        wallet_index = 0
+        disabled = False
 
         import aiohttp
 
         async with aiohttp.ClientSession() as session:
-            # Initialize with current latest sig for each wallet (one at a time to avoid 429)
-            for addr in self.wallets:
+            wallet_addrs = list(self.wallets.keys())
+            if not wallet_addrs:
+                return
+
+            logger.info(
+                "CopyTrading: RPC polling activo ({} wallets, 1 por ciclo de {}s)",
+                len(wallet_addrs), POLL_INTERVAL,
+            )
+
+            while not disabled:
+                await asyncio.sleep(POLL_INTERVAL)
+                if self._state != StrategyState.RUNNING:
+                    continue
+
+                addr = wallet_addrs[wallet_index % len(wallet_addrs)]
+                wallet_index += 1
+
                 try:
                     payload = {
                         "jsonrpc": "2.0", "id": 1,
                         "method": "getSignaturesForAddress",
-                        "params": [addr, {"limit": 1}],
+                        "params": [addr, {"limit": 5}],
                     }
                     async with session.post(rpc_url, json=payload) as resp:
                         if resp.status == 429:
-                            logger.warning("CopyTrading: 429 during init, reintentando en 30s...")
-                            await asyncio.sleep(30)
-                            async with session.post(rpc_url, json=payload) as retry_resp:
-                                data = await retry_resp.json()
-                                sigs = data.get("result", [])
-                        else:
-                            data = await resp.json()
-                            sigs = data.get("result", [])
-                    if sigs:
-                        last_sig[addr] = sigs[0]["signature"]
-                    await asyncio.sleep(0.5)  # spacing between init requests
-                except Exception as exc:
-                    logger.warning("CopyTrading: init falló para {}: {}", addr[:8], exc)
-            logger.info("CopyTrading: RPC polling init para {} wallets", len(last_sig))
-
-            # Main polling loop
-            while True:
-                await asyncio.sleep(BASE_INTERVAL + backoff)
-                if self._state != StrategyState.RUNNING:
-                    continue
-
-                hit_429 = False
-                new_txs = 0
-
-                # Poll each wallet with spacing to avoid rate limits
-                for addr in self.wallets:
-                    if hit_429:
-                        break
-                    try:
-                        payload = {
-                            "jsonrpc": "2.0", "id": 1,
-                            "method": "getSignaturesForAddress",
-                            "params": [addr, {"limit": 5}],
-                        }
-                        async with session.post(rpc_url, json=payload) as resp:
-                            if resp.status == 429:
-                                hit_429 = True
-                                break
-                            data = await resp.json()
-
-                        sigs = data.get("result", [])
-                        if not sigs:
-                            await asyncio.sleep(0.3)
-                            continue
-
-                        prev = last_sig.get(addr, "")
-                        new_sigs = []
-                        for s in sigs:
-                            if s["signature"] == prev:
-                                break
-                            new_sigs.append(s["signature"])
-                        if not new_sigs:
-                            await asyncio.sleep(0.3)
-                            continue
-
-                        last_sig[addr] = sigs[0]["signature"]
-
-                        # Fetch enhanced transaction data from Helius
-                        if not helius_api_key:
-                            await asyncio.sleep(0.3)
-                            continue
-                        enhance_url = f"https://api.helius.xyz/v0/transactions/?api-key={helius_api_key}"
-                        enhance_payload = {"transactions": new_sigs}
-                        async with session.post(enhance_url, json=enhance_payload) as resp:
-                            if resp.status == 429:
-                                hit_429 = True
-                                break
-                            if resp.status != 200:
-                                await asyncio.sleep(0.3)
+                            consecutive_429 += 1
+                            if consecutive_429 >= MAX_429_BEFORE_DISABLE:
+                                logger.warning(
+                                    "CopyTrading: {} 429 seguidos. RPC polling DESHABILITADO. "
+                                    "Usando solo webhooks de Helius.",
+                                    consecutive_429,
+                                )
+                                disabled = True
                                 continue
-                            enhanced_txs = await resp.json()
+                            logger.warning(
+                                "CopyTrading: 429 ({}/{}). Reintentando en {}s...",
+                                consecutive_429, MAX_429_BEFORE_DISABLE,
+                                POLL_INTERVAL * 2,
+                            )
+                            await asyncio.sleep(POLL_INTERVAL)
+                            continue
+                        data = await resp.json()
 
-                        for tx in enhanced_txs:
-                            await self._process_transaction(tx)
-                            new_txs += 1
+                    consecutive_429 = 0
 
-                        await asyncio.sleep(0.3)  # spacing between wallet requests
+                    sigs = data.get("result", [])
+                    if not sigs:
+                        continue
 
-                    except Exception as exc:
-                        logger.debug("CopyTrading: poll error para {}: {}", addr[:8], exc)
-                        await asyncio.sleep(0.3)
+                    prev = last_sig.get(addr, "")
+                    new_sigs = []
+                    for s in sigs:
+                        if s["signature"] == prev:
+                            break
+                        new_sigs.append(s["signature"])
+                    if not new_sigs:
+                        continue
 
-                # Adjust backoff based on rate limiting
-                if hit_429:
-                    backoff = min(backoff * 2 + 5, MAX_BACKOFF)
-                    logger.warning(
-                        "CopyTrading: rate limit (429) detectado. Backoff: {:.0f}s (próximo ciclo en {:.0f}s)",
-                        backoff, BASE_INTERVAL + backoff,
-                    )
-                else:
-                    if backoff > 0:
-                        backoff = max(0, backoff - 2)
-                    if new_txs > 0:
-                        logger.info("CopyTrading: {} nuevas transacciones detectadas via RPC", new_txs)
+                    last_sig[addr] = sigs[0]["signature"]
+
+                    if not helius_api_key:
+                        continue
+                    enhance_url = f"https://api.helius.xyz/v0/transactions/?api-key={helius_api_key}"
+                    enhance_payload = {"transactions": new_sigs}
+                    async with session.post(enhance_url, json=enhance_payload) as resp:
+                        if resp.status == 429:
+                            consecutive_429 += 1
+                            continue
+                        if resp.status != 200:
+                            continue
+                        enhanced_txs = await resp.json()
+
+                    for tx in enhanced_txs:
+                        await self._process_transaction(tx)
+
+                except Exception as exc:
+                    logger.debug("CopyTrading: poll error para {}: {}", addr[:8], exc)
+
+        if disabled:
+            logger.info("CopyTrading: operando solo via webhooks (RPC polling deshabilitado)")
+
 
     async def stop(self) -> None:
         """Detiene la estrategia."""
