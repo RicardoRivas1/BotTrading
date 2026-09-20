@@ -199,18 +199,6 @@ class PositionTracker:
             pos.current_price_updated_at = now
 
         if current_price is None or current_price <= 0:
-            # Sin precio conocido: verificar TIME_EXPIRED de todos modos para
-            # que posiciones en tokens muertos/sin liquidez puedan cerrarse.
-            if now - pos.created_at > MAX_HOLD_TIME_SEC:
-                logger.info(
-                    "⏳ TIME EXPIRED (sin precio) para {} ({}) tras {:.0f}s",
-                    mint, pos.symbol, MAX_HOLD_TIME_SEC,
-                )
-                ok = await process_sell_and_notify(
-                    pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=0.0,
-                )
-                if ok:
-                    self.remove_position(mint)
             return
 
         # --- Asignación dinámica del precio de entrada (BASE) ---
@@ -288,18 +276,18 @@ class PositionTracker:
                         self.remove_position(mint)
                     return
 
-        # --- TIME_EXPIRED: cierre forzado si se superó el hold máximo ---
-        if now - pos.created_at > MAX_HOLD_TIME_SEC:
-            logger.info(
-                "⏳ TIME EXPIRED para {} ({}) tras {:.0f}s (PnL {:+.2f}%)",
-                mint, pos.symbol, MAX_HOLD_TIME_SEC, pnl_pct,
-            )
-            ok = await process_sell_and_notify(
-                pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=pnl_pct
-            )
-            if ok:
-                self.remove_position(mint)
-            return
+        # --- TIME_EXPIRED DESHABILITADO: solo cerrar si el trader cierra ---
+        # if now - pos.created_at > MAX_HOLD_TIME_SEC:
+        #     logger.info(
+        #         "⏳ TIME EXPIRED para {} ({}) tras {:.0f}s (PnL {:+.2f}%)",
+        #         mint, pos.symbol, MAX_HOLD_TIME_SEC, pnl_pct,
+        #     )
+        #     ok = await process_sell_and_notify(
+        #         pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=pnl_pct
+        #     )
+        #     if ok:
+        #         self.remove_position(mint)
+        #     return
 
         # Progreso: si la posición sigue abierta (no se vendió por TP/SL o
         # TIME_EXPIRED), se reporta su estado periódicamente o ante saltos de

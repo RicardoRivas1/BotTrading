@@ -411,6 +411,36 @@ class CopyTradingStrategy(Strategy):
         )
 
         signal = self._parse_trade(tx, tracked, wallet_address=wallet_address)
+
+        # DUMP every failed parse for debugging
+        if not signal:
+            import json
+            tt = tx.get("tokenTransfers", [])
+            nt = tx.get("nativeTransfers", [])
+            ad = tx.get("accountData", [])
+            desc = tx.get("description", "")[:200]
+            tbc_summary = []
+            for acct in ad[:5]:
+                for tbc in acct.get("tokenBalanceChanges", []):
+                    tbc_summary.append({
+                        "acct": acct.get("account", "")[:12],
+                        "mint": tbc.get("mint", "")[:12],
+                        "tokenAmt": tbc.get("tokenAmount", 0),
+                        "mintAmt": tbc.get("mintAmount", 0),
+                    })
+            logger.warning(
+                "PARSE_FAIL type={} fp={} trader={} sig={}\n"
+                "  tt_count={} nt_count={} ad_count={}\n"
+                "  tt={}\n  nt={}\n  tbc={}\n  desc={}",
+                tx_type, fee_payer[:12],
+                (wallet_address or fee_payer)[:12],
+                signature[:16],
+                len(tt), len(nt), len(ad),
+                json.dumps(tt[:2], default=str)[:400],
+                json.dumps(nt[:3], default=str)[:400],
+                json.dumps(tbc_summary[:5], default=str)[:400],
+                desc,
+            )
         if signal:
             await self._execute_copy_trade(signal)
 
@@ -551,14 +581,15 @@ class CopyTradingStrategy(Strategy):
                         amount_sol = sol_received
 
         if not action or not token_mint:
-            logger.debug(
+            logger.warning(
                 "CopyTrading: no se pudo determinar mint para {} | "
                 "trader={} | accounts={} | tokenTransfers={} | "
                 "sol_spent={:.6f} | sol_received={:.6f} | "
-                "tokens_rcvd={} | tokens_sent={}",
+                "tokens_rcvd={} | tokens_sent={} | desc={}",
                 signature[:16] + "...", trader[:8] + "...", len(account_data),
                 len(token_transfers), sol_spent, sol_received,
                 len(tokens_received), len(tokens_sent),
+                tx.get("description", "")[:120],
             )
             return None
 
