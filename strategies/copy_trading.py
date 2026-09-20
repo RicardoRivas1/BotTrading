@@ -264,17 +264,26 @@ class CopyTradingStrategy(Strategy):
         Compares tokens_sent in the transfer vs what we hold in executor
         and tracker positions. Returns 0-100.
         """
+        if tokens_sent_amount <= 0:
+            return 0.0
+
         # Try executor position first (has token_amount_ui)
         pos = self.executor.positions.get(mint)
         if pos and pos.token_amount_ui > 0:
-            return (tokens_sent_amount / pos.token_amount_ui) * 100.0
+            pct = (tokens_sent_amount / pos.token_amount_ui) * 100.0
+            return min(pct, 100.0)
 
         # Try tracker position (has amount in SOL, estimate tokens)
         tracker_pos = self.tracker.positions.get(mint)
         if tracker_pos and tracker_pos.amount > 0 and tracker_pos.buy_price > 0:
             estimated_tokens = tracker_pos.amount / tracker_pos.buy_price
             if estimated_tokens > 0:
-                return (tokens_sent_amount / estimated_tokens) * 100.0
+                pct = (tokens_sent_amount / estimated_tokens) * 100.0
+                # Guard: if pct > 1000, tokens_sent is likely in raw units (lamports),
+                # divide by 10^decimals to convert to UI
+                if pct > 1000.0:
+                    pct = (tokens_sent_amount / (estimated_tokens * 1e6)) * 100.0
+                return min(pct, 100.0)
 
         # If we have a position but can't estimate, assume full sell
         if tracker_pos or pos:

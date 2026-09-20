@@ -685,7 +685,7 @@ class JupiterExecutor:
         try_sequence = (
             ("pumpfun", "bonding_curve", "gecko", "dexscreener", "jupiter")
             if is_pump_mint
-            else ("jupiter", "gecko", "dexscreener", "pumpfun")
+            else ("bonding_curve", "pumpfun", "jupiter", "gecko", "dexscreener")
         )
 
         price_sol = 0.0
