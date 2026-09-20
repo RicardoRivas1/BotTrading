@@ -845,7 +845,10 @@ class CopyTradingStrategy(Strategy):
 
         # Caso 3b: Recibe SOL neto + tiene posiciones abiertas = VENTA
         # (Axiom sells: no tokenTransfers, trader receives SOL net)
-        elif sol_received > 0 and tracked.address:
+        # Guard: solo aplica si NO hay tokens involucrados. Si el trader RECIBE
+        # tokens y gasta SOL, eso es una COMPRA (Caso 1) y no debe ser capturado
+        # aqui por el pequeno cambio SOL (sol_received ~0.002).
+        elif sol_received > 0 and not tokens_received and not tokens_sent and tracked.address:
             wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
             if wallet_positions and sol_received > max(sol_spent, 0.001):
                 pos = wallet_positions[-1]
@@ -886,7 +889,7 @@ class CopyTradingStrategy(Strategy):
                     amount_sol = sol_spent
 
         # Caso 4: Solo recibe SOL (posible venta en bonding curve / Axiom)
-        elif action is None and sol_received > 0 and not tokens_sent:
+        elif action is None and sol_received > 0 and not tokens_sent and not tokens_received:
             # Usar sell_mint_from_balance si se detecto
             if sell_mint_from_balance:
                 token_mint = sell_mint_from_balance
