@@ -132,7 +132,14 @@ class CopyTradingStrategy(Strategy):
             )
 
     # ----------------------------------------------------------- Mint extraction helpers
-    _KNOWN_ADDRESSES: set[str] = {SOL_MINT} | set(DEX_PROGRAMS.values())
+    _KNOWN_ADDRESSES: set[str] = {
+        SOL_MINT,
+        # USDC / USDT (stablecoins que aparecen en swaps)
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+        # Wrapped SOL
+        "So11111111111111111111111111111111111111112",
+    } | set(DEX_PROGRAMS.values())
 
     def _extract_mint_from_account_data(
         self, account_data: list[dict[str, Any]], fee_payer: str
@@ -310,12 +317,12 @@ class CopyTradingStrategy(Strategy):
             if nt.get("toUserAccount") == trader
         )
 
-        # Analizar transfers de tokens (excluyendo SOL)
+        # Analizar transfers de tokens (excluyendo SOL y stablecoins)
         tokens_received = []
         tokens_sent = []
         for tt in token_transfers:
             mint = tt.get("mint", "")
-            if not mint or mint == SOL_MINT:
+            if not mint or mint in self._KNOWN_ADDRESSES:
                 continue
             amount = tt.get("tokenAmount", 0)
             if tt.get("toUserAccount") == trader:
