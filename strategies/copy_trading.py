@@ -876,13 +876,33 @@ class CopyTradingStrategy(Strategy):
                         entry = position.entry_price
                     elif tracker_pos and tracker_pos.buy_price and tracker_pos.buy_price > 0:
                         entry = tracker_pos.buy_price
-                    if entry > 0:
-                        try:
-                            current_price = await self.executor.get_token_price(signal.token_mint)
-                            if current_price > 0:
-                                pnl_pct = (current_price - entry) / entry * 100
-                        except Exception:
-                            pass
+
+                    current_price = 0.0
+                    try:
+                        current_price = await self.executor.get_token_price(signal.token_mint)
+                    except Exception:
+                        pass
+
+                    if entry > 0 and current_price > 0:
+                        pnl_pct = (current_price - entry) / entry * 100
+                    elif current_price > 0 and not entry:
+                        sol_invested = 0.0
+                        token_held = 0.0
+                        if position:
+                            sol_invested = getattr(position, "sol_invested", 0.0) or 0.0
+                            token_held = getattr(position, "token_amount_ui", 0.0) or 0.0
+                        if sol_invested <= 0 and tracker_pos:
+                            sol_invested = getattr(tracker_pos, "amount", 0.0) or 0.0
+                        if sol_invested <= 0:
+                            sol_invested = signal.amount_sol
+                        if token_held > 0:
+                            current_value = token_held * current_price
+                            pnl_pct = (current_value - sol_invested) / sol_invested * 100
+                        elif sol_invested > 0:
+                            logger.debug(
+                                "PnL no disponible: sin token_amount_ui para {} | sol_invested={:.6f}",
+                                signal.token_mint[:12] + "...", sol_invested,
+                            )
 
                     # Default to 100% if sell_pct not detected
                     pct = signal.sell_pct if signal.sell_pct > 0 else 100.0

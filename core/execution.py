@@ -452,6 +452,13 @@ class JupiterExecutor:
                     entry_price_sol = await self.get_token_price(token_mint)
             except Exception:
                 pass
+            if entry_price_sol <= 0 and via_pumpfun:
+                try:
+                    entry_price_sol = await self.get_token_price(token_mint)
+                except Exception:
+                    pass
+            if entry_price_sol <= 0 and token_qty_ui > 0 and self.buy_amount_sol > 0:
+                entry_price_sol = self.buy_amount_sol / token_qty_ui
         else:
             entry_price_sol = self.buy_amount_sol / token_qty_ui if token_qty_ui else 0.0
             if entry_price_sol <= 0:
