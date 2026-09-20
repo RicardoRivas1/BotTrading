@@ -575,41 +575,13 @@ class CopyTradingStrategy(Strategy):
         token_mint = None
         amount_sol = 0.0
 
-        # Caso 1: Recibe tokens y envia SOL = COMPRA
-        # BUT: if we already have a position for this token, it's a DEX sell
-        # (trader receives token change + SOL goes to buyer's ATA)
-        if tokens_received and sol_spent > 0:
-            tokens_received.sort(key=lambda t: t["amount"], reverse=True)
-            candidate_mint = tokens_received[0]["mint"]
-
-            # Check if we already hold this token → it's a SELL, not a buy
-            existing_pos = (
-                self.executor.positions.get(candidate_mint)
-                or self.tracker.positions.get(candidate_mint)
-            )
-            if existing_pos and tracked.address:
-                wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
-                has_position = any(wp.mint == candidate_mint for wp in wallet_positions)
-                if has_position:
-                    # This is a DEX sell - trader receives token change
-                    sell_pct = self._calc_sell_pct(candidate_mint, tokens_received[0]["amount"], tracked.address)
-                    if sell_pct > 5.0:
-                        action = "sell"
-                        token_mint = candidate_mint
-                        amount_sol = sol_spent
-                        logger.info(
-                            "CopyTrading: SELL (dex swap) {} | mint={} | SOL_out={:.6f} | sell_pct={:.0f}%",
-                            signature[:16] + "...", candidate_mint[:12] + "...", sol_spent, sell_pct,
-                        )
-
-            # If not already holding, it's a real buy
-            if action is None:
-                action = "buy"
-                token_mint = candidate_mint
-                amount_sol = sol_spent
+        # IMPORTANT: Check tokens_sent FIRST (sells) before tokens_received (buys)
+        # When a DEX sell happens, BOTH tokens_sent AND tokens_received can be present
+        # (trader sends tokens, receives change + SOL). Checking tokens_sent first
+        # prevents misclassifying sells as buys.
 
         # Caso 2: Envia tokens y recibe SOL = VENTA
-        elif tokens_sent and sol_received > 0:
+        if tokens_sent and sol_received > 0:
             action = "sell"
             tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
             token_mint = tokens_sent[0]["mint"]
@@ -622,10 +594,8 @@ class CopyTradingStrategy(Strategy):
             tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
             token_mint = tokens_sent[0]["mint"]
             amount_sol = sol_spent
-            # Calculate real sell_pct based on tokens sent vs position holdings
             sell_pct = self._calc_sell_pct(token_mint, tokens_sent[0]["amount"], tracked.address)
             if sell_pct < 5.0:
-                # Small transfer, likely not a real sell - skip
                 logger.debug(
                     "CopyTrade ignorado: small token transfer ({:.1f}%) {} | {}",
                     sell_pct, signature[:16] + "...", token_mint[:12] + "...",
@@ -641,10 +611,8 @@ class CopyTradingStrategy(Strategy):
         elif tokens_sent and sol_spent == 0 and sol_received == 0:
             tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
             candidate_mint = tokens_sent[0]["mint"]
-            # Calculate real sell_pct based on tokens sent vs position holdings
             sell_pct = self._calc_sell_pct(candidate_mint, tokens_sent[0]["amount"], tracked.address)
             if sell_pct < 5.0:
-                # Small token transfer between wallets, not a sell
                 return None
             if tracked.address:
                 wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
@@ -675,6 +643,15 @@ class CopyTradingStrategy(Strategy):
                     "CopyTrading: SELL by wallet match (net SOL) {} -> {} ({}) | {:.6f} SOL",
                     tracked.label, pos.symbol, pos.mint[:12] + "...", sol_received,
                 )
+
+        # Caso 1: Recibe tokens y envia SOL = COMPRA
+        # This is checked AFTER all sell cases to prevent misclassifying sells as buys.
+        # When DEX sell happens, both tokens_sent and tokens_received can be present.
+        elif tokens_received and sol_spent > 0:
+            tokens_received.sort(key=lambda t: t["amount"], reverse=True)
+            token_mint = tokens_received[0]["mint"]
+            action = "buy"
+            amount_sol = sol_spent
 
         # Caso 3: Solo envio de SOL (posible compra en bonding curve)
         if action is None and sol_spent > 0 and not tokens_received:
