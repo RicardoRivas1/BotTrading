@@ -258,6 +258,31 @@ class CopyTradingStrategy(Strategy):
                 return tracked
         return None
 
+    def _calc_sell_pct(self, mint: str, tokens_sent_amount: float, wallet: str) -> float:
+        """Calculate what percentage of our position is being sold.
+
+        Compares tokens_sent in the transfer vs what we hold in executor
+        and tracker positions. Returns 0-100.
+        """
+        # Try executor position first (has token_amount_ui)
+        pos = self.executor.positions.get(mint)
+        if pos and pos.token_amount_ui > 0:
+            return (tokens_sent_amount / pos.token_amount_ui) * 100.0
+
+        # Try tracker position (has amount in SOL, estimate tokens)
+        tracker_pos = self.tracker.positions.get(mint)
+        if tracker_pos and tracker_pos.amount > 0 and tracker_pos.buy_price > 0:
+            estimated_tokens = tracker_pos.amount / tracker_pos.buy_price
+            if estimated_tokens > 0:
+                return (tokens_sent_amount / estimated_tokens) * 100.0
+
+        # If we have a position but can't estimate, assume full sell
+        if tracker_pos or pos:
+            return 100.0
+
+        # No position found - not a sell at all
+        return 0.0
+
     async def start(self) -> None:
         """Inicia la estrategia de copy trading y el polling de RPC."""
         self._set_state(StrategyState.RUNNING)
@@ -542,11 +567,37 @@ class CopyTradingStrategy(Strategy):
         amount_sol = 0.0
 
         # Caso 1: Recibe tokens y envia SOL = COMPRA
+        # BUT: if we already have a position for this token, it's a DEX sell
+        # (trader receives token change + SOL goes to buyer's ATA)
         if tokens_received and sol_spent > 0:
-            action = "buy"
             tokens_received.sort(key=lambda t: t["amount"], reverse=True)
-            token_mint = tokens_received[0]["mint"]
-            amount_sol = sol_spent
+            candidate_mint = tokens_received[0]["mint"]
+
+            # Check if we already hold this token → it's a SELL, not a buy
+            existing_pos = (
+                self.executor.positions.get(candidate_mint)
+                or self.tracker.positions.get(candidate_mint)
+            )
+            if existing_pos and tracked.address:
+                wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
+                has_position = any(wp.mint == candidate_mint for wp in wallet_positions)
+                if has_position:
+                    # This is a DEX sell - trader receives token change
+                    sell_pct = self._calc_sell_pct(candidate_mint, tokens_received[0]["amount"], tracked.address)
+                    if sell_pct > 5.0:
+                        action = "sell"
+                        token_mint = candidate_mint
+                        amount_sol = sol_spent
+                        logger.info(
+                            "CopyTrading: SELL (dex swap) {} | mint={} | SOL_out={:.6f} | sell_pct={:.0f}%",
+                            signature[:16] + "...", candidate_mint[:12] + "...", sol_spent, sell_pct,
+                        )
+
+            # If not already holding, it's a real buy
+            if action is None:
+                action = "buy"
+                token_mint = candidate_mint
+                amount_sol = sol_spent
 
         # Caso 2: Envia tokens y recibe SOL = VENTA
         elif tokens_sent and sol_received > 0:
@@ -559,33 +610,45 @@ class CopyTradingStrategy(Strategy):
         # Axiom/Pump sells: CENTED sends tokens to buyer, SOL goes to buyer's ATA,
         # but the DEX return SOL comes via the program, not shown in nativeTransfers.
         elif tokens_sent and sol_spent > 0 and sol_received == 0:
-            action = "sell"
             tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
             token_mint = tokens_sent[0]["mint"]
-            amount_sol = 0.0  # SOL return unknown from nativeTransfers
-            sell_pct = 100.0
+            amount_sol = sol_spent
+            # Calculate real sell_pct based on tokens sent vs position holdings
+            sell_pct = self._calc_sell_pct(token_mint, tokens_sent[0]["amount"], tracked.address)
+            if sell_pct < 5.0:
+                # Small transfer, likely not a real sell - skip
+                logger.debug(
+                    "CopyTrade ignorado: small token transfer ({:.1f}%) {} | {}",
+                    sell_pct, signature[:16] + "...", token_mint[:12] + "...",
+                )
+                return None
+            action = "sell"
             logger.info(
-                "CopyTrading: SELL (dex program) {} | tokens_sent={} | SOL_out={:.6f}",
-                signature[:16] + "...", tokens_sent[0]["mint"][:12] + "...", sol_spent,
+                "CopyTrading: SELL (dex program) {} | tokens_sent={} | SOL_out={:.6f} | sell_pct={:.0f}%",
+                signature[:16] + "...", token_mint[:12] + "...", sol_spent, sell_pct,
             )
 
         # Caso 2c: Envia tokens sin SOL = possible DEX sell (SOL via program) or wallet transfer
         elif tokens_sent and sol_spent == 0 and sol_received == 0:
-            # Check if any open position matches this token → it's a sell
+            tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
+            candidate_mint = tokens_sent[0]["mint"]
+            # Calculate real sell_pct based on tokens sent vs position holdings
+            sell_pct = self._calc_sell_pct(candidate_mint, tokens_sent[0]["amount"], tracked.address)
+            if sell_pct < 5.0:
+                # Small token transfer between wallets, not a sell
+                return None
             if tracked.address:
                 wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
                 for wp in wallet_positions:
-                    if wp.mint in [t["mint"] for t in tokens_sent]:
+                    if wp.mint == candidate_mint:
                         token_mint = wp.mint
                         action = "sell"
                         amount_sol = 0.0
-                        sell_pct = 100.0
                         logger.info(
-                            "CopyTrading: SELL (token dump match) {} -> {} ({})",
-                            tracked.label, wp.symbol, wp.mint[:12] + "...",
+                            "CopyTrading: SELL (token transfer) {} -> {} ({}) | sell_pct={:.0f}%",
+                            tracked.label, wp.symbol, wp.mint[:12] + "...", sell_pct,
                         )
                         break
-            # If no position match, could be a wallet-to-wallet token transfer, skip
             if action is None:
                 return None
 
@@ -800,23 +863,9 @@ class CopyTradingStrategy(Strategy):
                     position = self.executor.positions.get(signal.token_mint)
                     tracker_pos = self.tracker.positions.get(signal.token_mint)
 
-                    # Fallback: find ALL positions from this wallet and sell them
-                    if not position and not tracker_pos and signal.wallet:
-                        wallet_positions = self.tracker.get_positions_by_wallet(signal.wallet)
-                        if wallet_positions:
-                            # Sell the most recent position from this wallet
-                            pos = wallet_positions[-1]
-                            signal.token_mint = pos.mint
-                            signal.token_symbol = pos.symbol
-                            tracker_pos = pos
-                            logger.info(
-                                "CopyTrading: SELL por wallet {} -> vendiendo {} ({})",
-                                signal.wallet[:8] + "...", pos.symbol, pos.mint[:12] + "...",
-                            )
-
                     if not position and not tracker_pos:
                         logger.info(
-                            "CopyTrading: SELL ignorado {} ({}) - no hay posicion",
+                            "CopyTrading: SELL ignorado {} ({}) - posicion no encontrada (ya vendida o no existe)",
                             signal.source, signal.token_mint[:8] + "...",
                         )
                         return
