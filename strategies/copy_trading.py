@@ -482,7 +482,7 @@ class CopyTradingStrategy(Strategy):
 
             tracked = self._find_tracked_wallet_in_transfers(tx)
             if not tracked:
-                logger.warning(
+                logger.debug(
                     "CopyTrading: fee_payer {} no es wallet monitoreada. "
                     "senders={} receivers={} sig={}",
                     fee_payer[:12] + "...",
@@ -650,11 +650,24 @@ class CopyTradingStrategy(Strategy):
         # prevents misclassifying sells as buys.
 
         # Caso 2: Envia tokens y recibe SOL = VENTA
+        # BUT: pump.fun buys with intermediate wrapping show tokens_sent + tiny sol_rcvd
+        # (fee refund). If sol_spent >> sol_rcvd and is_pump_fun, it's actually a BUY.
         if tokens_sent and sol_received > 0:
-            action = "sell"
-            tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
-            token_mint = tokens_sent[0]["mint"]
-            amount_sol = sol_received
+            sol_ratio = sol_spent / sol_received if sol_received > 0 else 999
+            if is_pump_fun and sol_ratio > 10 and tokens_received:
+                tokens_received.sort(key=lambda t: t["amount"], reverse=True)
+                token_mint = tokens_received[0]["mint"]
+                action = "buy"
+                amount_sol = sol_spent
+                logger.info(
+                    "CopyTrade: pump.fun buy (wrapping intermedio) {} | mint={} | SOL_spent={:.6f} sol_rcvd={:.6f} ratio={:.0f}x",
+                    signature[:16] + "...", token_mint[:12] + "...", sol_spent, sol_received, sol_ratio,
+                )
+            else:
+                action = "sell"
+                tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
+                token_mint = tokens_sent[0]["mint"]
+                amount_sol = sol_received
 
         # Caso 2b: Envia tokens + envia SOL (DEX sell - SOL return via program, not nativeTransfers)
         # Axiom/Pump sells: CENTED sends tokens to buyer, SOL goes to buyer's ATA,
