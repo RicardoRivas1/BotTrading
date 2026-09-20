@@ -144,8 +144,11 @@ class CopyTradingStrategy(Strategy):
     def _extract_mint_from_account_data(
         self, account_data: list[dict[str, Any]], fee_payer: str
     ) -> Optional[str]:
-        """Intenta encontrar el mint del token que compro/vendio el fee_payer
-        analizando tokenBalanceChanges en accountData de Helius Enhanced."""
+        """Encuentra el mint del token que compro/vendio el fee_payer
+        analizando tokenBalanceChanges en accountData de Helius Enhanced.
+        Prioriza el token con mayor cambio absoluto (el token real de la operacion)."""
+        best_mint: Optional[str] = None
+        best_abs: int = 0
         for acct in account_data:
             for tbc in acct.get("tokenBalanceChanges", []):
                 user = tbc.get("userAccount", "")
@@ -160,14 +163,17 @@ class CopyTradingStrategy(Strategy):
                     amount = int(amount_str)
                 except (ValueError, TypeError):
                     amount = 0
-                if amount > 0:
-                    return mint
-        return None
+                if abs(amount) > best_abs:
+                    best_abs = abs(amount)
+                    best_mint = mint
+        return best_mint
 
     def _extract_mint_from_sent_tokens(
         self, account_data: list[dict[str, Any]], fee_payer: str
     ) -> Optional[str]:
         """Extrae el mint del token que envio (vendio) el fee_payer."""
+        best_mint: Optional[str] = None
+        best_abs: int = 0
         for acct in account_data:
             for tbc in acct.get("tokenBalanceChanges", []):
                 user = tbc.get("userAccount", "")
@@ -182,9 +188,10 @@ class CopyTradingStrategy(Strategy):
                     amount = int(amount_str)
                 except (ValueError, TypeError):
                     amount = 0
-                if amount < 0:
-                    return mint
-        return None
+                if amount < 0 and abs(amount) > best_abs:
+                    best_abs = abs(amount)
+                    best_mint = mint
+        return best_mint
 
     def _extract_mint_from_description(self, description: str) -> Optional[str]:
         """Busca un mint en la descripcion de la transaccion, excluyendo
@@ -338,12 +345,14 @@ class CopyTradingStrategy(Strategy):
         # Caso 1: Recibe tokens y envia SOL = COMPRA
         if tokens_received and sol_spent > 0:
             action = "buy"
+            tokens_received.sort(key=lambda t: t["amount"], reverse=True)
             token_mint = tokens_received[0]["mint"]
             amount_sol = sol_spent
 
         # Caso 2: Envia tokens y recibe SOL = VENTA
         elif tokens_sent and sol_received > 0:
             action = "sell"
+            tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
             token_mint = tokens_sent[0]["mint"]
             amount_sol = sol_received
 
