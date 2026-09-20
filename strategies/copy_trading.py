@@ -555,8 +555,42 @@ class CopyTradingStrategy(Strategy):
             token_mint = tokens_sent[0]["mint"]
             amount_sol = sol_received
 
+        # Caso 2b: Envia tokens + envia SOL (DEX sell - SOL return via program, not nativeTransfers)
+        # Axiom/Pump sells: CENTED sends tokens to buyer, SOL goes to buyer's ATA,
+        # but the DEX return SOL comes via the program, not shown in nativeTransfers.
+        elif tokens_sent and sol_spent > 0 and sol_received == 0:
+            action = "sell"
+            tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
+            token_mint = tokens_sent[0]["mint"]
+            amount_sol = 0.0  # SOL return unknown from nativeTransfers
+            sell_pct = 100.0
+            logger.info(
+                "CopyTrading: SELL (dex program) {} | tokens_sent={} | SOL_out={:.6f}",
+                signature[:16] + "...", tokens_sent[0]["mint"][:12] + "...", sol_spent,
+            )
+
+        # Caso 2c: Envia tokens sin SOL = transfer/token dump (ignorar si no es sell)
+        elif tokens_sent and sol_spent == 0 and sol_received == 0:
+            # Could be a wallet-to-wallet token transfer, not a trade
+            return None
+
+        # Caso 3b: Recibe SOL neto + tiene posiciones abiertas = VENTA
+        # (Axiom sells: no tokenTransfers, trader receives SOL net)
+        elif sol_received > 0 and tracked.address:
+            wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
+            if wallet_positions and sol_received > max(sol_spent, 0.001):
+                pos = wallet_positions[-1]
+                token_mint = pos.mint
+                action = "sell"
+                amount_sol = sol_received
+                sell_pct = 100.0
+                logger.info(
+                    "CopyTrading: SELL by wallet match (net SOL) {} -> {} ({}) | {:.6f} SOL",
+                    tracked.label, pos.symbol, pos.mint[:12] + "...", sol_received,
+                )
+
         # Caso 3: Solo envio de SOL (posible compra en bonding curve)
-        elif sol_spent > 0 and not tokens_received:
+        if action is None and sol_spent > 0 and not tokens_received:
             # 1) Intentar desde accountData (tokenBalanceChanges)
             token_mint = self._extract_mint_from_account_data(
                 account_data, trader, extra_exclude={fee_payer}
@@ -574,7 +608,7 @@ class CopyTradingStrategy(Strategy):
                     amount_sol = sol_spent
 
         # Caso 4: Solo recibe SOL (posible venta en bonding curve / Axiom)
-        elif sol_received > 0 and not tokens_sent:
+        elif action is None and sol_received > 0 and not tokens_sent:
             # Usar sell_mint_from_balance si se detecto
             if sell_mint_from_balance:
                 token_mint = sell_mint_from_balance
@@ -609,7 +643,7 @@ class CopyTradingStrategy(Strategy):
                             )
 
         # Caso 5: tokenBalanceChanges muestra trader perdiendo tokens (venta via programa)
-        elif sell_mint_from_balance and sell_pct > 0:
+        elif action is None and sell_mint_from_balance and sell_pct > 0:
             action = "sell"
             token_mint = sell_mint_from_balance
             amount_sol = sol_received if sol_received > 0 else 0.0
