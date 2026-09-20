@@ -248,10 +248,6 @@ class PositionTracker:
             current_price = 0.0
             logger.warning("No se pudo obtener precio de {} ({}): {}", mint, pos.symbol, exc)
 
-        if current_price is not None and current_price > 0:
-            pos.current_price = current_price
-            pos.current_price_updated_at = now
-
         if current_price is None or current_price <= 0:
             return
 

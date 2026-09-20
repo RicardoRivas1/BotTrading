@@ -590,22 +590,33 @@ class CopyTradingStrategy(Strategy):
         # Caso 2b: Envia tokens + envia SOL (DEX sell - SOL return via program, not nativeTransfers)
         # Axiom/Pump sells: CENTED sends tokens to buyer, SOL goes to buyer's ATA,
         # but the DEX return SOL comes via the program, not shown in nativeTransfers.
+        # NOTE: For pump.fun buys, Helius sometimes inverts token transfers:
+        # CENTED is shown as sender (fromUserAccount) when actually receiving tokens.
+        # In that case sell_pct < 5% (no existing position) and we should reclassify as BUY.
         elif tokens_sent and sol_spent > 0 and sol_received == 0:
             tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
             token_mint = tokens_sent[0]["mint"]
             amount_sol = sol_spent
             sell_pct = self._calc_sell_pct(token_mint, tokens_sent[0]["amount"], tracked.address)
             if sell_pct < 5.0:
-                logger.debug(
-                    "CopyTrade ignorado: small token transfer ({:.1f}%) {} | {}",
-                    sell_pct, signature[:16] + "...", token_mint[:12] + "...",
+                if is_pump_fun:
+                    logger.info(
+                        "CopyTrade: pump.fun buy (Helius inverted transfer) {} | tokens_sent would-be {} | SOL_spent={:.6f}",
+                        signature[:16] + "...", token_mint[:12] + "...", sol_spent,
+                    )
+                    action = "buy"
+                else:
+                    logger.debug(
+                        "CopyTrade ignorado: small token transfer ({:.1f}%) {} | {}",
+                        sell_pct, signature[:16] + "...", token_mint[:12] + "...",
+                    )
+                    return None
+            else:
+                action = "sell"
+                logger.info(
+                    "CopyTrading: SELL (dex program) {} | tokens_sent={} | SOL_out={:.6f} | sell_pct={:.0f}%",
+                    signature[:16] + "...", token_mint[:12] + "...", sol_spent, sell_pct,
                 )
-                return None
-            action = "sell"
-            logger.info(
-                "CopyTrading: SELL (dex program) {} | tokens_sent={} | SOL_out={:.6f} | sell_pct={:.0f}%",
-                signature[:16] + "...", token_mint[:12] + "...", sol_spent, sell_pct,
-            )
 
         # Caso 2c: Envia tokens sin SOL = possible DEX sell (SOL via program) or wallet transfer
         elif tokens_sent and sol_spent == 0 and sol_received == 0:
@@ -869,8 +880,20 @@ class CopyTradingStrategy(Strategy):
                     except Exception:
                         pass
 
+                    # get_token_price may have updated position.entry_price as side-effect
+                    if entry <= 0 and position and position.entry_price and position.entry_price > 0:
+                        entry = position.entry_price
+                        logger.debug(
+                            "PnL: entry_price adoptado de get_token_price side-effect = {:.10g} for {}",
+                            entry, signal.token_mint[:12] + "...",
+                        )
+
                     if entry > 0 and current_price > 0:
                         pnl_pct = (current_price - entry) / entry * 100
+                        logger.debug(
+                            "PnL calculado: entry={:.10g} current={:.10g} => {:.2f}% for {}",
+                            entry, current_price, pnl_pct, signal.token_mint[:12] + "...",
+                        )
                     elif current_price > 0 and not entry:
                         sol_invested = 0.0
                         token_held = 0.0
