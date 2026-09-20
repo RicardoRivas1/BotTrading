@@ -52,6 +52,7 @@ class CopyTradeSignal:
     tx_signature: str
     timestamp: float = field(default_factory=time.time)
     source: str = "helius_webhook"
+    sell_pct: float = 0.0  # 0-100: percentage to sell (100 = full, 25 = quarter)
 
 
 @dataclass
@@ -464,6 +465,32 @@ class CopyTradingStrategy(Strategy):
             elif tt.get("fromUserAccount") == trader:
                 tokens_sent.append({"mint": mint, "amount": amount})
 
+        # Detectar porcentaje de venta desde tokenBalanceChanges
+        sell_pct = 0.0
+        sell_mint_from_balance = None
+        for acct in account_data:
+            if acct.get("account") != trader:
+                continue
+            for tbc in acct.get("tokenBalanceChanges", []):
+                tbc_mint = tbc.get("mint", "")
+                if not tbc_mint or tbc_mint in excluded:
+                    continue
+                # tokenAmount = balance DESPUES de la tx
+                # mintAmount = tokens ganados (>0) o perdidos (<0)
+                mint_delta = tbc.get("mintAmount", 0)
+                final_balance = tbc.get("tokenAmount", 0)
+                if mint_delta < 0 and final_balance >= 0:
+                    tokens_sold = abs(mint_delta)
+                    remaining = final_balance
+                    total_before = tokens_sold + remaining
+                    if total_before > 0:
+                        sell_pct = (tokens_sold / total_before) * 100
+                        sell_mint_from_balance = tbc_mint
+                        logger.debug(
+                            "Sell pct calculado: {:.1f}% | sold={:.4f} remaining={:.4f} mint={}",
+                            sell_pct, tokens_sold, remaining, tbc_mint[:12],
+                        )
+
         # Determinar accion
         action = None
         token_mint = None
@@ -503,19 +530,25 @@ class CopyTradingStrategy(Strategy):
 
         # Caso 4: Solo recibe SOL (posible venta en bonding curve)
         elif sol_received > 0 and not tokens_sent:
-            token_mint = self._extract_mint_from_sent_tokens(
-                account_data, trader, extra_exclude={fee_payer}
-            )
-            if token_mint:
+            # Usar sell_mint_from_balance si se detecto
+            if sell_mint_from_balance:
+                token_mint = sell_mint_from_balance
                 action = "sell"
                 amount_sol = sol_received
             else:
-                token_mint = self._extract_mint_from_description(
-                    tx.get("description", ""), extra_exclude={fee_payer}
+                token_mint = self._extract_mint_from_sent_tokens(
+                    account_data, trader, extra_exclude={fee_payer}
                 )
                 if token_mint:
                     action = "sell"
                     amount_sol = sol_received
+                else:
+                    token_mint = self._extract_mint_from_description(
+                        tx.get("description", ""), extra_exclude={fee_payer}
+                    )
+                    if token_mint:
+                        action = "sell"
+                        amount_sol = sol_received
 
         if not action or not token_mint:
             logger.debug(
@@ -541,10 +574,11 @@ class CopyTradingStrategy(Strategy):
             amount_sol = max_amount
 
         source_label = "pump.fun" if is_pump_fun else "dex"
+        sell_info = f" | sell_pct={sell_pct:.0f}%" if action == "sell" and sell_pct > 0 else ""
         logger.info(
-            "CopyTrading: signal {} {} | mint={} | {:.6f} SOL | trader={} | src={}",
+            "CopyTrading: signal {} {} | mint={} | {:.6f} SOL | trader={} | src={}{}",
             action.upper(), signature[:16] + "...", token_mint[:12] + "...",
-            amount_sol, trader[:8] + "...", source_label,
+            amount_sol, trader[:8] + "...", source_label, sell_info,
         )
         return CopyTradeSignal(
             wallet=tracked.address,
@@ -555,6 +589,7 @@ class CopyTradingStrategy(Strategy):
             tx_signature=signature,
             timestamp=float(timestamp) if timestamp else time.time(),
             source=f"helius:{tracked.label}:{source_label}",
+            sell_pct=sell_pct,
         )
 
     async def _execute_copy_trade(self, signal: CopyTradeSignal) -> None:
@@ -568,8 +603,27 @@ class CopyTradingStrategy(Strategy):
                     if existing:
                         return
 
-                    max_pos = int(getattr(self.config.trading, "MAX_OPEN_POSITIONS", 3))
-                    if len(self.executor.positions) >= max_pos:
+                    # If max positions reached, close oldest from same wallet to rotate
+                    max_pos = int(getattr(self.config.trading, "MAX_OPEN_POSITIONS", 10))
+                    if len(self.executor.positions) >= max_pos and signal.wallet:
+                        wallet_positions = self.tracker.get_positions_by_wallet(signal.wallet)
+                        if wallet_positions:
+                            oldest = wallet_positions[0]
+                            logger.info(
+                                "CopyTrading: Rotacion - cerrando {} ({}) para abrir nuevo token",
+                                oldest.symbol, oldest.mint[:12] + "...",
+                            )
+                            await process_sell_and_notify(
+                                oldest.mint,
+                                symbol=oldest.symbol,
+                                reason="ROTATION",
+                                sell_pct=100.0,
+                            )
+                            self.executor.positions.pop(oldest.mint, None)
+                            self.tracker.positions.pop(oldest.mint, None)
+                        elif len(self.executor.positions) >= max_pos:
+                            return
+                    elif len(self.executor.positions) >= max_pos:
                         return
 
                     original_amount = self.executor.buy_amount_sol
@@ -653,20 +707,25 @@ class CopyTradingStrategy(Strategy):
                         except Exception:
                             pass
 
+                    # Default to 100% if sell_pct not detected
+                    pct = signal.sell_pct if signal.sell_pct > 0 else 100.0
+
                     await process_sell_and_notify(
                         signal.token_mint,
                         symbol=signal.token_symbol,
                         reason="COPY_TRADE_SELL",
                         pnl=pnl_pct,
+                        sell_pct=pct,
                     )
 
                     # Clean up positions from both executor and tracker
-                    self.executor.positions.pop(signal.token_mint, None)
-                    self.tracker.positions.pop(signal.token_mint, None)
+                    if pct >= 99.0:
+                        self.executor.positions.pop(signal.token_mint, None)
+                        self.tracker.positions.pop(signal.token_mint, None)
 
                     logger.success(
-                        "CopyTrading: SELL {} | {} | PnL: {:.2f}%",
-                        signal.source, signal.token_mint[:8] + "...", pnl_pct,
+                        "CopyTrading: SELL {} | {} | PnL: {:.2f}% | sell_pct: {:.0f}%",
+                        signal.source, signal.token_mint[:8] + "...", pnl_pct, pct,
                     )
 
             except Exception as exc:

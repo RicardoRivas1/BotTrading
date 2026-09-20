@@ -216,12 +216,14 @@ async def process_sell_and_notify(
     symbol: str = "N/A",
     reason: str = "",
     pnl: float = 0.0,
+    sell_pct: float = 100.0,
 ) -> bool:
     """Vende (real o simulado) y notifica el motivo de la salida TP/SL.
 
+    sell_pct: porcentaje a vender (100 = todo, 25 = cuarta parte, etc.)
     En DRY_RUN solo registra la venta simulada. En modo real, el balance de
     tokens se estima desde la posición del tracker (`amount / buy_price`) y la
-    totalidad se vende vía Jupiter. Devuelve True si la salida se ejecutó.
+    cantidad se ajusta por sell_pct. Devuelve True si la salida se ejecutó.
     """
     from core.notifier import TelegramNotifier
     from core.tracker import get_global_tracker
@@ -233,22 +235,38 @@ async def process_sell_and_notify(
     )
     tracker = get_global_tracker()
 
+    sell_pct = max(0.0, min(100.0, sell_pct))
+
     try:
         if cfg.trading.DRY_RUN:
             logger.info(
-                "[DRY_RUN] Venta simulada de {} ({}) por {} (PnL {:.2f}%)",
-                symbol, mint, reason, pnl,
+                "[DRY_RUN] Venta simulada de {} ({}) por {} (PnL {:.2f}%, pct={:.0f}%)",
+                symbol, mint, reason, pnl, sell_pct,
             )
-            # Also clean up executor.positions so MAX_OPEN_POSITIONS isn't blocked
-            tracker.executor.positions.pop(mint, None)
+            # If full sell, clean up positions
+            if sell_pct >= 99.0:
+                tracker.executor.positions.pop(mint, None)
+                tracker.positions.pop(mint, None)
         else:
             pos = tracker.get_position(mint)
             token_amount = (pos.amount / pos.buy_price) if pos and pos.buy_price else 0.0
             if token_amount <= 0:
                 logger.warning(f"Sin balance estimado para vender {symbol} ({mint}); omitiendo.")
                 return False
+            # Adjust by sell percentage
+            token_amount = token_amount * (sell_pct / 100.0)
+            if token_amount <= 0:
+                logger.warning(f"sell_pct={sell_pct:.0f}% resulta en 0 tokens para {symbol}; omitiendo.")
+                return False
             await tracker.executor.sell_token(mint, token_amount)
-            logger.success(f"Venta de {symbol} ({mint}) ejecutada por {reason} (PnL {pnl:.2f}%)")
+            logger.success(
+                "Venta de {} ({}) ejecutada por {} ({:.0f}% | PnL {:.2f}%)",
+                symbol, mint, reason, sell_pct, pnl,
+            )
+            # If full sell, clean up positions
+            if sell_pct >= 99.0:
+                tracker.executor.positions.pop(mint, None)
+                tracker.positions.pop(mint, None)
     except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
         logger.error(f"Error vendiendo {symbol} ({reason}): {exc}")
         await notifier.send_error(f"No se pudo vender {symbol} ({mint}) por {reason}: {exc}")
@@ -261,7 +279,7 @@ async def process_sell_and_notify(
     elif reason == "TRAILING_STOP":
         await notifier.send_trailing_stop(mint, pnl)
     else:
-        await notifier.send_status(f"Venta de {symbol} ({mint}) por {reason} (PnL {pnl:.2f}%)")
+        await notifier.send_status(f"Venta de {symbol} ({mint}) por {reason} ({sell_pct:.0f}% | PnL {pnl:.2f}%)")
     return True
 
 
