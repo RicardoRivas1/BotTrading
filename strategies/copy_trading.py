@@ -188,6 +188,24 @@ class CopyTradingStrategy(Strategy):
                 return candidate
         return None
 
+    def _find_tracked_wallet_in_transfers(self, tx: dict[str, Any]) -> Optional[TrackedWallet]:
+        """Si fee_payer no es una wallet monitoreada, busca en nativeTransfers
+        y tokenTransfers para ver si alguna wallet monitoreada participo."""
+        native_transfers = tx.get("nativeTransfers", [])
+        token_transfers = tx.get("tokenTransfers", [])
+        involved: set[str] = set()
+        for nt in native_transfers:
+            involved.add(nt.get("fromUserAccount", ""))
+            involved.add(nt.get("toUserAccount", ""))
+        for tt in token_transfers:
+            involved.add(tt.get("fromUserAccount", ""))
+            involved.add(tt.get("toUserAccount", ""))
+        for addr in involved:
+            tracked = self.wallets.get(addr)
+            if tracked and tracked.enabled:
+                return tracked
+        return None
+
     async def start(self) -> None:
         """Inicia la estrategia de copy trading."""
         self._set_state(StrategyState.RUNNING)
@@ -219,11 +237,22 @@ class CopyTradingStrategy(Strategy):
         signature = tx.get("signature", "")
 
         if tx_type not in COPY_TRADE_TYPES:
+            logger.debug(
+                "CopyTrading: tx filtrada por tipo '{}' (esperado {}): sig={}",
+                tx_type, COPY_TRADE_TYPES, signature[:16] + "...",
+            )
             return
 
         tracked = self.wallets.get(fee_payer)
+
         if not tracked or not tracked.enabled:
-            return
+            tracked = self._find_tracked_wallet_in_transfers(tx)
+            if not tracked:
+                logger.debug(
+                    "CopyTrading: fee_payer {} no es wallet monitoreada. sig={}",
+                    fee_payer[:12] + "...", signature[:16] + "...",
+                )
+                return
 
         # Deduplicacion
         if signature in self._recent_signals:
@@ -236,15 +265,15 @@ class CopyTradingStrategy(Strategy):
 
         self._inc_stat("trades_executed")
         logger.info(
-            "CopyTrading: trade detectado de {} ({})",
-            tracked.label, fee_payer[:8] + "...",
+            "CopyTrading: trade detectado de {} ({}) | type={} | sig={}",
+            tracked.label, fee_payer[:8] + "...", tx_type, signature[:16] + "...",
         )
 
         signal = self._parse_trade(tx, tracked)
         if signal:
             await self._execute_copy_trade(signal)
 
-    def _parse_trade(self, tx: dict[str, Any], tracked: TrackedWallet) -> Optional[CopyTradeSignal]:
+    def _parse_trade(self, tx: dict[str, Any], tracked: TrackedWallet, wallet_address: str = "") -> Optional[CopyTradeSignal]:
         """Extrae la senal de trading de una transaccion.
 
         Detecta especialmente transacciones de Pump.fun (bonding curve)
@@ -256,6 +285,8 @@ class CopyTradingStrategy(Strategy):
         token_transfers = tx.get("tokenTransfers", [])
         native_transfers = tx.get("nativeTransfers", [])
         account_data = tx.get("accountData", [])
+
+        trader = wallet_address or fee_payer
 
         # Detectar si es transaccion de Pump.fun
         is_pump_fun = False
@@ -271,12 +302,12 @@ class CopyTradingStrategy(Strategy):
         sol_spent = sum(
             nt.get("amount", 0) / 1e9
             for nt in native_transfers
-            if nt.get("fromUserAccount") == fee_payer
+            if nt.get("fromUserAccount") == trader
         )
         sol_received = sum(
             nt.get("amount", 0) / 1e9
             for nt in native_transfers
-            if nt.get("toUserAccount") == fee_payer
+            if nt.get("toUserAccount") == trader
         )
 
         # Analizar transfers de tokens (excluyendo SOL)
@@ -287,9 +318,9 @@ class CopyTradingStrategy(Strategy):
             if not mint or mint == SOL_MINT:
                 continue
             amount = tt.get("tokenAmount", 0)
-            if tt.get("toUserAccount") == fee_payer:
+            if tt.get("toUserAccount") == trader:
                 tokens_received.append({"mint": mint, "amount": amount})
-            elif tt.get("fromUserAccount") == fee_payer:
+            elif tt.get("fromUserAccount") == trader:
                 tokens_sent.append({"mint": mint, "amount": amount})
 
         # Determinar accion
@@ -312,7 +343,7 @@ class CopyTradingStrategy(Strategy):
         # Caso 3: Solo envio de SOL (posible compra en bonding curve)
         elif sol_spent > 0 and not tokens_received:
             # 1) Intentar desde accountData (tokenBalanceChanges)
-            token_mint = self._extract_mint_from_account_data(account_data, fee_payer)
+            token_mint = self._extract_mint_from_account_data(account_data, trader)
             if token_mint:
                 action = "buy"
                 amount_sol = sol_spent
@@ -327,7 +358,7 @@ class CopyTradingStrategy(Strategy):
 
         # Caso 4: Solo recibe SOL (posible venta en bonding curve)
         elif sol_received > 0 and not tokens_sent:
-            token_mint = self._extract_mint_from_sent_tokens(account_data, fee_payer)
+            token_mint = self._extract_mint_from_sent_tokens(account_data, trader)
             if token_mint:
                 action = "sell"
                 amount_sol = sol_received
