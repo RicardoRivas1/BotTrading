@@ -444,17 +444,18 @@ class JupiterExecutor:
             token_qty_ui = out_amount / (10 ** decimals) if decimals else 0.0
 
         if simulate:
+            # Usar la MISMA secuencia de fuentes que al vender (get_token_price),
+            # no una fuente distinta por pump/non-pump. Si la compra y la venta
+            # usan precios de fuentes distintas (curva virtual vs pool), el PnL
+            # se infla artificialmente cuando el token migra a pool entre ambas.
             entry_price_sol = 0.0
             try:
-                if via_pumpfun:
-                    entry_price_sol = await self._get_price_from_pumpfun(token_mint)
-                else:
-                    entry_price_sol = await self.get_token_price(token_mint)
+                entry_price_sol = await self.get_token_price(token_mint)
             except Exception:
                 pass
             if entry_price_sol <= 0 and via_pumpfun:
                 try:
-                    entry_price_sol = await self.get_token_price(token_mint)
+                    entry_price_sol = await self._get_price_from_pumpfun(token_mint)
                 except Exception:
                     pass
             if entry_price_sol <= 0 and token_qty_ui > 0 and self.buy_amount_sol > 0:
@@ -697,12 +698,12 @@ class JupiterExecutor:
 
     # --------------------------------------------------- Price / Monitoring
     async def get_token_price(self, token_mint: str) -> float:
-        is_pump_mint = str(token_mint).lower().endswith("pump")
-        try_sequence = (
-            ("pumpfun", "bonding_curve", "gecko", "dexscreener", "jupiter")
-            if is_pump_mint
-            else ("bonding_curve", "pumpfun", "jupiter", "gecko", "dexscreener")
-        )
+        # Secuencia UNICA y determinista para todas las llamadas (compra y venta).
+        # Usar secuencias distintas segun el estado del token hacia que el
+        # entry_price (bonding curve virtual) y el current_price (jupiter/gecko)
+        # fueran de ordenes de magnitud distintos => PnL inflado falso.
+        # Regla: Pump.fun API si sigue en bonding curve, si no DexScreener.
+        try_sequence = ("pumpfun", "bonding_curve", "dexscreener")
 
         price_sol = 0.0
         for source in try_sequence:
