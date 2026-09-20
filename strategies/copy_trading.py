@@ -239,17 +239,20 @@ class CopyTradingStrategy(Strategy):
 
     def _find_tracked_wallet_in_transfers(self, tx: dict[str, Any]) -> Optional[TrackedWallet]:
         """Si fee_payer no es una wallet monitoreada, busca en nativeTransfers
-        y tokenTransfers para ver si alguna wallet monitoreada participo."""
+        y tokenTransfers para ver si alguna wallet monitoreada participo como REMITENTE.
+
+        Solo coincidimos si la wallet monitoreada es el REMITENTE (fromUserAccount),
+        no el destinatario. Si alguien envia tokens A una wallet monitoreada,
+        eso no es un trade de esa wallet.
+        """
         native_transfers = tx.get("nativeTransfers", [])
         token_transfers = tx.get("tokenTransfers", [])
-        involved: set[str] = set()
+        senders: set[str] = set()
         for nt in native_transfers:
-            involved.add(nt.get("fromUserAccount", ""))
-            involved.add(nt.get("toUserAccount", ""))
+            senders.add(nt.get("fromUserAccount", ""))
         for tt in token_transfers:
-            involved.add(tt.get("fromUserAccount", ""))
-            involved.add(tt.get("toUserAccount", ""))
-        for addr in involved:
+            senders.add(tt.get("fromUserAccount", ""))
+        for addr in senders:
             tracked = self.wallets.get(addr)
             if tracked and tracked.enabled:
                 return tracked
