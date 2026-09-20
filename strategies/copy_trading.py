@@ -607,8 +607,12 @@ class CopyTradingStrategy(Strategy):
                 tokens_sent.append({"mint": mint, "amount": amount})
 
         # Detectar porcentaje de venta desde tokenBalanceChanges
+        # Usamos el CAMBIO DE BALANCE DEL TRADER (no nuestra posicion) como
+        # señal fiel de compra/venta. mintAmount > 0 = balance subio = compra
+        # (incluye DCA: compras repetidas del mismo token). < 0 = vendio.
         sell_pct = 0.0
         sell_mint_from_balance = None
+        trader_delta_by_mint: dict[str, float] = {}
         for acct in account_data:
             if acct.get("account") != trader:
                 continue
@@ -619,6 +623,7 @@ class CopyTradingStrategy(Strategy):
                 # mintAmount = tokens ganados (>0) o perdidos (<0)
                 mint_delta = tbc.get("mintAmount", 0)
                 final_balance = tbc.get("tokenAmount", 0)
+                trader_delta_by_mint[tbc_mint] = mint_delta
                 if mint_delta < 0 and final_balance >= 0:
                     tokens_sold = abs(mint_delta)
                     remaining = final_balance
@@ -637,11 +642,12 @@ class CopyTradingStrategy(Strategy):
         amount_sol = 0.0
 
         logger.debug(
-            "CopyTrade classify: trader={} tokens_sent={} tokens_rcvd={} sol_spent={:.6f} sol_rcvd={:.6f} is_pump={}",
+            "CopyTrade classify: trader={} tokens_sent={} tokens_rcvd={} sol_spent={:.6f} sol_rcvd={:.6f} is_pump={} deltas={}",
             trader[:8] + "..." if trader else "?",
             [(t["mint"][:8] + "...", t["amount"]) for t in tokens_sent[:2]],
             [(t["mint"][:8] + "...", t["amount"]) for t in tokens_received[:2]],
             sol_spent, sol_received, is_pump_fun,
+            {m[:8] + "...": round(d, 4) for m, d in list(trader_delta_by_mint.items())[:3]},
         )
 
         # IMPORTANT: Check tokens_sent FIRST (sells) before tokens_received (buys)
@@ -650,59 +656,106 @@ class CopyTradingStrategy(Strategy):
         # prevents misclassifying sells as buys.
 
         # Caso 2: Envia tokens y recibe SOL = VENTA
-        # BUT: pump.fun buys with intermediate wrapping show tokens_sent + tiny sol_rcvd
-        # (fee refund). If sol_spent >> sol_rcvd and is_pump_fun, it's actually a BUY.
+        # BUT: buys con wrapping intermedio (pump.fun) o swaps multi-hop (DEX)
+        # muestran un token "enviado" cuyo balance en realidad no baja.
+        # Señal fiel: el delta de balance del trader por mint.
         if tokens_sent and sol_received > 0:
-            sol_ratio = sol_spent / sol_received if sol_received > 0 else 999
-            if is_pump_fun and sol_ratio > 10 and tokens_received:
-                tokens_received.sort(key=lambda t: t["amount"], reverse=True)
-                token_mint = tokens_received[0]["mint"]
+            tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
+            tokens_received.sort(key=lambda t: t["amount"], reverse=True)
+            sent_mint = tokens_sent[0]["mint"]
+            sent_delta = trader_delta_by_mint.get(sent_mint, 0.0)
+            # (1) Un token RECIBIDO con balance del trader positivo = compra real.
+            #     Cubre swapping multi-hop: SOL -> intermedio -> token final.
+            #     Guard: en venta real sol_received > sol_spent, en compra al reves.
+            received_buy = [
+                t for t in tokens_received
+                if trader_delta_by_mint.get(t["mint"], 0.0) > 1e-6
+            ]
+            if received_buy and sol_spent > sol_received:
+                token_mint = received_buy[0]["mint"]
                 action = "buy"
-                amount_sol = sol_spent
+                amount_sol = sol_spent if sol_spent > 0 else sol_received
                 logger.info(
-                    "CopyTrade: pump.fun buy (wrapping intermedio) {} | mint={} | SOL_spent={:.6f} sol_rcvd={:.6f} ratio={:.0f}x",
-                    signature[:16] + "...", token_mint[:12] + "...", sol_spent, sol_received, sol_ratio,
+                    "CopyTrade: buy (balance recibido +{:.6f}) {} | mint={} | SOL={:.6f} | mid_tk={}",
+                    trader_delta_by_mint.get(token_mint, 0.0), signature[:16] + "...",
+                    token_mint[:12] + "...", amount_sol, sent_mint[:12] + "...",
+                )
+            elif sent_delta < 0:
+                # (2) Balance del token enviado BAJO = venta real
+                token_mint = sent_mint
+                action = "sell"
+                amount_sol = sol_received if sol_received > 0 else sol_spent
+                logger.info(
+                    "CopyTrading: SELL (balance -{:.6f}) {} | tokens_sent={} | SOL_rcvd={:.6f}",
+                    -sent_delta, signature[:16] + "...", token_mint[:12] + "...", sol_received,
                 )
             else:
-                action = "sell"
-                tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
-                token_mint = tokens_sent[0]["mint"]
-                amount_sol = sol_received
+                sol_ratio = sol_spent / sol_received if sol_received > 0 else 999
+                if is_pump_fun and sol_ratio > 10 and tokens_received:
+                    token_mint = tokens_received[0]["mint"]
+                    action = "buy"
+                    amount_sol = sol_spent
+                    logger.info(
+                        "CopyTrade: pump.fun buy (wrapping intermedio) {} | mint={} | SOL_spent={:.6f} sol_rcvd={:.6f} ratio={:.0f}x",
+                        signature[:16] + "...", token_mint[:12] + "...", sol_spent, sol_received, sol_ratio,
+                    )
+                else:
+                    token_mint = sent_mint
+                    action = "sell"
+                    amount_sol = sol_received
 
         # Caso 2b: Envia tokens + envia SOL (DEX sell - SOL return via program, not nativeTransfers)
         # Axiom/Pump sells: CENTED sends tokens to buyer, SOL goes to buyer's ATA,
         # but the DEX return SOL comes via the program, not shown in nativeTransfers.
-        # NOTE: For pump.fun buys, Helius sometimes inverts token transfers:
-        # CENTED is shown as sender (fromUserAccount) when actually receiving tokens.
-        # In that case sell_pct < 5% (no existing position) and we should reclassify as BUY.
+        # NOTA: Para compras DCA (el trader acumula el MISMO token), el balance del
+        # trader SUBE (mintAmount > 0). Eso es COMPRA, no venta. Solo si el balance
+        # del trader BAJA es venta real.
         elif tokens_sent and sol_spent > 0 and sol_received == 0:
             tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
             token_mint = tokens_sent[0]["mint"]
             amount_sol = sol_spent
-            sell_pct = self._calc_sell_pct(token_mint, tokens_sent[0]["amount"], tracked.address)
+            trader_delta = trader_delta_by_mint.get(token_mint, 0.0)
             logger.debug(
-                "CopyTrade CASE2b: sell_pct={:.1f}% is_pump={} | mint={} | tokens_amt={}",
-                sell_pct, is_pump_fun, token_mint[:12] + "...", tokens_sent[0]["amount"],
+                "CopyTrade CASE2b: trader_delta={:.4f} is_pump={} | mint={} | tokens_amt={}",
+                trader_delta, is_pump_fun, token_mint[:12] + "...", tokens_sent[0]["amount"],
             )
-            if sell_pct < 5.0:
-                if is_pump_fun:
-                    logger.info(
-                        "CopyTrade: pump.fun buy (Helius inverted transfer) {} | tokens_sent would-be {} | SOL_spent={:.6f}",
-                        signature[:16] + "...", token_mint[:12] + "...", sol_spent,
-                    )
-                    action = "buy"
-                else:
-                    logger.debug(
-                        "CopyTrade ignorado: small token transfer ({:.1f}%) {} | {}",
-                        sell_pct, signature[:16] + "...", token_mint[:12] + "...",
-                    )
-                    return None
-            else:
+            if trader_delta > 0:
+                # El trader INCREMENTO su balance del token = compra (DCA)
+                action = "buy"
+                sell_pct = 0.0
+                logger.info(
+                    "CopyTrade: DCA buy (balance +{:.4f}) {} | mint={} | SOL_spent={:.6f} | pump={}",
+                    trader_delta, signature[:16] + "...", token_mint[:12] + "...", sol_spent, is_pump_fun,
+                )
+            elif trader_delta < 0:
+                # Balance del trader bajo = venta real
                 action = "sell"
                 logger.info(
-                    "CopyTrading: SELL (dex program) {} | tokens_sent={} | SOL_out={:.6f} | sell_pct={:.0f}%",
-                    signature[:16] + "...", token_mint[:12] + "...", sol_spent, sell_pct,
+                    "CopyTrading: SELL (dex program, balance -{:.4f}) {} | tokens_sent={} | SOL_out={:.6f}",
+                    -trader_delta, signature[:16] + "...", token_mint[:12] + "...", sol_spent,
                 )
+            else:
+                # Delta no disponible (fallback): usar sell_pct vs nuestra posicion
+                sell_pct = self._calc_sell_pct(token_mint, tokens_sent[0]["amount"], tracked.address)
+                if sell_pct < 5.0:
+                    if is_pump_fun:
+                        logger.info(
+                            "CopyTrade: pump.fun buy (Helius inverted transfer) {} | tokens_sent would-be {} | SOL_spent={:.6f}",
+                            signature[:16] + "...", token_mint[:12] + "...", sol_spent,
+                        )
+                        action = "buy"
+                    else:
+                        logger.debug(
+                            "CopyTrade ignorado: small token transfer ({:.1f}%) {} | {}",
+                            sell_pct, signature[:16] + "...", token_mint[:12] + "...",
+                        )
+                        return None
+                else:
+                    action = "sell"
+                    logger.info(
+                        "CopyTrading: SELL (dex program) {} | tokens_sent={} | SOL_out={:.6f} | sell_pct={:.0f}%",
+                        signature[:16] + "...", token_mint[:12] + "...", sol_spent, sell_pct,
+                    )
 
         # Caso 2c: Envia tokens sin SOL = possible DEX sell (SOL via program) or wallet transfer
         elif tokens_sent and sol_spent == 0 and sol_received == 0:
@@ -879,6 +932,8 @@ class CopyTradingStrategy(Strategy):
                     if existing or tracker_pos:
                         if existing:
                             existing.sol_invested += signal.amount_sol
+                            if existing.entry_price and existing.entry_price > 0:
+                                existing.token_amount_ui += signal.amount_sol / existing.entry_price
                         if tracker_pos:
                             tracker_pos.amount += signal.amount_sol
                         logger.info(
