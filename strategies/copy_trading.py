@@ -93,6 +93,26 @@ class CopyTradingStrategy(Strategy):
         self.webhook_path = "/webhook/copy-trading"
         self._load_wallets()
 
+    def _notify(self, coro: Any) -> None:
+        """Notifica en background (fire-and-forget) sin bloquear la ruta del trade.
+
+        Telegram en modo secuencial tarda 1-5s por mensaje (HTTP + limite de 1
+        msg/s del bot). Esperarlo dentro del lock atrasa/descarta sells cuando
+        llegan webhooks con volumen; la notificacion no es critica para el trade.
+        """
+        try:
+            task = asyncio.get_event_loop().create_task(coro)
+
+            def _guard(t: Any) -> None:
+                try:
+                    t.result()
+                except Exception:
+                    pass
+
+            task.add_done_callback(_guard)
+        except Exception:
+            pass
+
     @property
     def name(self) -> str:
         return "CopyTrading"
@@ -778,7 +798,19 @@ class CopyTradingStrategy(Strategy):
             else:
                 # Delta no disponible (fallback): usar sell_pct vs nuestra posicion
                 sell_pct = self._calc_sell_pct(token_mint, tokens_sent[0]["amount"], tracked.address)
-                if sell_pct < 5.0:
+                # Si ya tenemos posicion del mint, siempre es venta aunque el % sea
+                # pequeno: los scalpers venden fracciones chicas varias veces.
+                have_pos = bool(
+                    self.executor.positions.get(token_mint)
+                    or self.tracker.positions.get(token_mint)
+                )
+                if have_pos:
+                    action = "sell"
+                    logger.info(
+                        "CopyTrading: SELL (dex program, posicion) {} | tokens_sent={} | SOL_out={:.6f} | sell_pct={:.0f}%",
+                        signature[:16] + "...", token_mint[:12] + "...", sol_spent, max(sell_pct, 1.0),
+                    )
+                elif sell_pct < 5.0:
                     if is_pump_fun:
                         logger.info(
                             "CopyTrade: pump.fun buy (Helius inverted transfer) {} | tokens_sent would-be {} | SOL_spent={:.6f}",
@@ -803,9 +835,22 @@ class CopyTradingStrategy(Strategy):
             tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
             candidate_mint = tokens_sent[0]["mint"]
             sell_pct = self._calc_sell_pct(candidate_mint, tokens_sent[0]["amount"], tracked.address)
-            if sell_pct < 5.0:
+            # Si ya tenemos posicion del mint, es venta aunque el % sea pequeno.
+            have_pos = bool(
+                self.executor.positions.get(candidate_mint)
+                or self.tracker.positions.get(candidate_mint)
+            )
+            if sell_pct < 5.0 and not have_pos:
                 return None
-            if tracked.address:
+            if have_pos:
+                token_mint = candidate_mint
+                action = "sell"
+                amount_sol = 0.0
+                logger.info(
+                    "CopyTrading: SELL (token transfer, posicion) {} -> {} | sell_pct={:.0f}%",
+                    tracked.label, token_mint[:12] + "...", sell_pct,
+                )
+            elif tracked.address:
                 wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
                 for wp in wallet_positions:
                     if wp.mint == candidate_mint:
@@ -1031,13 +1076,13 @@ class CopyTradingStrategy(Strategy):
                         )
                         from core.stats import get_trade_stats
                         get_trade_stats().record_buy(signal.wallet, new_position=False)
-                        await self.notifier.send_buy(
+                        self._notify(self.notifier.send_buy(
                             signal.token_mint,
                             signal.amount_sol,
                             symbol=signal.token_symbol or signal.token_mint[:6].upper(),
                             dry_run=self.config.trading.DRY_RUN,
                             trader=signal.trader_label,
-                        )
+                        ))
                         return
 
                     max_pos = int(
@@ -1080,13 +1125,13 @@ class CopyTradingStrategy(Strategy):
                         source_wallet=signal.wallet,
                     )
 
-                    await self.notifier.send_buy(
+                    self._notify(self.notifier.send_buy(
                         signal.token_mint,
                         signal.amount_sol,
                         symbol=symbol,
                         dry_run=self.config.trading.DRY_RUN,
                         trader=signal.trader_label,
-                    )
+                    ))
 
                     # Record buy in stats
                     from core.stats import get_trade_stats
@@ -1299,7 +1344,7 @@ class CopyTradingStrategy(Strategy):
             except Exception as exc:
                 self._inc_stat("trades_failed")
                 logger.error("CopyTrading: error ejecutando copy trade: {}", exc)
-                await self.notifier.send_error(f"Copy trade fallido ({signal.source}): {exc}")
+                self._notify(self.notifier.send_error(f"Copy trade fallido ({signal.source}): {exc}"))
 
     # ----------------------------------------------------------- Helius webhook setup
     async def setup_helius_webhook(self, webhook_url: str) -> Optional[str]:
