@@ -141,6 +141,7 @@ class CopyTradingStrategy(Strategy):
         "So11111111111111111111111111111111111111112",
         # Axiom program
         "AxiomRYA1zHVkpmvMtNPmBMzYFnM3RYqM3a7EMzN1t",
+        "AxiomRXZAq1Jgjj9hKcPgCMbrZJzYVLpTLpTmZEu7AxF",
     } | set(DEX_PROGRAMS.values())
 
     # Known program/authority accounts that are NOT token mints
@@ -154,15 +155,14 @@ class CopyTradingStrategy(Strategy):
         "CebN5WGUA4hG37LkS87YDh2XZ9P5Yq5R5h5h5h5h5h5",
     }
 
-    def _get_all_excluded_addresses(self) -> set[str]:
-        """Returns ALL addresses that should never be treated as token mints:
-        known programs, stablecoins, DEX programs, AND all tracked wallet addresses."""
+    def _get_all_excluded_addresses(self, extra: Optional[set[str]] = None) -> set[str]:
+        """Returns ALL addresses that should never be treated as token mints."""
         excluded = self._KNOWN_ADDRESSES | self._NON_MINT_ADDRESSES
-        # Add all tracked wallet addresses - these are wallets we monitor, NOT tokens
         excluded = excluded | set(self.wallets.keys())
-        # Add our bot's own wallet
         if hasattr(self.executor, 'wallet_pubkey') and self.executor.wallet_pubkey:
             excluded.add(self.executor.wallet_pubkey)
+        if extra:
+            excluded = excluded | extra
         return excluded
 
     @staticmethod
@@ -175,14 +175,16 @@ class CopyTradingStrategy(Strategy):
         return True
 
     def _extract_mint_from_account_data(
-        self, account_data: list[dict[str, Any]], fee_payer: str
+        self, account_data: list[dict[str, Any]], fee_payer: str, extra_exclude: Optional[set[str]] = None
     ) -> Optional[str]:
-        excluded = self._get_all_excluded_addresses()
+        excluded = self._get_all_excluded_addresses(extra_exclude)
         best_mint: Optional[str] = None
         best_abs: int = 0
         for acct in account_data:
             for tbc in acct.get("tokenBalanceChanges", []):
                 user = tbc.get("userAccount", "")
+                if user != fee_payer:
+                    continue
                 mint = tbc.get("mint", "")
                 if not mint or mint in excluded:
                     continue
@@ -200,14 +202,16 @@ class CopyTradingStrategy(Strategy):
         return best_mint
 
     def _extract_mint_from_sent_tokens(
-        self, account_data: list[dict[str, Any]], fee_payer: str
+        self, account_data: list[dict[str, Any]], fee_payer: str, extra_exclude: Optional[set[str]] = None
     ) -> Optional[str]:
-        excluded = self._get_all_excluded_addresses()
+        excluded = self._get_all_excluded_addresses(extra_exclude)
         best_mint: Optional[str] = None
         best_abs: int = 0
         for acct in account_data:
             for tbc in acct.get("tokenBalanceChanges", []):
                 user = tbc.get("userAccount", "")
+                if user != fee_payer:
+                    continue
                 mint = tbc.get("mint", "")
                 if not mint or mint in excluded:
                     continue
@@ -224,8 +228,8 @@ class CopyTradingStrategy(Strategy):
                     best_mint = mint
         return best_mint
 
-    def _extract_mint_from_description(self, description: str) -> Optional[str]:
-        excluded = self._get_all_excluded_addresses()
+    def _extract_mint_from_description(self, description: str, extra_exclude: Optional[set[str]] = None) -> Optional[str]:
+        excluded = self._get_all_excluded_addresses(extra_exclude)
         candidates = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,44}', description)
         for candidate in candidates:
             if candidate not in excluded:
@@ -393,14 +397,16 @@ class CopyTradingStrategy(Strategy):
         # Caso 3: Solo envio de SOL (posible compra en bonding curve)
         elif sol_spent > 0 and not tokens_received:
             # 1) Intentar desde accountData (tokenBalanceChanges)
-            token_mint = self._extract_mint_from_account_data(account_data, trader)
+            token_mint = self._extract_mint_from_account_data(
+                account_data, trader, extra_exclude={fee_payer}
+            )
             if token_mint:
                 action = "buy"
                 amount_sol = sol_spent
             else:
                 # 2) Fallback: descripcion de la transaccion
                 token_mint = self._extract_mint_from_description(
-                    tx.get("description", "")
+                    tx.get("description", ""), extra_exclude={fee_payer}
                 )
                 if token_mint:
                     action = "buy"
@@ -408,13 +414,15 @@ class CopyTradingStrategy(Strategy):
 
         # Caso 4: Solo recibe SOL (posible venta en bonding curve)
         elif sol_received > 0 and not tokens_sent:
-            token_mint = self._extract_mint_from_sent_tokens(account_data, trader)
+            token_mint = self._extract_mint_from_sent_tokens(
+                account_data, trader, extra_exclude={fee_payer}
+            )
             if token_mint:
                 action = "sell"
                 amount_sol = sol_received
             else:
                 token_mint = self._extract_mint_from_description(
-                    tx.get("description", "")
+                    tx.get("description", ""), extra_exclude={fee_payer}
                 )
                 if token_mint:
                     action = "sell"
@@ -500,6 +508,7 @@ class CopyTradingStrategy(Strategy):
                         symbol=symbol,
                         buy_price=entry_price,
                         amount=signal.amount_sol,
+                        source_wallet=signal.wallet,
                     )
 
                     await self.notifier.send_buy(
@@ -516,18 +525,37 @@ class CopyTradingStrategy(Strategy):
                     )
 
                 elif signal.action == "sell":
+                    # First try exact mint match
                     position = self.executor.positions.get(signal.token_mint)
                     tracker_pos = self.tracker.positions.get(signal.token_mint)
+
+                    # Fallback: find ALL positions from this wallet and sell them
+                    if not position and not tracker_pos and signal.wallet:
+                        wallet_positions = self.tracker.get_positions_by_wallet(signal.wallet)
+                        if wallet_positions:
+                            # Sell the most recent position from this wallet
+                            pos = wallet_positions[-1]
+                            signal.token_mint = pos.mint
+                            signal.token_symbol = pos.symbol
+                            tracker_pos = pos
+                            logger.info(
+                                "CopyTrading: SELL por wallet {} -> vendiendo {} ({})",
+                                signal.wallet[:8] + "...", pos.symbol, pos.mint[:12] + "...",
+                            )
+
                     if not position and not tracker_pos:
                         logger.info(
-                            "CopyTrading: SELL ignorado {} ({}) - no hay posicion para {}",
-                            signal.source, signal.token_mint[:8] + "...", signal.token_mint[:16] + "...",
+                            "CopyTrading: SELL ignorado {} ({}) - no hay posicion",
+                            signal.source, signal.token_mint[:8] + "...",
                         )
                         return
 
                     pnl_pct = 0.0
-                    entry = (position.entry_price if position and position.entry_price else 0.0) or \
-                            (tracker_pos.buy_price if tracker_pos and tracker_pos.buy_price else 0.0)
+                    entry = 0.0
+                    if position and position.entry_price and position.entry_price > 0:
+                        entry = position.entry_price
+                    elif tracker_pos and tracker_pos.buy_price and tracker_pos.buy_price > 0:
+                        entry = tracker_pos.buy_price
                     if entry > 0:
                         try:
                             current_price = await self.executor.get_token_price(signal.token_mint)

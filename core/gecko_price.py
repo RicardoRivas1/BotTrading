@@ -33,13 +33,16 @@ async def get_price_from_geckoterminal(token_mint: str) -> Optional[float]:
 
         # priceNative is SOL price
         price_native = data.get("data", {}).get("attributes", {}).get("price_native")
-        if price_native:
-            return float(price_native)
+        if price_native is not None:
+            try:
+                return float(price_native)
+            except (ValueError, TypeError):
+                pass
 
         # Try pool-based approach
         return await _get_price_from_pool(token_mint, session)
 
-    except (aiohttp.ClientError, ValueError, TypeError) as exc:
+    except Exception as exc:  # noqa: BLE001 - catch ALL errors to prevent cascading
         logger.debug("GeckoTerminal error for {}: {}", token_mint, exc)
         return None
 

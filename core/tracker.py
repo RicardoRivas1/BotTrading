@@ -98,6 +98,7 @@ class TrackerPosition:
     max_hold_seconds: float = field(default_factory=lambda: float(MAX_HOLD_TIME_SEC))
     last_progress_notify_at: float = 0.0
     last_notified_pnl_pct: float = 0.0
+    source_wallet: str = ""  # wallet address that triggered this buy
 
 
 class PositionTracker:
@@ -120,6 +121,7 @@ class PositionTracker:
         symbol: str,
         buy_price: float,
         amount: float,
+        source_wallet: str = "",
     ) -> None:
         """Registra una posición activa para que el monitor la vigile."""
         # Nunca guardar symbol "N/A": si no hay ticker, usar los primeros 6
@@ -134,7 +136,12 @@ class PositionTracker:
             symbol=symbol,
             buy_price=buy_price,
             amount=amount,
+            source_wallet=source_wallet,
         )
+
+    def get_positions_by_wallet(self, wallet: str) -> list[TrackerPosition]:
+        """Devuelve todas las posiciones abiertas para una wallet dada."""
+        return [p for p in self.positions.values() if p.source_wallet == wallet]
 
     def remove_position(self, mint: str) -> bool:
         """Elimina la posición; devuelve True si existía."""
