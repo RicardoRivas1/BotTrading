@@ -1228,25 +1228,49 @@ class CopyTradingStrategy(Strategy):
                     # los traders venden 20-40% de su posicion, no todo.
                     wm_key = (signal.wallet, signal.token_mint)
                     accumulated = self._wallet_mint_tokens.get(wm_key, 0.0)
-                    if signal.trade_token_amount > 0 and accumulated > 0:
-                        real_pct = (signal.trade_token_amount / accumulated) * 100.0
-                        real_pct = min(real_pct, 100.0)
-                        if real_pct > 1.0:
-                            pct = real_pct
-                            logger.info(
-                                "CopyTrading: sell pct recalculado {:.1f}% (trader acumulo {:.4g} tk, vendio {:.4g}) para {}",
-                                real_pct, accumulated, signal.trade_token_amount,
-                                signal.token_mint[:8] + "...",
+
+                    # Fuente AUTORITATIVA: balance on-chain del trader tras la venta.
+                    # total_antes = balance_actual + vendido_en_esta_tx. Si cerro todo
+                    # el ATA queda en 0 => pct=100%. Si vendio 30% le quedan 70% => 30%.
+                    # Funciona aunque el bot empezo a copiar tarde o se reinicio
+                    # (el tracking acumulado _wallet_mint_tokens puede estar vacio).
+                    if signal.trade_token_amount > 0:
+                        try:
+                            held_after = await self.executor.get_wallet_token_balance(
+                                signal.wallet, signal.token_mint
                             )
-                        # Descontar lo vendido del acumulado del trader para
-                        # proximas ventas parciales del mismo trader/token.
-                        self._wallet_mint_tokens[wm_key] = max(
-                            0.0, accumulated - signal.trade_token_amount
-                        )
-                    elif signal.trade_token_amount > 0:
+                            total_before = held_after + signal.trade_token_amount
+                            if total_before > 0:
+                                real_pct = (
+                                    (signal.trade_token_amount / total_before) * 100.0
+                                )
+                                real_pct = max(1.0, min(real_pct, 100.0))
+                                pct = real_pct
+                                # Re-sincronizar el tracking con la realidad on-chain
+                                self._wallet_mint_tokens[wm_key] = max(0.0, held_after)
+                                logger.info(
+                                    "CopyTrading: sell pct on-chain {:.1f}% (trader balance post-venta {:.4g} tk + vendidos {:.4g} tk) para {}",
+                                    real_pct, held_after, signal.trade_token_amount,
+                                    signal.token_mint[:8] + "...",
+                                )
+                        except Exception as exc:
+                            logger.debug(
+                                "CopyTrading: fallo balance on-chain de {} para sell pct; usando tracking.",
+                                signal.token_mint[:12] + "...",  # noqa: TRY400
+                            )
+                            # Fallback al tracking acumulado si RPC falla
+                            if signal.trade_token_amount > 0 and accumulated > 0:
+                                real_pct = (signal.trade_token_amount / accumulated) * 100.0
+                                real_pct = min(real_pct, 100.0)
+                                if real_pct > 1.0:
+                                    pct = real_pct
+                                self._wallet_mint_tokens[wm_key] = max(
+                                    0.0, accumulated - signal.trade_token_amount
+                                )
+                    elif signal.trade_token_amount <= 0:
                         logger.debug(
-                            "CopyTrading: sin tracking de tokens acumulados para {:.4g} tk de {} (posiblemente compro de la mano de otra)",
-                            signal.trade_token_amount, signal.token_mint[:8] + "...",
+                            "CopyTrading: sin cantidad de tokens vendidos medible para {}",
+                            signal.token_mint[:12] + "...",
                         )
 
                     if entry > 0 and current_price > 0:
@@ -1337,6 +1361,7 @@ class CopyTradingStrategy(Strategy):
                         reason="COPY_TRADE_SELL",
                         pnl=pnl_pct,
                         sell_pct=pct,
+                        trader=signal.trader_label,
                     )
 
                     # Clean up positions from both executor and tracker

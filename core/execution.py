@@ -578,6 +578,26 @@ class JupiterExecutor:
         except Exception:
             return 0.0
 
+    async def get_wallet_token_balance(self, wallet_pubkey: str, token_mint: str) -> float:
+        """Saldo real (unidades humanas) del token en el ATA de una wallet
+        arbitraria vía RPC.
+
+        Usado para calcular el % REAL que vendio un trader: si tras la venta su
+        saldo del token queda en ~0, cerro el 100%; si le queda saldo, vendio
+        solo una parte (30-50%). Sin esto el bot asume 100% y liquida todo.
+        """
+        try:
+            ata = get_associated_token_address(
+                Pubkey.from_string(wallet_pubkey),
+                Pubkey.from_string(token_mint),
+            )
+            resp = await self._rpc_client.get_token_account_balance(ata)
+            if not resp.value or resp.value.ui_amount is None:
+                return 0.0
+            return float(resp.value.ui_amount)
+        except Exception:
+            return 0.0
+
     async def sell_token(
         self,
         token_mint: str,

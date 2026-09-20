@@ -217,6 +217,7 @@ async def process_sell_and_notify(
     reason: str = "",
     pnl: float = 0.0,
     sell_pct: float = 100.0,
+    trader: str = "",
 ) -> bool:
     """Vende (real o simulado) y notifica el motivo de la salida TP/SL.
 
@@ -283,7 +284,11 @@ async def process_sell_and_notify(
     elif reason == "TRAILING_STOP":
         await notifier.send_trailing_stop(mint, pnl)
     else:
-        await notifier.send_status(f"Venta de {symbol} ({mint}) por {reason} ({sell_pct:.0f}% | PnL {pnl:.2f}%)")
+        trader_txt = f" | Trader: {trader}" if trader else ""
+        await notifier.send_status(
+            f"Venta de {symbol} ({mint}) por {reason} "
+            f"({sell_pct:.0f}% | PnL {pnl:.2f}%){trader_txt}"
+        )
     return True
 
 
