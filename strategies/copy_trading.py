@@ -305,9 +305,25 @@ class CopyTradingStrategy(Strategy):
 
         cfg = load_config()
         rpc_url = cfg.solana.HELIUS_RPC_URL
+
+        # Auto-fix: if rpc_url is just an API key (no URL), build the full URL
+        if rpc_url and not rpc_url.startswith("http"):
+            logger.warning(
+                "CopyTrading: HELIUS_RPC_URL parece ser solo un API key ('{}...'), "
+                "auto-detectando URL completa...",
+                rpc_url[:8],
+            )
+            rpc_url = f"https://mainnet.helius-rpc.com/?api-key={rpc_url}"
+
         helius_api_key = os.getenv("HELIUS_API_KEY", "")
         if not helius_api_key and "api-key=" in rpc_url:
             helius_api_key = rpc_url.split("api-key=")[-1].split("&")[0]
+
+        if not rpc_url or not rpc_url.startswith("http"):
+            logger.error("CopyTrading: RPC URL invalida '{}'. Polling deshabilitado.", rpc_url)
+            return
+
+        logger.info("CopyTrading: RPC polling con URL: {}...", rpc_url[:60])
 
         # Track last seen signature per wallet
         last_sig: dict[str, str] = {}
@@ -327,7 +343,7 @@ class CopyTradingStrategy(Strategy):
                             last_sig[addr] = sigs[0]["signature"]
             logger.info("RPC polling initialized for {} wallets", len(last_sig))
         except Exception as exc:
-            logger.warning("RPC polling init failed: {}", exc)
+            logger.warning("CopyTrading: RPC polling init failed: {}", exc)
 
         while True:
             await asyncio.sleep(1.5)
@@ -336,7 +352,7 @@ class CopyTradingStrategy(Strategy):
             try:
                 await self._poll_wallets(rpc_url, helius_api_key, last_sig)
             except Exception as exc:
-                logger.debug("RPC poll error: {}", exc)
+                logger.warning("CopyTrading: RPC poll loop error: {}", exc)
 
     async def _poll_wallets(
         self, rpc_url: str, helius_api_key: str, last_sig: dict[str, str]
@@ -384,7 +400,7 @@ class CopyTradingStrategy(Strategy):
                         await self._process_transaction(tx)
 
                 except Exception as exc:
-                    logger.debug("Poll error for {}: {}", addr[:8], exc)
+                    logger.warning("CopyTrading: poll error para {}: {}", addr[:8], exc)
 
     async def stop(self) -> None:
         """Detiene la estrategia."""
@@ -395,6 +411,10 @@ class CopyTradingStrategy(Strategy):
     async def handle_webhook(self, payload: dict[str, Any]) -> dict[str, str]:
         """Procesa un webhook de Helius Enhanced Transaction."""
         self._inc_stat("signals_received")
+        tx_count = len(payload) if isinstance(payload, list) else 1
+        logger.info(
+            "CopyTrading: webhook recibido ({} txs)", tx_count,
+        )
 
         try:
             transactions = payload if isinstance(payload, list) else [payload]
