@@ -641,7 +641,7 @@ class CopyTradingStrategy(Strategy):
         token_mint = None
         amount_sol = 0.0
 
-        logger.debug(
+        logger.info(
             "CopyTrade classify: trader={} tokens_sent={} tokens_rcvd={} sol_spent={:.6f} sol_rcvd={:.6f} is_pump={} deltas={}",
             trader[:8] + "..." if trader else "?",
             [(t["mint"][:8] + "...", t["amount"]) for t in tokens_sent[:2]],
@@ -901,10 +901,11 @@ class CopyTradingStrategy(Strategy):
 
         source_label = "pump.fun" if is_pump_fun else "dex"
         sell_info = f" | sell_pct={sell_pct:.0f}%" if action == "sell" and sell_pct > 0 else ""
+        chosen_delta = trader_delta_by_mint.get(token_mint, 0.0)
         logger.info(
-            "CopyTrading: signal {} {} | mint={} | {:.6f} SOL | trader={} | src={}{}",
+            "CopyTrading: signal {} {} | mint={} | {:.6f} SOL | trader={} | src={}{} | delta={:+.4f}",
             action.upper(), signature[:16] + "...", token_mint[:12] + "...",
-            amount_sol, trader[:8] + "...", source_label, sell_info,
+            amount_sol, trader[:8] + "...", source_label, sell_info, chosen_delta,
         )
         return CopyTradeSignal(
             wallet=tracked.address,
