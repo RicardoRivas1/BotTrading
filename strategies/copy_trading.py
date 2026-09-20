@@ -1239,8 +1239,11 @@ class CopyTradingStrategy(Strategy):
                             held_after = await self.executor.get_wallet_token_balance(
                                 signal.wallet, signal.token_mint
                             )
+                            # -1.0 = error de RPC => no podemos confiar en el
+                            # balance; usar tracking acumulado como fallback.
+                            rpc_error = held_after < 0
                             total_before = held_after + signal.trade_token_amount
-                            if total_before > 0:
+                            if not rpc_error and total_before > 0:
                                 real_pct = (
                                     (signal.trade_token_amount / total_before) * 100.0
                                 )
@@ -1253,10 +1256,12 @@ class CopyTradingStrategy(Strategy):
                                     real_pct, held_after, signal.trade_token_amount,
                                     signal.token_mint[:8] + "...",
                                 )
+                            elif rpc_error:
+                                raise RuntimeError("RPC error en balance on-chain")
                         except Exception as exc:
                             logger.debug(
-                                "CopyTrading: fallo balance on-chain de {} para sell pct; usando tracking.",
-                                signal.token_mint[:12] + "...",  # noqa: TRY400
+                                "CopyTrading: fallo balance on-chain de {} para sell pct; usando tracking: {}",
+                                signal.token_mint[:12] + "...", exc,
                             )
                             # Fallback al tracking acumulado si RPC falla
                             if signal.trade_token_amount > 0 and accumulated > 0:

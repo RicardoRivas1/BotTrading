@@ -20,6 +20,7 @@ import httpx
 from bip_utils import Bip39SeedGenerator
 from loguru import logger
 from solana.rpc.async_api import AsyncClient
+from solana.rpc.core import TokenAccountOpts
 from solana.rpc.models import TxOpts
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -579,24 +580,47 @@ class JupiterExecutor:
             return 0.0
 
     async def get_wallet_token_balance(self, wallet_pubkey: str, token_mint: str) -> float:
-        """Saldo real (unidades humanas) del token en el ATA de una wallet
-        arbitraria vía RPC.
+        """Saldo real (unidades humanas) del token en TODAS las cuentas SPL de
+        una wallet arbitraria vía RPC.
 
-        Usado para calcular el % REAL que vendio un trader: si tras la venta su
-        saldo del token queda en ~0, cerro el 100%; si le queda saldo, vendio
-        solo una parte (30-50%). Sin esto el bot asume 100% y liquida todo.
+        Suma el balance de todas las cuentas token del trader para ese mint
+        (ATA estándar, cuentas no derivadas, etc.). El ATA estándar solo no
+        sirve: los traders de pump.fun a veces la token sale de cuentas alternas
+        y get_token_account_balance fallaba => saldo 0 => el bot creia que
+        vendio el 100% cuando en realidad vendio 50% (PnL inflado).
+
+        Devuelve -1.0 si hubo un ERROR de RPC (para distinguirlo de saldo real 0,
+        que significaria que el trader vendio el 100%).
         """
         try:
-            ata = get_associated_token_address(
-                Pubkey.from_string(wallet_pubkey),
-                Pubkey.from_string(token_mint),
+            owner = Pubkey.from_string(wallet_pubkey)
+            mint = Pubkey.from_string(token_mint)
+            resp = await self._rpc_client.get_token_accounts_by_owner_json_parsed(
+                owner,
+                TokenAccountOpts(mint=mint),
             )
-            resp = await self._rpc_client.get_token_account_balance(ata)
-            if not resp.value or resp.value.ui_amount is None:
-                return 0.0
-            return float(resp.value.ui_amount)
-        except Exception:
-            return 0.0
+            total = 0.0
+            for item in resp.value or []:
+                try:
+                    data = getattr(item.account, "data", None)
+                    parsed = getattr(data, "parsed", None)
+                    if parsed is None:
+                        continue
+                    info = parsed.info if hasattr(parsed, "info") else (parsed.get("info") if isinstance(parsed, dict) else None)
+                    token_amount = getattr(info, "tokenAmount", None) if hasattr(info, "tokenAmount") else ((info or {}).get("tokenAmount") if isinstance(info, dict) else None)
+                    ui_amount = getattr(token_amount, "uiAmount", None) if hasattr(token_amount, "uiAmount") else ((token_amount or {}).get("uiAmount") if isinstance(token_amount, dict) else None)
+                    if ui_amount is not None:
+                        total += float(ui_amount)
+                except Exception:
+                    # Una cuenta ilegible no debe invalidar el total de las demas
+                    continue
+            return total
+        except Exception as exc:
+            logger.debug(
+                "get_wallet_token_balance RPC fallo para {} ({}): {}",
+                wallet_pubkey[:8] + "...", token_mint[:8] + "...", exc,
+            )
+            return -1.0
 
     async def sell_token(
         self,
