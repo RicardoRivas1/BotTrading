@@ -356,10 +356,10 @@ class PositionTracker:
 
         if pos is not None:
             now = time.time()
-            if now - pos.last_no_price_log >= 30:
-                logger.warning(
-                    "Sin precio real para {} ({}): {}",
-                    mint, pos.symbol, cause,
+            if now - pos.last_no_price_log >= 300:
+                logger.info(
+                    "Sin precio para {} ({})",
+                    mint, pos.symbol,
                 )
                 pos.last_no_price_log = now
         return 0.0

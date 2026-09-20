@@ -16,34 +16,28 @@ GECKO_API = "https://api.geckoterminal.com/api/v2"
 
 
 async def get_price_from_geckoterminal(token_mint: str) -> Optional[float]:
-    """Get token price in SOL from GeckoTerminal.
-
-    Queries the most liquid Solana pool for the token and returns
-    price in SOL (priceNative).
-    """
+    """Get token price in SOL from GeckoTerminal."""
     url = f"{GECKO_API}/networks/solana/tokens/{token_mint}"
     try:
         timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, headers=_USER_AGENT) as resp:
                 if resp.status != 200:
-                    logger.debug("GeckoTerminal responded {} for {}", resp.status, token_mint)
                     return None
                 data = await resp.json()
 
-        # priceNative is SOL price
-        price_native = data.get("data", {}).get("attributes", {}).get("price_native")
-        if price_native is not None:
-            try:
-                return float(price_native)
-            except (ValueError, TypeError):
-                pass
+            # priceNative is SOL price
+            price_native = data.get("data", {}).get("attributes", {}).get("price_native")
+            if price_native is not None:
+                try:
+                    return float(price_native)
+                except (ValueError, TypeError):
+                    pass
 
-        # Try pool-based approach
-        return await _get_price_from_pool(token_mint, session)
+            # Try pool-based approach (inside session context)
+            return await _get_price_from_pool(token_mint, session)
 
-    except Exception as exc:  # noqa: BLE001 - catch ALL errors to prevent cascading
-        logger.debug("GeckoTerminal error for {}: {}", token_mint, exc)
+    except Exception:
         return None
 
 
@@ -60,7 +54,6 @@ async def _get_price_from_pool(token_mint: str, session: aiohttp.ClientSession) 
         if not pools:
             return None
 
-        # Sort by reserve_in_usd (liquidity) — handle None values
         def _safe_liquidity(p: dict) -> float:
             try:
                 val = p.get("attributes", {}).get("reserve_in_usd")
@@ -73,7 +66,7 @@ async def _get_price_from_pool(token_mint: str, session: aiohttp.ClientSession) 
         pools.sort(key=_safe_liquidity, reverse=True)
 
         best = pools[0]
-        attrs = best.get("attributes", {})
+        attrs = best.get("attributes", {}) or {}
         price_native = attrs.get("base_token_price_native") or attrs.get("quote_token_price_native")
         if price_native is not None:
             try:
@@ -81,8 +74,8 @@ async def _get_price_from_pool(token_mint: str, session: aiohttp.ClientSession) 
             except (ValueError, TypeError):
                 pass
 
-    except Exception as exc:
-        logger.debug("GeckoTerminal pool error for {}: {}", token_mint, exc)
+    except Exception:
+        pass
 
     return None
 
@@ -102,7 +95,7 @@ async def get_symbol_from_geckoterminal(token_mint: str) -> Optional[str]:
         if symbol:
             return symbol.upper()
 
-    except Exception as exc:
-        logger.debug("GeckoTerminal symbol error for {}: {}", token_mint, exc)
+    except Exception:
+        pass
 
     return None
