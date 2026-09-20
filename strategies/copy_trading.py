@@ -811,7 +811,11 @@ class CopyTradingStrategy(Strategy):
                         signature[:16] + "...", token_mint[:12] + "...", sol_spent, max(sell_pct, 1.0),
                     )
                 elif sell_pct < 5.0:
-                    if is_pump_fun:
+                    # Solo clasificar como "inverted transfer" (compra) si el
+                    # trader gasto SOL real (>= MIN_BUY_SOL). Si sol_spent es solo
+                    # un fee (~0.000005), es una VENTA cuya devolucion llego via
+                    # programa (Axiom/pump) o un transfer menor: NO es compra.
+                    if is_pump_fun and sol_spent >= 0.005:
                         logger.info(
                             "CopyTrade: pump.fun buy (Helius inverted transfer) {} | tokens_sent would-be {} | SOL_spent={:.6f}",
                             signature[:16] + "...", token_mint[:12] + "...", sol_spent,

@@ -241,7 +241,11 @@ class TradingBot:
 
                     if text == "/stats":
                         stats = get_trade_stats()
-                        await self.notifier.send(stats.format_summary())
+                        # Usar posiciones REALES (tracker) en vez del contador
+                        # acumulado positions_opened - positions_closed, que se
+                        # desincroniza (cierre por TP/SL/time, reinicios DRY_RUN).
+                        real_open = len(self.tracker.positions)
+                        await self.notifier.send(stats.format_summary(open_positions=real_open))
                     elif text == "/wallets":
                         stats = get_trade_stats()
                         s = stats.summary()

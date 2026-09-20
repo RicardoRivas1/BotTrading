@@ -245,9 +245,17 @@ class TradeStats:
             } for w, ws in self.wallets.items()},
         }
 
-    def format_summary(self) -> str:
-        """Human-readable summary for Telegram."""
+    def format_summary(self, open_positions: Optional[int] = None) -> str:
+        """Human-readable summary for Telegram.
+
+        Si se pasa `open_positions` se usa ese valor (posiciones reales actuales)
+        en lugar del contador acumulado positions_opened - positions_closed, que
+        se desincroniza (p.ej. el tracker cierra por TP/SL/time sin llamar
+        record_sell, o se reinicia DRY_RUN con posiciones previas).
+        """
         s = self.summary()
+        if open_positions is not None:
+            s["open_positions"] = max(0, int(open_positions))
         lines = [
             "📊 <b>ESTADISTICAS DEL BOT</b>",
             "",
