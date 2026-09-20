@@ -636,7 +636,7 @@ class CopyTradingStrategy(Strategy):
                     # Accumulate if same token bought again (distributed buys)
                     if existing or tracker_pos:
                         if existing:
-                            existing.amount += signal.amount_sol
+                            existing.sol_invested += signal.amount_sol
                         if tracker_pos:
                             tracker_pos.amount += signal.amount_sol
                         logger.info(
