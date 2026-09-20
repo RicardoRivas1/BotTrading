@@ -720,6 +720,10 @@ class CopyTradingStrategy(Strategy):
                         dry_run=self.config.trading.DRY_RUN,
                     )
 
+                    # Record buy in stats
+                    from core.stats import get_trade_stats
+                    get_trade_stats().record_buy(signal.wallet)
+
                     logger.success(
                         "CopyTrading: BUY {} | {} SOL | {} ({})",
                         signal.source, f"{signal.amount_sol:.6f}",
@@ -769,6 +773,20 @@ class CopyTradingStrategy(Strategy):
                     # Default to 100% if sell_pct not detected
                     pct = signal.sell_pct if signal.sell_pct > 0 else 100.0
 
+                    # Record sell in stats before cleaning positions
+                    from core.stats import get_trade_stats
+                    _entry = entry if entry > 0 else 0.0
+                    _buy_time = 0.0
+                    _sol_invested = signal.amount_sol
+                    _wallet_for_stats = signal.wallet
+                    if tracker_pos:
+                        _buy_time = float(getattr(tracker_pos, "created_at", 0.0) or 0.0)
+                        _sol_invested = getattr(tracker_pos, "amount", signal.amount_sol)
+                        if not _wallet_for_stats:
+                            _wallet_for_stats = getattr(tracker_pos, "source_wallet", "")
+                    if not _wallet_for_stats:
+                        _wallet_for_stats = signal.source
+
                     await process_sell_and_notify(
                         signal.token_mint,
                         symbol=signal.token_symbol,
@@ -781,6 +799,22 @@ class CopyTradingStrategy(Strategy):
                     if pct >= 99.0:
                         self.executor.positions.pop(signal.token_mint, None)
                         self.tracker.positions.pop(signal.token_mint, None)
+
+                    # Record completed trade in stats
+                    get_trade_stats().record_sell(
+                        mint=signal.token_mint,
+                        symbol=signal.token_symbol or signal.token_mint[:6].upper(),
+                        wallet=_wallet_for_stats,
+                        entry_price=_entry,
+                        exit_price=0.0,  # price at sell time unknown in dry_run
+                        pnl_pct=pnl_pct,
+                        sol_invested=_sol_invested,
+                        sol_received=0.0,
+                        buy_time=_buy_time,
+                        sell_time=time.time(),
+                        sell_reason="COPY_TRADE_SELL",
+                        sell_pct=pct,
+                    )
 
                     logger.success(
                         "CopyTrading: SELL {} | {} | PnL: {:.2f}% | sell_pct: {:.0f}%",

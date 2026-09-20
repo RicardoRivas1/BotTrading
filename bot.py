@@ -69,7 +69,11 @@ async def start_health_server(engine: StrategyEngine) -> None:
             )
 
     async def stats_handler(request: web.Request) -> web.Response:
-        return web.json_response(engine.get_stats())
+        from core.stats import get_trade_stats
+        engine_stats = engine.get_stats()
+        trade_stats = get_trade_stats().summary()
+        engine_stats["trade_stats"] = trade_stats
+        return web.json_response(engine_stats)
 
     app.router.add_get("/", health_handler)
     app.router.add_post("/webhook/copy-trading", copy_trade_webhook)
@@ -176,6 +180,9 @@ class TradingBot:
             self.notifier.start_heartbeat(interval_minutes=30.0)
         )
 
+        # Telegram command listener (/stats, /wallets)
+        cmd_task = asyncio.create_task(self._telegram_command_loop())
+
         # Monitor de posiciones
         monitor_task = asyncio.create_task(self.tracker.start_monitoring())
 
@@ -195,8 +202,67 @@ class TradingBot:
         finally:
             await self.engine.stop_all()
             heartbeat_task.cancel()
+            cmd_task.cancel()
             monitor_task.cancel()
-            await asyncio.gather(heartbeat_task, monitor_task, return_exceptions=True)
+            await asyncio.gather(heartbeat_task, cmd_task, monitor_task, return_exceptions=True)
+
+    async def _telegram_command_loop(self) -> None:
+        """Polls Telegram for /stats and /wallets commands."""
+        import aiohttp
+        from core.stats import get_trade_stats
+
+        cfg = self.config
+        if not cfg.telegram.TELEGRAM_TOKEN or not cfg.telegram.TELEGRAM_CHAT_ID:
+            return
+
+        token = cfg.telegram.TELEGRAM_TOKEN
+        chat_id = cfg.telegram.TELEGRAM_CHAT_ID
+        offset = 0
+        logger.info("Telegram command listener iniciado (/stats, /wallets)")
+
+        while True:
+            try:
+                url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=5"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as resp:
+                        if resp.status != 200:
+                            await asyncio.sleep(5)
+                            continue
+                        data = await resp.json()
+
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    msg = update.get("message", {})
+                    text = msg.get("text", "").strip().lower()
+                    from_chat = str(msg.get("chat", {}).get("id", ""))
+
+                    if from_chat != chat_id:
+                        continue
+
+                    if text == "/stats":
+                        stats = get_trade_stats()
+                        await self.notifier.send(stats.format_summary())
+                    elif text == "/wallets":
+                        stats = get_trade_stats()
+                        s = stats.summary()
+                        if not s["wallets"]:
+                            await self.notifier.send_status("No hay trades registrados aun.")
+                        else:
+                            lines = [" wallets:\n"]
+                            for w, ws in s["wallets"].items():
+                                lines.append(
+                                    f"• <code>{w[:12]}...</code>: "
+                                    f"{ws['buys']} buys / {ws['sells']} sells | "
+                                    f"WR {ws['win_rate']}% | PnL {ws['pnl_pct']:+.2f}%"
+                                )
+                            await self.notifier.send("\n".join(lines))
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(10)
+
+            await asyncio.sleep(3)
 
     async def _setup_helius_webhook(self) -> None:
         """Configura el webhook de Helius para copy trading."""
