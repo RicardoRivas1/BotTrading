@@ -243,10 +243,12 @@ async def process_sell_and_notify(
                 "[DRY_RUN] Venta simulada de {} ({}) por {} (PnL {:.2f}%, pct={:.0f}%)",
                 symbol, mint, reason, pnl, sell_pct,
             )
-            # If full sell, clean up positions
+            # If full sell, clean up positions and persist
             if sell_pct >= 99.0:
                 tracker.executor.positions.pop(mint, None)
                 tracker.positions.pop(mint, None)
+                tracker.executor._save_exec_positions()
+                tracker._save_positions()
         else:
             pos = tracker.get_position(mint)
             token_amount = (pos.amount / pos.buy_price) if pos and pos.buy_price else 0.0
@@ -263,10 +265,12 @@ async def process_sell_and_notify(
                 "Venta de {} ({}) ejecutada por {} ({:.0f}% | PnL {:.2f}%)",
                 symbol, mint, reason, sell_pct, pnl,
             )
-            # If full sell, clean up positions
+            # If full sell, clean up positions and persist
             if sell_pct >= 99.0:
                 tracker.executor.positions.pop(mint, None)
                 tracker.positions.pop(mint, None)
+                tracker.executor._save_exec_positions()
+                tracker._save_positions()
     except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
         logger.error(f"Error vendiendo {symbol} ({reason}): {exc}")
         await notifier.send_error(f"No se pudo vender {symbol} ({mint}) por {reason}: {exc}")

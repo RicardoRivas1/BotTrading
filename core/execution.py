@@ -191,6 +191,7 @@ class JupiterExecutor:
         self._rpc_client: AsyncClient = AsyncClient(rpc_url)
 
         self.positions: dict[str, Position] = {}
+        self._load_exec_positions()
         # Tokens detectados en la bonding curve de Pump.fun (sin ruta en
         # Jupiter/Raydium): para ellos se salta Jupiter y se vende directo.
         self.pump_bonding_tokens: set[str] = set()
@@ -467,6 +468,7 @@ class JupiterExecutor:
             peak_price=entry_price_sol,
             sol_invested=self.buy_amount_sol,
         )
+        self._save_exec_positions()
         if entry_price_sol > 0:
             logger.info("Posición registrada para {} @ entry={:.9f} SOL", token_mint, entry_price_sol)
         else:
@@ -826,6 +828,58 @@ class JupiterExecutor:
                             return float(price_usd)
         return 180.0
 
+    # ------------------------------------------------------- Persistencia
+    EXEC_POSITIONS_FILE = "exec_positions.json"
+
+    def _save_exec_positions(self) -> None:
+        """Guarda posiciones del executor a disco."""
+        import json as _json
+        from pathlib import Path
+        try:
+            data = {}
+            for mint, pos in self.positions.items():
+                data[mint] = {
+                    "mint": pos.mint,
+                    "token_amount_ui": pos.token_amount_ui,
+                    "entry_price": pos.entry_price,
+                    "peak_price": pos.peak_price,
+                    "sol_invested": pos.sol_invested,
+                    "trailing_active": pos.trailing_active,
+                    "created_at": pos.created_at,
+                }
+            Path(self.EXEC_POSITIONS_FILE).write_text(
+                _json.dumps(data, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def _load_exec_positions(self) -> None:
+        """Carga posiciones del executor desde disco."""
+        import json as _json
+        from pathlib import Path
+        path = Path(self.EXEC_POSITIONS_FILE)
+        if not path.exists():
+            return
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+            for mint, info in data.items():
+                self.positions[mint] = Position(
+                    mint=info["mint"],
+                    token_amount_ui=info.get("token_amount_ui", 0.0),
+                    entry_price=info.get("entry_price", 0.0),
+                    peak_price=info.get("peak_price", 0.0),
+                    sol_invested=info.get("sol_invested", 0.0),
+                    trailing_active=info.get("trailing_active", False),
+                    created_at=info.get("created_at", 0.0),
+                )
+            if self.positions:
+                logger.info(
+                    "Executor: posiciones cargadas desde disco: {}",
+                    len(self.positions),
+                )
+        except Exception:
+            pass
+
     async def get_token_symbol(self, token_mint: str) -> str:
         symbol = await self._get_symbol_from_dexscreener(token_mint)
         if symbol:
@@ -933,6 +987,7 @@ class JupiterExecutor:
                 token_mint, reason, pnl_pct,
             )
             self.positions.pop(token_mint, None)
+            self._save_exec_positions()
             return
 
         try:
@@ -945,6 +1000,7 @@ class JupiterExecutor:
             return
 
         self.positions.pop(token_mint, None)
+        self._save_exec_positions()
         logger.success("Posición {} cerrada por {} (PnL {:.2f}%)", token_mint, reason, pnl_pct)
 
     # ------------------------------------------------------------ Decimals

@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -106,6 +108,7 @@ class PositionTracker:
 
     # Slippage alto para ventas de emergencia en stop-loss (20% = 2000 bps).
     EMERGENCY_SLIPPAGE_BPS = 2000
+    POSITIONS_FILE = "open_positions.json"
 
     def __init__(self, executor: Any, notifier: Any, config: Any) -> None:
         self.executor = executor
@@ -113,6 +116,7 @@ class PositionTracker:
         self.config = config
         # Memoría global de posiciones activas (independiente del executor).
         self.positions: dict[str, TrackerPosition] = {}
+        self._load_positions()
 
     # ------------------------------------------------------------- Público
     def add_position(
@@ -138,6 +142,7 @@ class PositionTracker:
             amount=amount,
             source_wallet=source_wallet,
         )
+        self._save_positions()
 
     def get_positions_by_wallet(self, wallet: str) -> list[TrackerPosition]:
         """Devuelve todas las posiciones abiertas para una wallet dada."""
@@ -145,11 +150,60 @@ class PositionTracker:
 
     def remove_position(self, mint: str) -> bool:
         """Elimina la posición; devuelve True si existía."""
-        return self.positions.pop(mint, None) is not None
+        result = self.positions.pop(mint, None) is not None
+        if result:
+            self._save_positions()
+        return result
 
     def get_position(self, mint: str) -> Optional[TrackerPosition]:
         """Devuelve la posición registrada (o None)."""
         return self.positions.get(mint)
+
+    # ------------------------------------------------------- Persistencia
+    def _save_positions(self) -> None:
+        """Guarda posiciones abiertas a disco para sobrevivir reinicios."""
+        try:
+            data = {}
+            for mint, pos in self.positions.items():
+                data[mint] = {
+                    "mint": pos.mint,
+                    "symbol": pos.symbol,
+                    "buy_price": pos.buy_price,
+                    "amount": pos.amount,
+                    "created_at": pos.created_at,
+                    "source_wallet": pos.source_wallet,
+                    "highest_pnl_pct": pos.highest_pnl_pct,
+                }
+            Path(self.POSITIONS_FILE).write_text(
+                json.dumps(data, indent=2), encoding="utf-8"
+            )
+        except Exception as exc:
+            logger.debug("No se pudieron guardar posiciones: {}", exc)
+
+    def _load_positions(self) -> None:
+        """Carga posiciones abiertas desde disco al iniciar."""
+        path = Path(self.POSITIONS_FILE)
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for mint, info in data.items():
+                self.positions[mint] = TrackerPosition(
+                    mint=info["mint"],
+                    symbol=info.get("symbol", mint[:6].upper()),
+                    buy_price=info.get("buy_price", 0.0),
+                    amount=info.get("amount", 0.0),
+                    created_at=info.get("created_at", 0.0),
+                    source_wallet=info.get("source_wallet", ""),
+                    highest_pnl_pct=info.get("highest_pnl_pct", 0.0),
+                )
+            if self.positions:
+                logger.info(
+                    "Posiciones cargadas desde disco: {} posiciones abiertas",
+                    len(self.positions),
+                )
+        except Exception as exc:
+            logger.warning("Error cargando posiciones: {}", exc)
 
     async def start_monitoring(self) -> None:
         """Bucle de monitoreo en segundo plano; lánzalo con `asyncio.create_task`."""

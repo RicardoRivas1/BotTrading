@@ -631,6 +631,15 @@ class CopyTradingStrategy(Strategy):
         if amount_sol < 0.0001:
             return None
 
+        # Para buys: monto minimo realista (evita falsos positivos de fees/tiny transfers)
+        MIN_BUY_SOL = 0.005
+        if action == "buy" and amount_sol < MIN_BUY_SOL:
+            logger.debug(
+                "CopyTrade ignorado: buy demasiado pequeno ({:.6f} < {:.6f} SOL) | {}",
+                amount_sol, MIN_BUY_SOL, signature[:16] + "...",
+            )
+            return None
+
         # Limitar monto al maximo configurado
         max_amount = float(
             getattr(self.config.copy_trading, "MAX_COPY_TRADE_SOL", 0.01)
