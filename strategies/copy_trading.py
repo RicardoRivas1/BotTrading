@@ -631,30 +631,27 @@ class CopyTradingStrategy(Strategy):
             try:
                 if signal.action == "buy":
                     existing = self.executor.positions.get(signal.token_mint)
-                    if existing:
+                    tracker_pos = self.tracker.positions.get(signal.token_mint)
+
+                    # Accumulate if same token bought again (distributed buys)
+                    if existing or tracker_pos:
+                        if existing:
+                            existing.amount += signal.amount_sol
+                        if tracker_pos:
+                            tracker_pos.amount += signal.amount_sol
+                        logger.info(
+                            "CopyTrading: BUY acumulado {} | +{:.6f} SOL ({})",
+                            signal.source, signal.amount_sol,
+                            signal.token_mint[:8] + "...",
+                        )
                         return
 
-                    # If max positions reached, close oldest from same wallet to rotate
                     max_pos = int(getattr(self.config.trading, "MAX_OPEN_POSITIONS", 10))
-                    if len(self.executor.positions) >= max_pos and signal.wallet:
-                        wallet_positions = self.tracker.get_positions_by_wallet(signal.wallet)
-                        if wallet_positions:
-                            oldest = wallet_positions[0]
-                            logger.info(
-                                "CopyTrading: Rotacion - cerrando {} ({}) para abrir nuevo token",
-                                oldest.symbol, oldest.mint[:12] + "...",
-                            )
-                            await process_sell_and_notify(
-                                oldest.mint,
-                                symbol=oldest.symbol,
-                                reason="ROTATION",
-                                sell_pct=100.0,
-                            )
-                            self.executor.positions.pop(oldest.mint, None)
-                            self.tracker.positions.pop(oldest.mint, None)
-                        elif len(self.executor.positions) >= max_pos:
-                            return
-                    elif len(self.executor.positions) >= max_pos:
+                    if len(self.executor.positions) >= max_pos:
+                        logger.info(
+                            "CopyTrading: BUY ignorado {} - max posiciones ({})",
+                            signal.source, signal.token_mint[:8] + "...",
+                        )
                         return
 
                     original_amount = self.executor.buy_amount_sol
