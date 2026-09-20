@@ -441,8 +441,14 @@ class CopyTradingStrategy(Strategy):
         fee_payer = tx.get("feePayer", "")
         signature = tx.get("signature", "")
 
+        logger.info(
+            "CopyTrading: tx type={} fee_payer={} sig={}",
+            tx_type, fee_payer[:12] + "..." if fee_payer else "?",
+            signature[:16] + "..." if signature else "?",
+        )
+
         if tx_type not in COPY_TRADE_TYPES:
-            logger.debug(
+            logger.warning(
                 "CopyTrading: tx filtrada por tipo '{}' (esperado {}): sig={}",
                 tx_type, COPY_TRADE_TYPES, signature[:16] + "...",
             )
@@ -455,7 +461,7 @@ class CopyTradingStrategy(Strategy):
         if not tracked or not tracked.enabled:
             tracked = self._find_tracked_wallet_in_transfers(tx)
             if not tracked:
-                logger.debug(
+                logger.warning(
                     "CopyTrading: fee_payer {} no es wallet monitoreada. sig={}",
                     fee_payer[:12] + "...", signature[:16] + "...",
                 )
