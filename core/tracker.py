@@ -300,29 +300,57 @@ class PositionTracker:
         await self._maybe_notify_progress(pos, pnl_pct)
 
     async def _get_current_price(self, mint: str) -> float:
-        """Precio real en cascada: Pump.fun → Jupiter/DexScreener (executor).
+        """Precio real en cascada multi-fuente.
 
         El precio siempre está en las mismas unidades que el de entrada
         (SOL por Token). Orden de fuentes:
 
-        1. `get_pumpfun_price(mint)`: bonding curve de Pump.fun directamente.
-        2. `executor.get_token_price(mint)`: Jupiter v6 → DexScreener → Pump.fun.
+        1. `get_pumpfun_price(mint)`: bonding curve de Pump.fun (API HTTP).
+        2. `get_bonding_curve_price(mint)`: bonding curve directo on-chain (RPC).
+        3. GeckoTerminal API: indices rapido tokens nuevos.
+        4. `executor.get_token_price(mint)`: Jupiter v6 → DexScreener → Pump.fun.
 
-        Si ninguna fuente entrega precio válido devuelve 0.0 (el caller decide
-        conservar la última cotización conocida) y registra un `warning`
-        aplacado (máx. 1 cada 30s) con la causa del fallo.
+        Si ninguna fuente entrega precio válido devuelve 0.0.
         """
         pos = self.positions.get(mint)
+        is_pump = mint.lower().endswith("pump")
         cause: Optional[str] = None
 
+        # 1. Pump.fun API (fast, but may 403 for new tokens)
         try:
             price = await get_pumpfun_price(mint)
             if price is not None and price > 0:
                 return price
-            cause = "Pump.fun sin cotización"
+            cause = "Pump.fun API sin cotización"
         except Exception as exc:  # noqa: BLE001
-            cause = f"Pump.fun: {exc}"
+            cause = f"Pump.fun API: {exc}"
 
+        # 2. Bonding curve on-chain via RPC (works for ALL Pump.fun tokens)
+        if is_pump:
+            try:
+                from core.bonding_curve import get_bonding_curve_price
+                rpc_url = getattr(self.config.solana, "HELIUS_RPC_URL", "") if hasattr(self.config, "solana") else ""
+                if rpc_url:
+                    price = await get_bonding_curve_price(rpc_url, mint)
+                    if price is not None and price > 0:
+                        logger.debug("Precio de {} vía bonding curve RPC (SOL): {:.10g}", mint, price)
+                        return price
+                    cause = f"{cause} | Bonding curve RPC sin datos"
+            except Exception as exc:  # noqa: BLE001
+                cause = f"{cause} | Bonding curve: {exc}"
+
+        # 3. GeckoTerminal (fast indexing for new tokens)
+        try:
+            from core.gecko_price import get_price_from_geckoterminal
+            price = await get_price_from_geckoterminal(mint)
+            if price is not None and price > 0:
+                logger.debug("Precio de {} vía GeckoTerminal (SOL): {:.10g}", mint, price)
+                return price
+            cause = f"{cause or 'N/A'} | GeckoTerminal sin cotización"
+        except Exception as exc:  # noqa: BLE001
+            cause = f"{cause or 'N/A'} | GeckoTerminal: {exc}"
+
+        # 4. Jupiter/DexScreener (broadest coverage, slowest for new tokens)
         try:
             price = await self.executor.get_token_price(mint)
             if price is not None and price > 0:

@@ -674,9 +674,9 @@ class JupiterExecutor:
     async def get_token_price(self, token_mint: str) -> float:
         is_pump_mint = str(token_mint).lower().endswith("pump")
         try_sequence = (
-            ("dexscreener", "pumpfun", "jupiter")
+            ("pumpfun", "bonding_curve", "gecko", "dexscreener", "jupiter")
             if is_pump_mint
-            else ("jupiter", "dexscreener", "pumpfun")
+            else ("jupiter", "gecko", "dexscreener", "pumpfun")
         )
 
         price_sol = 0.0
@@ -714,6 +714,26 @@ class JupiterExecutor:
                         logger.info("Precio de {} vía Pump.fun (SOL): {:.10g}", token_mint, price_sol)
                 except Exception as exc:
                     logger.error("Pump.fun sin precio para {}: {}", token_mint, exc)
+
+            elif source == "bonding_curve":
+                try:
+                    from core.bonding_curve import get_bonding_curve_price
+                    rpc_url = self.rpc_url or ""
+                    if rpc_url:
+                        price_sol = await get_bonding_curve_price(rpc_url, token_mint)
+                        if price_sol > 0:
+                            logger.info("Precio de {} vía bonding curve RPC (SOL): {:.10g}", token_mint, price_sol)
+                except Exception as exc:
+                    logger.debug("Bonding curve RPC sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
+
+            elif source == "gecko":
+                try:
+                    from core.gecko_price import get_price_from_geckoterminal
+                    price_sol = await get_price_from_geckoterminal(token_mint)
+                    if price_sol > 0:
+                        logger.info("Precio de {} vía GeckoTerminal (SOL): {:.10g}", token_mint, price_sol)
+                except Exception as exc:
+                    logger.debug("GeckoTerminal sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
 
         if price_sol <= 0:
             raise SwapExecutionError(f"No se pudo obtener precio de {token_mint} desde ningún endpoint.")
@@ -813,6 +833,13 @@ class JupiterExecutor:
         symbol = await self._get_symbol_from_pumpfun(token_mint)
         if symbol:
             return symbol
+        try:
+            from core.gecko_price import get_symbol_from_geckoterminal
+            symbol = await get_symbol_from_geckoterminal(token_mint)
+            if symbol:
+                return symbol
+        except Exception:
+            pass
         fallback = str(token_mint)[:6].upper()
         logger.info("Sin ticker en APIs para {}; usando fallback {}", token_mint, fallback)
         return fallback
