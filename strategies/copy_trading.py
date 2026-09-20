@@ -141,6 +141,32 @@ class CopyTradingStrategy(Strategy):
         "So11111111111111111111111111111111111111112",
     } | set(DEX_PROGRAMS.values())
 
+    # Known program/authority accounts that are NOT token mints
+    _NON_MINT_ADDRESSES: set[str] = {
+        "SysvarRent111111111111111111111111111111111",
+        "SysvarC1ock11111111111111111111111111111111",
+        "11111111111111111111111111111111",
+        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+        "39azUYFWPz3VHgKCf3VChSWJ4GDQ5K7JeaKauKwit8Ky",
+        "CebN5WGUA4hG37LkS87YDh2XZ9P5Yq5R5h5h5h5h5h5",
+    }
+
+    @staticmethod
+    def _is_likely_valid_mint(addr: str) -> bool:
+        """Heuristic check: is this address likely a valid SPL token mint?
+
+        Rejects addresses that are too short, too long, or look like
+        program/authority accounts rather than token mints.
+        """
+        if not addr or len(addr) < 32 or len(addr) > 44:
+            return False
+        # Must be valid base58 character set
+        import re
+        if not re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', addr):
+            return False
+        return True
+
     def _extract_mint_from_account_data(
         self, account_data: list[dict[str, Any]], fee_payer: str
     ) -> Optional[str]:
@@ -156,6 +182,10 @@ class CopyTradingStrategy(Strategy):
                     continue
                 mint = tbc.get("mint", "")
                 if not mint or mint in self._KNOWN_ADDRESSES:
+                    continue
+                if mint in self._NON_MINT_ADDRESSES:
+                    continue
+                if not self._is_likely_valid_mint(mint):
                     continue
                 raw = tbc.get("rawTokenAmount", {})
                 amount_str = raw.get("tokenAmount", "0")
@@ -182,6 +212,10 @@ class CopyTradingStrategy(Strategy):
                 mint = tbc.get("mint", "")
                 if not mint or mint in self._KNOWN_ADDRESSES:
                     continue
+                if mint in self._NON_MINT_ADDRESSES:
+                    continue
+                if not self._is_likely_valid_mint(mint):
+                    continue
                 raw = tbc.get("rawTokenAmount", {})
                 amount_str = raw.get("tokenAmount", "0")
                 try:
@@ -198,7 +232,7 @@ class CopyTradingStrategy(Strategy):
         direcciones conocidas (programas DEX, SOL mint)."""
         candidates = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,44}', description)
         for candidate in candidates:
-            if candidate not in self._KNOWN_ADDRESSES:
+            if candidate not in self._KNOWN_ADDRESSES and candidate not in self._NON_MINT_ADDRESSES:
                 return candidate
         return None
 
@@ -259,6 +293,8 @@ class CopyTradingStrategy(Strategy):
 
         tracked = self.wallets.get(fee_payer)
 
+        # When wallet is found via transfers, use its address as the trader
+        wallet_address = ""
         if not tracked or not tracked.enabled:
             tracked = self._find_tracked_wallet_in_transfers(tx)
             if not tracked:
@@ -267,6 +303,7 @@ class CopyTradingStrategy(Strategy):
                     fee_payer[:12] + "...", signature[:16] + "...",
                 )
                 return
+            wallet_address = tracked.address
 
         # Deduplicacion
         if signature in self._recent_signals:
@@ -283,7 +320,7 @@ class CopyTradingStrategy(Strategy):
             tracked.label, fee_payer[:8] + "...", tx_type, signature[:16] + "...",
         )
 
-        signal = self._parse_trade(tx, tracked)
+        signal = self._parse_trade(tx, tracked, wallet_address=wallet_address)
         if signal:
             await self._execute_copy_trade(signal)
 
@@ -389,10 +426,12 @@ class CopyTradingStrategy(Strategy):
         if not action or not token_mint:
             logger.debug(
                 "CopyTrading: no se pudo determinar mint para {} | "
-                "accounts={} | tokenTransfers={} | "
-                "sol_spent={:.6f} | sol_received={:.6f}",
-                signature[:16] + "...", len(account_data),
+                "trader={} | accounts={} | tokenTransfers={} | "
+                "sol_spent={:.6f} | sol_received={:.6f} | "
+                "tokens_rcvd={} | tokens_sent={}",
+                signature[:16] + "...", trader[:8] + "...", len(account_data),
                 len(token_transfers), sol_spent, sol_received,
+                len(tokens_received), len(tokens_sent),
             )
             return None
 
@@ -408,6 +447,11 @@ class CopyTradingStrategy(Strategy):
             amount_sol = max_amount
 
         source_label = "pump.fun" if is_pump_fun else "dex"
+        logger.info(
+            "CopyTrading: signal {} {} | mint={} | {:.6f} SOL | trader={} | src={}",
+            action.upper(), signature[:16] + "...", token_mint[:12] + "...",
+            amount_sol, trader[:8] + "...", source_label,
+        )
         return CopyTradeSignal(
             wallet=tracked.address,
             action=action,
@@ -476,22 +520,35 @@ class CopyTradingStrategy(Strategy):
 
                 elif signal.action == "sell":
                     position = self.executor.positions.get(signal.token_mint)
-                    if not position:
+                    tracker_pos = self.tracker.positions.get(signal.token_mint)
+                    if not position and not tracker_pos:
+                        logger.info(
+                            "CopyTrading: SELL ignorado {} ({}) - no hay posicion para {}",
+                            signal.source, signal.token_mint[:8] + "...", signal.token_mint[:16] + "...",
+                        )
                         return
 
                     pnl_pct = 0.0
-                    if position.entry_price and position.entry_price > 0:
+                    entry = (position.entry_price if position and position.entry_price else 0.0) or \
+                            (tracker_pos.buy_price if tracker_pos and tracker_pos.buy_price else 0.0)
+                    if entry > 0:
                         try:
                             current_price = await self.executor.get_token_price(signal.token_mint)
-                            pnl_pct = (current_price - position.entry_price) / position.entry_price * 100
+                            if current_price > 0:
+                                pnl_pct = (current_price - entry) / entry * 100
                         except Exception:
                             pass
 
                     await process_sell_and_notify(
                         signal.token_mint,
+                        symbol=signal.token_symbol,
                         reason="COPY_TRADE_SELL",
                         pnl=pnl_pct,
                     )
+
+                    # Clean up positions from both executor and tracker
+                    self.executor.positions.pop(signal.token_mint, None)
+                    self.tracker.positions.pop(signal.token_mint, None)
 
                     logger.success(
                         "CopyTrading: SELL {} | {} | PnL: {:.2f}%",

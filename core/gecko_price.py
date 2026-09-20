@@ -57,13 +57,15 @@ async def _get_price_from_pool(token_mint: str, session: aiohttp.ClientSession) 
         if not pools:
             return None
 
-        # Sort by reserve_in_usd (liquidity)
-        pools.sort(
-            key=lambda p: float(
-                p.get("attributes", {}).get("reserve_in_usd", 0) or 0
-            ),
-            reverse=True,
-        )
+        # Sort by reserve_in_usd (liquidity) — handle None values
+        def _safe_liquidity(p: dict) -> float:
+            try:
+                val = p.get("attributes", {}).get("reserve_in_usd")
+                return float(val) if val is not None else 0.0
+            except (ValueError, TypeError):
+                return 0.0
+
+        pools.sort(key=_safe_liquidity, reverse=True)
 
         best = pools[0]
         price_native = (
