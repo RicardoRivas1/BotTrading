@@ -459,11 +459,35 @@ class CopyTradingStrategy(Strategy):
         # When wallet is found via transfers, use its address as the trader
         wallet_address = ""
         if not tracked or not tracked.enabled:
+            # Log transfer details for debugging
+            nt = tx.get("nativeTransfers", [])
+            tt = tx.get("tokenTransfers", [])
+            senders = set()
+            receivers = set()
+            for n in nt:
+                senders.add(n.get("fromUserAccount", ""))
+                receivers.add(n.get("toUserAccount", ""))
+            for t in tt:
+                senders.add(t.get("fromUserAccount", ""))
+                receivers.add(t.get("toUserAccount", ""))
+            tracked_in_s = senders.intersection(self.wallets.keys())
+            tracked_in_r = receivers.intersection(self.wallets.keys())
+            if tracked_in_s or tracked_in_r:
+                logger.info(
+                    "CopyTrading: wallets monitoreadas en transfers! senders={} receivers={}",
+                    [w[:8] for w in tracked_in_s],
+                    [w[:8] for w in tracked_in_r],
+                )
+
             tracked = self._find_tracked_wallet_in_transfers(tx)
             if not tracked:
                 logger.warning(
-                    "CopyTrading: fee_payer {} no es wallet monitoreada. sig={}",
-                    fee_payer[:12] + "...", signature[:16] + "...",
+                    "CopyTrading: fee_payer {} no es wallet monitoreada. "
+                    "senders={} receivers={} sig={}",
+                    fee_payer[:12] + "...",
+                    [s[:8] for s in list(senders)[:3]],
+                    [r[:8] for r in list(receivers)[:3]],
+                    signature[:16] + "...",
                 )
                 return
             wallet_address = tracked.address
@@ -611,6 +635,14 @@ class CopyTradingStrategy(Strategy):
         token_mint = None
         amount_sol = 0.0
 
+        logger.info(
+            "CopyTrade classify: trader={} tokens_sent={} tokens_rcvd={} sol_spent={:.6f} sol_rcvd={:.6f} is_pump={}",
+            trader[:8] + "..." if trader else "?",
+            [(t["mint"][:8] + "...", t["amount"]) for t in tokens_sent[:2]],
+            [(t["mint"][:8] + "...", t["amount"]) for t in tokens_received[:2]],
+            sol_spent, sol_received, is_pump_fun,
+        )
+
         # IMPORTANT: Check tokens_sent FIRST (sells) before tokens_received (buys)
         # When a DEX sell happens, BOTH tokens_sent AND tokens_received can be present
         # (trader sends tokens, receives change + SOL). Checking tokens_sent first
@@ -634,6 +666,10 @@ class CopyTradingStrategy(Strategy):
             token_mint = tokens_sent[0]["mint"]
             amount_sol = sol_spent
             sell_pct = self._calc_sell_pct(token_mint, tokens_sent[0]["amount"], tracked.address)
+            logger.info(
+                "CopyTrade CASE2b: sell_pct={:.1f}% is_pump={} | mint={} | tokens_amt={}",
+                sell_pct, is_pump_fun, token_mint[:12] + "...", tokens_sent[0]["amount"],
+            )
             if sell_pct < 5.0:
                 if is_pump_fun:
                     logger.info(
