@@ -569,10 +569,25 @@ class CopyTradingStrategy(Strategy):
                 signature[:16] + "...", tokens_sent[0]["mint"][:12] + "...", sol_spent,
             )
 
-        # Caso 2c: Envia tokens sin SOL = transfer/token dump (ignorar si no es sell)
+        # Caso 2c: Envia tokens sin SOL = possible DEX sell (SOL via program) or wallet transfer
         elif tokens_sent and sol_spent == 0 and sol_received == 0:
-            # Could be a wallet-to-wallet token transfer, not a trade
-            return None
+            # Check if any open position matches this token → it's a sell
+            if tracked.address:
+                wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
+                for wp in wallet_positions:
+                    if wp.mint in [t["mint"] for t in tokens_sent]:
+                        token_mint = wp.mint
+                        action = "sell"
+                        amount_sol = 0.0
+                        sell_pct = 100.0
+                        logger.info(
+                            "CopyTrading: SELL (token dump match) {} -> {} ({})",
+                            tracked.label, wp.symbol, wp.mint[:12] + "...",
+                        )
+                        break
+            # If no position match, could be a wallet-to-wallet token transfer, skip
+            if action is None:
+                return None
 
         # Caso 3b: Recibe SOL neto + tiene posiciones abiertas = VENTA
         # (Axiom sells: no tokenTransfers, trader receives SOL net)
@@ -661,9 +676,13 @@ class CopyTradingStrategy(Strategy):
             )
             return None
 
-        # Filtrar transfers de SOL minimos (fees de red)
-        if amount_sol < 0.0001:
+        # Filtrar transfers de SOL minimos (fees de red) - solo para buys
+        if action == "buy" and amount_sol < 0.0001:
             return None
+
+        # Para sells con amount_sol=0 (DEX program), usar sol_spent como referencia
+        if action == "sell" and amount_sol <= 0:
+            amount_sol = sol_spent if sol_spent > 0 else 0.01
 
         # Para buys: monto minimo realista (evita falsos positivos de fees/tiny transfers)
         MIN_BUY_SOL = 0.005
