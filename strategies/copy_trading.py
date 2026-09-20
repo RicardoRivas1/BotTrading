@@ -224,8 +224,8 @@ class CopyTradingStrategy(Strategy):
                     amount = int(amount_str)
                 except (ValueError, TypeError):
                     amount = 0
-                if abs(amount) > best_abs:
-                    best_abs = abs(amount)
+                if amount > 0 and amount > best_abs:
+                    best_abs = amount
                     best_mint = mint
         return best_mint
 
@@ -774,7 +774,6 @@ class CopyTradingStrategy(Strategy):
         elif tokens_sent and sol_spent > 0 and sol_received == 0:
             tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
             token_mint = tokens_sent[0]["mint"]
-            amount_sol = sol_spent
             trader_delta = trader_delta_by_mint.get(token_mint, 0.0)
             logger.debug(
                 "CopyTrade CASE2b: trader_delta={:.4f} is_pump={} | mint={} | tokens_amt={}",
@@ -783,6 +782,7 @@ class CopyTradingStrategy(Strategy):
             if trader_delta > 0:
                 # El trader INCREMENTO su balance del token = compra (DCA)
                 action = "buy"
+                amount_sol = sol_spent
                 sell_pct = 0.0
                 logger.info(
                     "CopyTrade: DCA buy (balance +{:.4f}) {} | mint={} | SOL_spent={:.6f} | pump={}",
@@ -791,6 +791,7 @@ class CopyTradingStrategy(Strategy):
             elif trader_delta < 0:
                 # Balance del trader bajo = venta real
                 action = "sell"
+                amount_sol = 0.0
                 logger.info(
                     "CopyTrading: SELL (dex program, balance -{:.4f}) {} | tokens_sent={} | SOL_out={:.6f}",
                     -trader_delta, signature[:16] + "...", token_mint[:12] + "...", sol_spent,
@@ -806,6 +807,7 @@ class CopyTradingStrategy(Strategy):
                 )
                 if have_pos:
                     action = "sell"
+                    amount_sol = 0.0
                     logger.info(
                         "CopyTrading: SELL (dex program, posicion) {} | tokens_sent={} | SOL_out={:.6f} | sell_pct={:.0f}%",
                         signature[:16] + "...", token_mint[:12] + "...", sol_spent, max(sell_pct, 1.0),
@@ -821,6 +823,7 @@ class CopyTradingStrategy(Strategy):
                             signature[:16] + "...", token_mint[:12] + "...", sol_spent,
                         )
                         action = "buy"
+                        amount_sol = sol_spent
                     else:
                         logger.debug(
                             "CopyTrade ignorado: small token transfer ({:.1f}%) {} | {}",
@@ -829,6 +832,7 @@ class CopyTradingStrategy(Strategy):
                         return None
                 else:
                     action = "sell"
+                    amount_sol = 0.0
                     logger.info(
                         "CopyTrading: SELL (dex program) {} | tokens_sent={} | SOL_out={:.6f} | sell_pct={:.0f}%",
                         signature[:16] + "...", token_mint[:12] + "...", sol_spent, sell_pct,
@@ -874,7 +878,15 @@ class CopyTradingStrategy(Strategy):
         # Guard: solo aplica si NO hay tokens involucrados. Si el trader RECIBE
         # tokens y gasta SOL, eso es una COMPRA (Caso 1) y no debe ser capturado
         # aqui por el pequeno cambio SOL (sol_received ~0.002).
+        # Requiere programa DEX o tipo SWAP para no clasificar transferencias directas/fondeos como ventas.
         elif sol_received > 0 and not tokens_received and not tokens_sent and tracked.address:
+            is_dex = bool(programs_involved.intersection(set(DEX_PROGRAMS.values()))) or tx.get("type") == "SWAP" or tx.get("source") in DEX_PROGRAMS
+            if not is_dex:
+                logger.debug(
+                    "CopyTrade ignorado: SOL recibido sin programa DEX ni SWAP ({}) para {}",
+                    signature[:16] + "...", tracked.label,
+                )
+                return None
             wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
             if wallet_positions and sol_received > max(sol_spent, 0.001):
                 pos = wallet_positions[-1]
@@ -1278,6 +1290,15 @@ class CopyTradingStrategy(Strategy):
                             signal.token_mint[:12] + "...",
                         )
 
+                    # Fallback entry desde compras acumuladas del trader si no tenemos entry
+                    w_sol = self._wallet_mint_sol.get(wm_key, 0.0)
+                    if entry <= 0 and accumulated > 0 and w_sol > 0:
+                        entry = w_sol / accumulated
+                        logger.info(
+                            "PnL: entry_price calculado desde compras del trader = {:.10g} for {}",
+                            entry, signal.token_mint[:12] + "...",
+                        )
+
                     if entry > 0 and current_price > 0:
                         pnl_pct = (current_price - entry) / entry * 100
                         logger.debug(
@@ -1290,6 +1311,8 @@ class CopyTradingStrategy(Strategy):
                         token_held = 0.0
                         if position:
                             token_held = getattr(position, "token_amount_ui", 0.0) or 0.0
+                        if token_held <= 0 and tracker_pos:
+                            token_held = getattr(tracker_pos, "token_amount_ui", 0.0) or 0.0
                         if token_held > 0 and si > 0:
                             current_value = token_held * current_price
                             pnl_pct = (current_value - si) / si * 100
@@ -1298,26 +1321,16 @@ class CopyTradingStrategy(Strategy):
                                 current_value, si, pnl_pct,
                             )
                         else:
-                            logger.debug(
-                                "PnL no disponible: sin token_amount_ui para {} | invested={:.6f}",
-                                signal.token_mint[:12] + "...", si,
-                            )
-                    elif sell_proceeds > 0:
-                        # Fallback final: SOL recibido (sin cap) vs el COSTO del
-                        # trader para esos tokens vendidos. Usamos sus numeros reales:
-                        # costo_por_tk = SOL_invertido_total / tokens_acumulados.
-                        # asi el PnL refleja la venta PARCIAL real (20-40%), no
-                        # "vendio todo lo que metio" como asumiamos antes.
-                        # `accumulated` ya fue capturado ANTES del descuento en el
-                        # bloque de pct, asi usamos la base correcta del costo.
-                        w_sol = self._wallet_mint_sol.get(wm_key, 0.0)
+                            pnl_pct = 0.0
+                    elif sell_proceeds > 0.0001:
+                        # Fallback: SOL recibido por el trader vs el COSTO del trader
                         sold_tok = (
                             signal.trade_token_amount
                             if signal.trade_token_amount > 0
                             else 0.0
                         )
-                        if accumulated > 0 and sold_tok > 0:
-                            cost_per_tk = w_sol / accumulated if w_sol > 0 else 0.0
+                        if accumulated > 0 and sold_tok > 0 and w_sol > 0:
+                            cost_per_tk = w_sol / accumulated
                             sold_cost = cost_per_tk * sold_tok
                             if sold_cost > 0:
                                 pnl_pct = (sell_proceeds - sold_cost) / sold_cost * 100
@@ -1326,35 +1339,26 @@ class CopyTradingStrategy(Strategy):
                                     sell_proceeds, sold_cost, f"{sold_tok:.6g}", pnl_pct,
                                 )
                             else:
-                                si = _sol_invested()
-                                if si > 0:
-                                    sold_port = si * (pct / 100.0)
-                                    if sold_port > 0:
-                                        pnl_pct = (sell_proceeds - sold_port) / sold_port * 100
-                                        logger.info(
-                                            "PnL estimado (SOL/inv parcial): sell={:.6f} vs {:.1f}% vendido (inv={:.6f}) => {:.2f}%",
-                                            sell_proceeds, pct, sold_port, pnl_pct,
-                                        )
+                                pnl_pct = 0.0
                         else:
-                            si = _sol_invested()
-                            if si > 0:
-                                sold_port = si * (pct / 100.0)
-                                if sold_port > 0:
-                                    pnl_pct = (sell_proceeds - sold_port) / sold_port * 100
-                                    logger.info(
-                                        "PnL estimado (SOL/inv): sell={:.6f} vs {:.1f}% vendido (inv={:.6f}) => {:.2f}%",
-                                        sell_proceeds, pct, sold_port, pnl_pct,
-                                    )
+                            pnl_pct = 0.0
+                    else:
+                        pnl_pct = 0.0
+
+                    # Clamp PnL: en spot trading la pérdida nunca puede ser peor que -100%
+                    pnl_pct = max(-100.0, pnl_pct)
 
                     # Record sell in stats before cleaning positions
                     from core.stats import get_trade_stats
                     _entry = entry if entry > 0 else 0.0
                     _buy_time = 0.0
-                    _sol_invested = signal.amount_sol
+                    _raw_sol_invested = _sol_invested()
+                    _sol_portion_invested = _raw_sol_invested * (pct / 100.0)
+                    _sol_received = max(0.0, _sol_portion_invested * (1.0 + pnl_pct / 100.0))
+                    _exit_price = current_price if current_price > 0 else (_entry * (1.0 + pnl_pct / 100.0) if _entry > 0 else 0.0)
                     _wallet_for_stats = signal.wallet
                     if tracker_pos:
                         _buy_time = float(getattr(tracker_pos, "created_at", 0.0) or 0.0)
-                        _sol_invested = getattr(tracker_pos, "amount", signal.amount_sol)
                         if not _wallet_for_stats:
                             _wallet_for_stats = getattr(tracker_pos, "source_wallet", "")
                     if not _wallet_for_stats:
@@ -1369,10 +1373,17 @@ class CopyTradingStrategy(Strategy):
                         trader=signal.trader_label,
                     )
 
-                    # Clean up positions from both executor and tracker
+                    # Clean up or reduce positions
                     if pct >= 99.0:
                         self.executor.positions.pop(signal.token_mint, None)
                         self.tracker.positions.pop(signal.token_mint, None)
+                    else:
+                        if position:
+                            position.sol_invested = max(0.0, getattr(position, "sol_invested", 0.0) - _sol_portion_invested)
+                        if tracker_pos:
+                            tracker_pos.amount = max(0.0, getattr(tracker_pos, "amount", 0.0) - _sol_portion_invested)
+                    self.executor._save_exec_positions()
+                    self.tracker._save_positions()
 
                     # Record completed trade in stats
                     get_trade_stats().record_sell(
@@ -1380,10 +1391,10 @@ class CopyTradingStrategy(Strategy):
                         symbol=signal.token_symbol or signal.token_mint[:6].upper(),
                         wallet=_wallet_for_stats,
                         entry_price=_entry,
-                        exit_price=0.0,  # price at sell time unknown in dry_run
+                        exit_price=_exit_price,
                         pnl_pct=pnl_pct,
-                        sol_invested=_sol_invested,
-                        sol_received=0.0,
+                        sol_invested=_sol_portion_invested,
+                        sol_received=_sol_received,
                         buy_time=_buy_time,
                         sell_time=time.time(),
                         sell_reason="COPY_TRADE_SELL",

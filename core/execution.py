@@ -746,8 +746,8 @@ class JupiterExecutor:
         # Usar secuencias distintas segun el estado del token hacia que el
         # entry_price (bonding curve virtual) y el current_price (jupiter/gecko)
         # fueran de ordenes de magnitud distintos => PnL inflado falso.
-        # Regla: Pump.fun API si sigue en bonding curve, si no DexScreener.
-        try_sequence = ("pumpfun", "bonding_curve", "dexscreener")
+        # Regla: Pump.fun API si sigue en bonding curve, si no DexScreener, fallback Jupiter.
+        try_sequence = ("pumpfun", "bonding_curve", "dexscreener", "jupiter")
 
         price_sol = 0.0
         for source in try_sequence:
@@ -763,24 +763,27 @@ class JupiterExecutor:
                             session, token_mint, SOL_MINT, amount_lamports
                         )
                     out = float(quote.get("outAmount") or 0)
-                    price_sol = out / 1_000_000_000
-                    if price_sol > 0:
+                    p = out / 1_000_000_000
+                    if p > 0:
+                        price_sol = p
                         logger.info("Precio de {} vía Jupiter (SOL): {:.10g}", token_mint, price_sol)
                 except Exception as exc:
                     logger.debug("Jupiter sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
 
             elif source == "dexscreener":
                 try:
-                    price_sol = await self._get_price_from_dexscreener(token_mint)
-                    if price_sol > 0:
+                    p = await self._get_price_from_dexscreener(token_mint)
+                    if p and p > 0:
+                        price_sol = float(p)
                         logger.info("Precio de {} vía DexScreener (SOL): {:.10g}", token_mint, price_sol)
                 except Exception as exc:
                     logger.warning("DexScreener sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
 
             elif source == "pumpfun":
                 try:
-                    price_sol = await self._get_price_from_pumpfun(token_mint)
-                    if price_sol > 0:
+                    p = await self._get_price_from_pumpfun(token_mint)
+                    if p and p > 0:
+                        price_sol = float(p)
                         logger.info("Precio de {} vía Pump.fun (SOL): {:.10g}", token_mint, price_sol)
                 except Exception as exc:
                     logger.error("Pump.fun sin precio para {}: {}", token_mint, exc)
@@ -790,8 +793,9 @@ class JupiterExecutor:
                     from core.bonding_curve import get_bonding_curve_price
                     rpc_url = self.rpc_url or ""
                     if rpc_url:
-                        price_sol = await get_bonding_curve_price(rpc_url, token_mint)
-                        if price_sol > 0:
+                        p = await get_bonding_curve_price(rpc_url, token_mint)
+                        if p is not None and p > 0:
+                            price_sol = float(p)
                             logger.info("Precio de {} vía bonding curve RPC (SOL): {:.10g}", token_mint, price_sol)
                 except Exception as exc:
                     logger.debug("Bonding curve RPC sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
@@ -799,12 +803,14 @@ class JupiterExecutor:
             elif source == "gecko":
                 try:
                     from core.gecko_price import get_price_from_geckoterminal
-                    price_sol = await get_price_from_geckoterminal(token_mint)
-                    if price_sol > 0:
+                    p = await get_price_from_geckoterminal(token_mint)
+                    if p is not None and p > 0:
+                        price_sol = float(p)
                         logger.info("Precio de {} vía GeckoTerminal (SOL): {:.10g}", token_mint, price_sol)
                 except Exception as exc:
                     logger.debug("GeckoTerminal sin precio para {} ({}); intentando fallbacks.", token_mint, exc)
 
+        price_sol = float(price_sol or 0.0)
         if price_sol <= 0:
             raise SwapExecutionError(f"No se pudo obtener precio de {token_mint} desde ningún endpoint.")
 
@@ -832,19 +838,29 @@ class JupiterExecutor:
 
         best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
 
-        try:
-            price_native = float(best.get("priceNative", 0) or 0)
-        except (ValueError, TypeError):
-            price_native = 0.0
-        if price_native > 0:
-            return price_native
+        quote_token = best.get("quoteToken", {}) or {}
+        quote_symbol = str(quote_token.get("symbol", "")).upper()
+        quote_addr = str(quote_token.get("address", ""))
+        is_sol_quote = quote_symbol in ("SOL", "WSOL", "") or quote_addr == SOL_MINT
 
+        # Si el par es contra SOL, priceNative es directamente el precio en SOL
+        if is_sol_quote:
+            try:
+                price_native = float(best.get("priceNative", 0) or 0)
+                if price_native > 0:
+                    return price_native
+            except (ValueError, TypeError):
+                pass
+
+        # Si el par es contra USD (USDC/USDT) o no se pudo leer priceNative, convertir USD a SOL
         price_usd = best.get("priceUsd")
         if price_usd:
             try:
                 sol_usd = await self._get_sol_usd_price()
                 if sol_usd > 0:
-                    return float(price_usd) / sol_usd
+                    converted = float(price_usd) / sol_usd
+                    if converted > 0:
+                        return converted
             except Exception:
                 pass
 
@@ -858,6 +874,12 @@ class JupiterExecutor:
                     logger.debug("Pump.fun respondió {} para {}", resp.status, token_mint)
                     return 0.0
                 data = await resp.json()
+
+        # Si el token ya completó la curva de bonding (migró a Raydium), la bonding curve
+        # de Pump.fun está congelada y no refleja el precio real actual de mercado.
+        if data.get("complete") is True:
+            logger.debug("Token {} ya completó bonding curve en Pump.fun; delegando a DEX", token_mint)
+            return 0.0
 
         virtual_sol = data.get("virtual_sol_reserves")
         virtual_tokens = data.get("virtual_token_reserves")

@@ -252,12 +252,12 @@ class TradingBot:
                         if not s["wallets"]:
                             await self.notifier.send_status("No hay trades registrados aun.")
                         else:
-                            lines = [" wallets:\n"]
+                            lines = ["<b>Wallets monitoreadas:</b>\n"]
                             for w, ws in s["wallets"].items():
                                 lines.append(
                                     f"• <code>{w[:12]}...</code>: "
                                     f"{ws['buys']} buys / {ws['sells']} sells | "
-                                    f"WR {ws['win_rate']}% | PnL {ws['pnl_pct']:+.2f}%"
+                                    f"WR {ws['win_rate']}% | PnL {ws['pnl_pct']:+.2f}% ({ws['net_pnl_sol']:+.4f} SOL)"
                                 )
                             await self.notifier.send("\n".join(lines))
 

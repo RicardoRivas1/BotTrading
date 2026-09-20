@@ -59,6 +59,16 @@ class WalletStats:
     def net_pnl_sol(self) -> float:
         return self.total_sol_received - self.total_sol_invested
 
+    @property
+    def avg_pnl_pct(self) -> float:
+        return (self.total_pnl_pct / self.sells) if self.sells > 0 else 0.0
+
+    @property
+    def net_pnl_pct(self) -> float:
+        if self.total_sol_invested > 0:
+            return (self.net_pnl_sol / self.total_sol_invested) * 100.0
+        return self.avg_pnl_pct
+
 
 class TradeStats:
     """Global trade statistics with JSON persistence."""
@@ -200,12 +210,34 @@ class TradeStats:
         return sum(1 for t in self.trades if t.pnl_pct < 0)
 
     @property
-    def total_pnl_pct(self) -> float:
+    def total_sol_invested(self) -> float:
+        return sum(t.sol_invested for t in self.trades)
+
+    @property
+    def total_sol_received(self) -> float:
+        return sum(t.sol_received for t in self.trades)
+
+    @property
+    def net_pnl_sol(self) -> float:
+        return self.total_sol_received - self.total_sol_invested
+
+    @property
+    def sum_pnl_pct(self) -> float:
         return sum(t.pnl_pct for t in self.trades)
 
     @property
     def avg_pnl_pct(self) -> float:
-        return self.total_pnl_pct / len(self.trades) if self.trades else 0.0
+        return (self.sum_pnl_pct / len(self.trades)) if self.trades else 0.0
+
+    @property
+    def net_pnl_pct(self) -> float:
+        if self.total_sol_invested > 0:
+            return (self.net_pnl_sol / self.total_sol_invested) * 100.0
+        return self.avg_pnl_pct
+
+    @property
+    def total_pnl_pct(self) -> float:
+        return self.net_pnl_pct
 
     @property
     def best_trade(self) -> Optional[TradeRecord]:
@@ -227,8 +259,9 @@ class TradeStats:
             "wins": wins,
             "losses": losses,
             "win_rate_pct": round(wins / self.total_sells * 100, 1) if self.total_sells > 0 else 0.0,
-            "total_pnl_pct": round(self.total_pnl_pct, 2),
+            "total_pnl_pct": round(self.net_pnl_pct, 2),
             "avg_pnl_pct": round(self.avg_pnl_pct, 2),
+            "net_pnl_sol": round(self.net_pnl_sol, 4),
             "best_trade_pct": round(self.best_trade.pnl_pct, 2) if self.best_trade else 0.0,
             "worst_trade_pct": round(self.worst_trade.pnl_pct, 2) if self.worst_trade else 0.0,
             "avg_hold_seconds": round(
@@ -238,7 +271,9 @@ class TradeStats:
                 "buys": ws.buys,
                 "sells": ws.sells,
                 "win_rate": round(ws.win_rate, 1),
-                "pnl_pct": round(ws.total_pnl_pct, 2),
+                "pnl_pct": round(ws.net_pnl_pct, 2),
+                "avg_pnl_pct": round(ws.avg_pnl_pct, 2),
+                "net_pnl_sol": round(ws.net_pnl_sol, 4),
                 "best": round(ws.best_trade_pct, 2),
                 "worst": round(ws.worst_trade_pct, 2),
                 "sol_invested": round(ws.total_sol_invested, 4),
@@ -262,7 +297,7 @@ class TradeStats:
             f"🔄 Compras: {s['total_buys']} | Ventas: {s['total_sells']} | Abiertas: {s['open_positions']}",
             f"✅ Wins: {s['wins']} | ❌ Losses: {s['losses']}",
             f"🎯 Win Rate: <b>{s['win_rate_pct']}%</b>",
-            f"💰 PnL Total: <b>{s['total_pnl_pct']:+.2f}%</b> | Promedio: {s['avg_pnl_pct']:+.2f}%",
+            f"💰 PnL Neto: <b>{s['total_pnl_pct']:+.2f}%</b> ({s['net_pnl_sol']:+.4f} SOL) | Promedio: {s['avg_pnl_pct']:+.2f}%",
             f"🏆 Mejor: {s['best_trade_pct']:+.2f}% | 📉 Peor: {s['worst_trade_pct']:+.2f}%",
         ]
         if s["avg_hold_seconds"] > 0:
@@ -276,7 +311,7 @@ class TradeStats:
                 short = w[:8] + "..."
                 lines.append(
                     f"  {short}: {ws['sells']} sells | WR {ws['win_rate']}% | "
-                    f"PnL {ws['pnl_pct']:+.2f}% | {ws['sol_invested']:.4f} SOL"
+                    f"PnL {ws['pnl_pct']:+.2f}% ({ws['net_pnl_sol']:+.4f} SOL) | {ws['sol_invested']:.4f} SOL"
                 )
 
         return "\n".join(lines)

@@ -70,6 +70,10 @@ async def get_pumpfun_price(mint: str) -> Optional[float]:
                     return None
                 data = await resp.json(content_type=None)
 
+        if data.get("complete") is True:
+            logger.debug("Pump.fun coin {} completó bonding curve; delegando a DEX", mint)
+            return None
+
         v_sol = float(data["virtual_sol_reserves"]) / 1e9
         v_tokens = float(data["virtual_token_reserves"]) / 1e6
         if v_sol > 0 and v_tokens > 0:
@@ -249,6 +253,17 @@ class PositionTracker:
             logger.warning("No se pudo obtener precio de {} ({}): {}", mint, pos.symbol, exc)
 
         if current_price is None or current_price <= 0:
+            # Sin precio conocido: verificar TIME_EXPIRED para posiciones sin trader
+            if not getattr(pos, "source_wallet", "") and (now - pos.created_at > MAX_HOLD_TIME_SEC):
+                logger.info(
+                    "⏳ TIME EXPIRED (sin precio) para {} ({}) tras {:.0f}s",
+                    mint, pos.symbol, MAX_HOLD_TIME_SEC,
+                )
+                ok = await process_sell_and_notify(
+                    pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=0.0,
+                )
+                if ok:
+                    self.remove_position(mint)
             return
 
         # --- Asignación dinámica del precio de entrada (BASE) ---
@@ -326,18 +341,19 @@ class PositionTracker:
                         self.remove_position(mint)
                     return
 
-        # --- TIME_EXPIRED DESHABILITADO: solo cerrar si el trader cierra ---
-        # if now - pos.created_at > MAX_HOLD_TIME_SEC:
-        #     logger.info(
-        #         "⏳ TIME EXPIRED para {} ({}) tras {:.0f}s (PnL {:+.2f}%)",
-        #         mint, pos.symbol, MAX_HOLD_TIME_SEC, pnl_pct,
-        #     )
-        #     ok = await process_sell_and_notify(
-        #         pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=pnl_pct
-        #     )
-        #     if ok:
-        #         self.remove_position(mint)
-        #     return
+        # --- TIME_EXPIRED: solo para posiciones sin trader (sniper), no para copy trading ---
+        max_hold = getattr(pos, "max_hold_seconds", 0.0) or float(MAX_HOLD_TIME_SEC)
+        if not getattr(pos, "source_wallet", "") and max_hold > 0 and (now - pos.created_at > max_hold):
+            logger.info(
+                "⏳ TIME EXPIRED para {} ({}) tras {:.0f}s (PnL {:+.2f}%)",
+                mint, pos.symbol, max_hold, pnl_pct,
+            )
+            ok = await process_sell_and_notify(
+                pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=pnl_pct
+            )
+            if ok:
+                self.remove_position(mint)
+            return
 
         # Progreso: si la posición sigue abierta (no se vendió por TP/SL o
         # TIME_EXPIRED), se reporta su estado periódicamente o ante saltos de
@@ -345,23 +361,11 @@ class PositionTracker:
         await self._maybe_notify_progress(pos, pnl_pct)
 
     async def _get_current_price(self, mint: str) -> float:
-        """Precio real en cascada multi-fuente.
-
-        El precio siempre está en las mismas unidades que el de entrada
-        (SOL por Token). Orden de fuentes:
-
-        1. `get_pumpfun_price(mint)`: bonding curve de Pump.fun (API HTTP).
-        2. `get_bonding_curve_price(mint)`: bonding curve directo on-chain (RPC).
-        3. GeckoTerminal API: indices rapido tokens nuevos.
-        4. `executor.get_token_price(mint)`: Jupiter v6 → DexScreener → Pump.fun.
-
-        Si ninguna fuente entrega precio válido devuelve 0.0.
-        """
+        """Precio real determinista (Pump.fun -> Bonding Curve RPC -> DexScreener)."""
         pos = self.positions.get(mint)
-        is_pump = mint.lower().endswith("pump")
         cause: Optional[str] = None
 
-        # 1. Pump.fun API (fast, but may 403 for new tokens)
+        # 1. Pump.fun API si está en bonding curve
         try:
             price = await get_pumpfun_price(mint)
             if price is not None and price > 0:
@@ -370,32 +374,7 @@ class PositionTracker:
         except Exception as exc:  # noqa: BLE001
             cause = f"Pump.fun API: {exc}"
 
-        # 2. Bonding curve on-chain via RPC (works for ALL Pump.fun tokens)
-        if is_pump:
-            try:
-                from core.bonding_curve import get_bonding_curve_price
-                rpc_url = getattr(self.config.solana, "HELIUS_RPC_URL", "") if hasattr(self.config, "solana") else ""
-                if rpc_url:
-                    price = await get_bonding_curve_price(rpc_url, mint)
-                    if price is not None and price > 0:
-                        logger.debug("Precio de {} vía bonding curve RPC (SOL): {:.10g}", mint, price)
-                        return price
-                    cause = f"{cause} | Bonding curve RPC sin datos"
-            except Exception as exc:  # noqa: BLE001
-                cause = f"{cause} | Bonding curve: {exc}"
-
-        # 3. GeckoTerminal (fast indexing for new tokens)
-        try:
-            from core.gecko_price import get_price_from_geckoterminal
-            price = await get_price_from_geckoterminal(mint)
-            if price is not None and price > 0:
-                logger.debug("Precio de {} vía GeckoTerminal (SOL): {:.10g}", mint, price)
-                return price
-            cause = f"{cause or 'N/A'} | GeckoTerminal sin cotización"
-        except Exception as exc:  # noqa: BLE001
-            cause = f"{cause or 'N/A'} | GeckoTerminal: {exc}"
-
-        # 4. Jupiter/DexScreener (broadest coverage, slowest for new tokens)
+        # 2. Delegar en la cadena determinista del executor
         try:
             price = await self.executor.get_token_price(mint)
             if price is not None and price > 0:

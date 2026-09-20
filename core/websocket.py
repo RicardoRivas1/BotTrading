@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Any, AsyncIterator, Optional
 
 import aiohttp
@@ -235,8 +236,38 @@ async def process_sell_and_notify(
         chat_id=cfg.telegram.TELEGRAM_CHAT_ID,
     )
     tracker = get_global_tracker()
+    pos = tracker.get_position(mint)
 
     sell_pct = max(0.0, min(100.0, sell_pct))
+
+    # Registrar venta en estadísticas para salidas del tracker (TP/SL/TRAILING_STOP/etc.)
+    if reason != "COPY_TRADE_SELL" and pos:
+        try:
+            from core.stats import get_trade_stats
+            _entry = getattr(pos, "buy_price", 0.0) or 0.0
+            _sol_inv = getattr(pos, "amount", 0.0) or 0.0
+            _portion_inv = _sol_inv * (sell_pct / 100.0)
+            _pnl_pct = max(-100.0, float(pnl))
+            _sol_rec = max(0.0, _portion_inv * (1.0 + _pnl_pct / 100.0))
+            _exit_price = _entry * (1.0 + _pnl_pct / 100.0) if _entry > 0 else 0.0
+            _wallet = getattr(pos, "source_wallet", "") or "tracker"
+            _buy_time = float(getattr(pos, "created_at", 0.0) or 0.0)
+            get_trade_stats().record_sell(
+                mint=mint,
+                symbol=symbol if symbol != "N/A" else getattr(pos, "symbol", mint[:6].upper()),
+                wallet=_wallet,
+                entry_price=_entry,
+                exit_price=_exit_price,
+                pnl_pct=_pnl_pct,
+                sol_invested=_portion_inv,
+                sol_received=_sol_rec,
+                buy_time=_buy_time,
+                sell_time=time.time(),
+                sell_reason=reason,
+                sell_pct=sell_pct,
+            )
+        except Exception as st_exc:
+            logger.debug("Error registrando venta en stats para {}: {}", mint, st_exc)
 
     try:
         if cfg.trading.DRY_RUN:
@@ -250,8 +281,10 @@ async def process_sell_and_notify(
                 tracker.positions.pop(mint, None)
                 tracker.executor._save_exec_positions()
                 tracker._save_positions()
+            elif pos:
+                pos.amount = max(0.0, getattr(pos, "amount", 0.0) * (1.0 - sell_pct / 100.0))
+                tracker._save_positions()
         else:
-            pos = tracker.get_position(mint)
             token_amount = (pos.amount / pos.buy_price) if pos and pos.buy_price else 0.0
             if token_amount <= 0:
                 logger.warning(f"Sin balance estimado para vender {symbol} ({mint}); omitiendo.")
@@ -271,6 +304,9 @@ async def process_sell_and_notify(
                 tracker.executor.positions.pop(mint, None)
                 tracker.positions.pop(mint, None)
                 tracker.executor._save_exec_positions()
+                tracker._save_positions()
+            elif pos:
+                pos.amount = max(0.0, getattr(pos, "amount", 0.0) * (1.0 - sell_pct / 100.0))
                 tracker._save_positions()
     except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
         logger.error(f"Error vendiendo {symbol} ({reason}): {exc}")
