@@ -89,13 +89,15 @@ class TelegramNotifier:
         price: Optional[float] = None,
         price_unit: str = "SOL",
         dry_run: bool = True,
+        trader: str = "",
     ) -> bool:
         """Notifica una compra de token ejecutada.
 
         Muestra el ticker/símbolo del token en grande y enlaza a Pump.fun,
         DexScreener y Solscan. `symbol` y `mint` se escapan con `html.escape()`
         para evitar errores 400 de Telegram. `price` (con `price_unit` "SOL" o
-        "USD") solo se muestra si está definido.
+        "USD") solo se muestra si está definido. `trader` opcional muestra la
+        wallet copiada.
         """
         mode_txt = "DRY_RUN" if dry_run else "REAL"
         safe_symbol = html.escape(str(symbol).upper())
@@ -113,6 +115,7 @@ class TelegramNotifier:
             price_txt = "N/D"
 
         price_line = f"\n<b>Precio:</b> {html.escape(price_txt)}" if price and price > 0 else ""
+        trader_line = f"\n<b>Trader:</b> {html.escape(str(trader))}" if trader else ""
 
         score_txt = html.escape(str(score)) if score is not None else "N/D"
 
@@ -123,7 +126,8 @@ class TelegramNotifier:
             f"<code>{safe_mint}</code>\n"
             f"<b>Monto:</b> {amount_txt} SOL\n"
             f"<b>Score RugCheck:</b> {score_txt}"
-            f"{price_line}\n\n"
+            f"{price_line}"
+            f"{trader_line}\n\n"
             f'🔗 <a href="https://pump.fun/{safe_mint}">Pump.fun</a> | '
             f'<a href="https://dexscreener.com/solana/{safe_mint}">DexScreener</a> | '
             f'<a href="https://solscan.io/token/{safe_mint}">Solscan</a>'

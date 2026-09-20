@@ -53,6 +53,8 @@ class CopyTradeSignal:
     timestamp: float = field(default_factory=time.time)
     source: str = "helius_webhook"
     sell_pct: float = 0.0  # 0-100: percentage to sell (100 = full, 25 = quarter)
+    trader_label: str = ""  # nombre del trader copiado (ej: cupsey)
+    sell_sol_raw: float = 0.0  # SOL real recibido en la venta (sin cap MAX_COPY_TRADE_SOL)
 
 
 @dataclass
@@ -963,6 +965,8 @@ class CopyTradingStrategy(Strategy):
         max_amount = float(
             getattr(self.config.copy_trading, "MAX_COPY_TRADE_SOL", 0.01)
         )
+        # Capturar el SOL real de la venta ANTES del cap (para PnL real)
+        sell_sol_raw = amount_sol if action == "sell" else 0.0
         if amount_sol > max_amount:
             amount_sol = max_amount
 
@@ -984,6 +988,8 @@ class CopyTradingStrategy(Strategy):
             timestamp=float(timestamp) if timestamp else time.time(),
             source=f"helius:{tracked.label}:{source_label}",
             sell_pct=sell_pct,
+            trader_label=tracked.label,
+            sell_sol_raw=sell_sol_raw,
         )
 
     async def _execute_copy_trade(self, signal: CopyTradeSignal) -> None:
@@ -1009,8 +1015,9 @@ class CopyTradingStrategy(Strategy):
                         if tracker_pos:
                             tracker_pos.amount += signal.amount_sol
                         logger.info(
-                            "CopyTrading: BUY acumulado {} | +{:.6f} SOL ({}) | total_investido={:.6f}",
-                            signal.source, signal.amount_sol,
+                            "CopyTrading: BUY acumulado {} ({}) | +{:.6f} SOL ({}) | total_investido={:.6f}",
+                            signal.trader_label or signal.source, signal.wallet[:8] + "...",
+                            signal.amount_sol,
                             signal.token_mint[:8] + "...",
                             existing.sol_invested if existing else tracker_pos.amount,
                         )
@@ -1021,6 +1028,7 @@ class CopyTradingStrategy(Strategy):
                             signal.amount_sol,
                             symbol=signal.token_symbol or signal.token_mint[:6].upper(),
                             dry_run=self.config.trading.DRY_RUN,
+                            trader=signal.trader_label,
                         )
                         return
 
@@ -1065,6 +1073,7 @@ class CopyTradingStrategy(Strategy):
                         signal.amount_sol,
                         symbol=symbol,
                         dry_run=self.config.trading.DRY_RUN,
+                        trader=signal.trader_label,
                     )
 
                     # Record buy in stats
@@ -1072,8 +1081,9 @@ class CopyTradingStrategy(Strategy):
                     get_trade_stats().record_buy(signal.wallet)
 
                     logger.success(
-                        "CopyTrading: BUY {} | {} SOL | {} ({})",
-                        signal.source, f"{signal.amount_sol:.6f}",
+                        "CopyTrading: BUY {} ({}) | {} SOL | {} ({})",
+                        signal.trader_label or signal.source, signal.wallet[:8] + "...",
+                        f"{signal.amount_sol:.6f}",
                         symbol, signal.token_mint[:8] + "...",
                     )
 
@@ -1110,57 +1120,51 @@ class CopyTradingStrategy(Strategy):
                             entry, signal.token_mint[:12] + "...",
                         )
 
+                    # SOL real recibido por el trader (sin el cap de MAX_COPY_TRADE_SOL)
+                    sell_proceeds = signal.sell_sol_raw if signal.sell_sol_raw > 0 else signal.amount_sol
+
+                    def _sol_invested():
+                        si = 0.0
+                        if position:
+                            si = getattr(position, "sol_invested", 0.0) or 0.0
+                        if si <= 0 and tracker_pos:
+                            si = getattr(tracker_pos, "amount", 0.0) or 0.0
+                        if si <= 0:
+                            si = signal.amount_sol
+                        return si
+
                     if entry > 0 and current_price > 0:
                         pnl_pct = (current_price - entry) / entry * 100
                         logger.debug(
                             "PnL calculado: entry={:.10g} current={:.10g} => {:.2f}% for {}",
                             entry, current_price, pnl_pct, signal.token_mint[:12] + "...",
                         )
-                    elif entry > 0 and current_price <= 0 and signal.amount_sol > 0:
-                        # Fallback para tokens nuevos sin precio: estimar PnL con sol_invested vs sell SOL
-                        sol_invested = 0.0
-                        if position:
-                            sol_invested = getattr(position, "sol_invested", 0.0) or 0.0
-                        if sol_invested <= 0 and tracker_pos:
-                            sol_invested = getattr(tracker_pos, "amount", 0.0) or 0.0
-                        if sol_invested > 0:
-                            pnl_pct = (signal.amount_sol - sol_invested) / sol_invested * 100
-                            logger.info(
-                                "PnL estimado (sin precio): sell={:.6f} vs invested={:.6f} => {:.2f}%",
-                                signal.amount_sol, sol_invested, pnl_pct,
-                            )
-                    elif current_price > 0 and not entry:
-                        sol_invested = 0.0
+                    elif current_price > 0 and entry <= 0:
+                        # Precio disponible sin entry: valor de tokens vs invertido
+                        si = _sol_invested()
                         token_held = 0.0
                         if position:
-                            sol_invested = getattr(position, "sol_invested", 0.0) or 0.0
                             token_held = getattr(position, "token_amount_ui", 0.0) or 0.0
-                        if sol_invested <= 0 and tracker_pos:
-                            sol_invested = getattr(tracker_pos, "amount", 0.0) or 0.0
-                        if sol_invested <= 0:
-                            sol_invested = signal.amount_sol
-                        if token_held > 0:
+                        if token_held > 0 and si > 0:
                             current_value = token_held * current_price
-                            pnl_pct = (current_value - sol_invested) / sol_invested * 100
-                        elif sol_invested > 0:
-                            logger.debug(
-                                "PnL no disponible: sin token_amount_ui para {} | sol_invested={:.6f}",
-                                signal.token_mint[:12] + "...", sol_invested,
-                            )
-                    else:
-                        # Sin entry ni precio actual: estimar con SOL invertido vs recibido
-                        sol_invested = 0.0
-                        if position:
-                            sol_invested = getattr(position, "sol_invested", 0.0) or 0.0
-                        if sol_invested <= 0 and tracker_pos:
-                            sol_invested = getattr(tracker_pos, "amount", 0.0) or 0.0
-                        if sol_invested <= 0:
-                            sol_invested = signal.amount_sol
-                        if sol_invested > 0:
-                            pnl_pct = (signal.amount_sol - sol_invested) / sol_invested * 100
+                            pnl_pct = (current_value - si) / si * 100
                             logger.info(
-                                "PnL estimado (sin entry/precio): sell={:.6f} vs invested={:.6f} => {:.2f}%",
-                                signal.amount_sol, sol_invested, pnl_pct,
+                                "PnL estimado (precio sin entry): valor={:.6f} vs invested={:.6f} => {:.2f}%",
+                                current_value, si, pnl_pct,
+                            )
+                        else:
+                            logger.debug(
+                                "PnL no disponible: sin token_amount_ui para {} | invested={:.6f}",
+                                signal.token_mint[:12] + "...", si,
+                            )
+                    elif sell_proceeds > 0:
+                        # Fallback final: SOL recibido (sin cap) vs invertido
+                        si = _sol_invested()
+                        if si > 0:
+                            pnl_pct = (sell_proceeds - si) / si * 100
+                            logger.info(
+                                "PnL estimado (SOL): sell={:.6f} vs invested={:.6f} => {:.2f}%",
+                                sell_proceeds, si, pnl_pct,
                             )
 
                     # Default to 100% if sell_pct not detected
@@ -1210,8 +1214,9 @@ class CopyTradingStrategy(Strategy):
                     )
 
                     logger.success(
-                        "CopyTrading: SELL {} | {} | PnL: {:.2f}% | sell_pct: {:.0f}%",
-                        signal.source, signal.token_mint[:8] + "...", pnl_pct, pct,
+                        "CopyTrading: SELL {} ({}) | {} | PnL: {:.2f}% | sell_pct: {:.0f}%",
+                        signal.trader_label or signal.source, signal.wallet[:8] + "...",
+                        signal.token_mint[:8] + "...", pnl_pct, pct,
                     )
 
             except Exception as exc:
