@@ -564,6 +564,19 @@ class JupiterExecutor:
             return 0.0
         return float(resp.value.ui_amount)
 
+    async def get_sol_balance(self) -> float:
+        """Balance actual de SOL (en unidades humanas) de la wallet del bot.
+
+        Usado para el tope de capital por trade de copy trading.
+        """
+        try:
+            resp = await self._rpc_client.get_balance(self.keypair.pubkey())
+            if resp.value is None:
+                return 0.0
+            return resp.value / 1_000_000_000
+        except Exception:
+            return 0.0
+
     async def sell_token(
         self,
         token_mint: str,

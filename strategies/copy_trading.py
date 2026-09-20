@@ -1100,7 +1100,27 @@ class CopyTradingStrategy(Strategy):
                         return
 
                     original_amount = self.executor.buy_amount_sol
-                    self.executor.buy_amount_sol = signal.amount_sol
+                    amount_to_use = signal.amount_sol
+                    trade_cap_pct = float(
+                        getattr(self.config.copy_trading, "COPY_TRADE_CAPITAL_PERCENT", 0.0)
+                    )
+                    if trade_cap_pct > 0 and not getattr(self.config.trading, "DRY_RUN", True):
+                        capital = await self.executor.get_sol_balance()
+                        cap_sol = capital * (trade_cap_pct / 100.0)
+                        if amount_to_use > cap_sol:
+                            logger.info(
+                                "CopyTrading: BUY cap {} SOL -> {:.6f} ({:.1f}% de {:.4f} SOL capital) {} | {}",
+                                signal.source, cap_sol, trade_cap_pct, capital,
+                                signal.token_mint[:8] + "...", signal.wallet[:8] + "...",
+                            )
+                            amount_to_use = cap_sol
+                        else:
+                            logger.debug(
+                                "CopyTrading: BUY {:.6f} SOL dentro del cap {:.6f} ({:.1f}% de {:.4f} SOL) {}",
+                                amount_to_use, cap_sol, trade_cap_pct, capital,
+                                signal.token_mint[:8] + "...",
+                            )
+                    self.executor.buy_amount_sol = amount_to_use
                     try:
                         sig = await self.executor.buy_token(signal.token_mint)
                     finally:
@@ -1110,6 +1130,7 @@ class CopyTradingStrategy(Strategy):
                         return
 
                     self._traded_mints.add(signal.token_mint)
+                    signal.amount_sol = amount_to_use
 
                     try:
                         symbol = await self.executor.get_token_symbol(signal.token_mint)

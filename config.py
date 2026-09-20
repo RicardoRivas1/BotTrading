@@ -224,6 +224,15 @@ class CopyTradingSettings(BaseSettings):
         gt=0,
         description="Monto fijo por compra en copy trading (SOL)",
     )
+    COPY_TRADE_CAPITAL_PERCENT: float = Field(
+        default=5.0,
+        ge=0,
+        description=(
+            "Porcentaje del capital total SOL de la wallet del bot usado como "
+            "TOPE por trade de copy trading. Cada compra copia el monto del "
+            "trader pero nunca supera este % del balance real (0 = deshabilitado)."
+        ),
+    )
     AUTO_SETUP_WEBHOOK: bool = Field(
         default=True,
         description="Crear webhook de Helius automaticamente al iniciar",
