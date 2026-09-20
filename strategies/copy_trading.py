@@ -86,7 +86,6 @@ class CopyTradingStrategy(Strategy):
         super().__init__(executor, notifier, tracker, config)
         self.wallets: dict[str, TrackedWallet] = {}
         self._recent_signals: dict[str, float] = {}
-        self._recent_buys: dict[str, float] = {}  # (wallet:mint) -> timestamp
         self._traded_mints: set[str] = set()  # mints que el bot ha comprado alguna vez
         self._wallet_mint_tokens: dict[tuple[str, str], float] = {}  # (wallet,mint)->tokens acumulados (SUMA via BUY)
         self._wallet_mint_sol: dict[tuple[str, str], float] = {}  # (wallet,mint)->SOL invertido acumulado (sin cap)
@@ -509,26 +508,6 @@ class CopyTradingStrategy(Strategy):
             k: v for k, v in self._recent_signals.items() if v > cutoff
         }
 
-        # Cooldown: si acabamos de comprar este token (Pump.fun entrega tokens via TRANSFER ~2s despues)
-        # Ignorar TRANSFER que son settlement de compra reciente
-        if tx_type == "TRANSFER":
-            now = time.time()
-            cooled_off = {k: v for k, v in self._recent_buys.items() if now - v < 30}
-            self._recent_buys = cooled_off
-            trader_addr = wallet_address or fee_payer
-            for tt in tx.get("tokenTransfers", []):
-                mint = tt.get("mint", "")
-                if not mint:
-                    continue
-                key = f"{trader_addr}:{mint}"
-                if key in self._recent_buys:
-                    logger.info(
-                        "CopyTrading: TRANSFER ignorado (settlement post-compra) {} | mint={} | {}s despues del BUY",
-                        signature[:16] + "...", mint[:12] + "...",
-                        int(now - self._recent_buys[key]),
-                    )
-                    return
-
         self._inc_stat("trades_executed")
         logger.info(
             "CopyTrading: trade detectado de {} ({}) | type={} | sig={}",
@@ -536,15 +515,6 @@ class CopyTradingStrategy(Strategy):
         )
 
         signal = self._parse_trade(tx, tracked, wallet_address=wallet_address)
-
-        # Registrar BUY para cooldown de TRANSFER post-compra
-        if signal and signal.action == "buy" and signal.token_mint:
-            buy_key = f"{signal.wallet}:{signal.token_mint}"
-            self._recent_buys[buy_key] = time.time()
-            logger.debug(
-                "CopyTrading: BUY cooldown registrado para {} (30s)",
-                buy_key[:20] + "...",
-            )
 
         if signal:
             await self._execute_copy_trade(signal)
