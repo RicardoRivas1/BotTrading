@@ -139,6 +139,8 @@ class CopyTradingStrategy(Strategy):
         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
         # Wrapped SOL
         "So11111111111111111111111111111111111111112",
+        # Axiom program
+        "AxiomRYA1zHVkpmvMtNPmBMzYFnM3RYqM3a7EMzN1t",
     } | set(DEX_PROGRAMS.values())
 
     # Known program/authority accounts that are NOT token mints
@@ -152,16 +154,21 @@ class CopyTradingStrategy(Strategy):
         "CebN5WGUA4hG37LkS87YDh2XZ9P5Yq5R5h5h5h5h5h5",
     }
 
+    def _get_all_excluded_addresses(self) -> set[str]:
+        """Returns ALL addresses that should never be treated as token mints:
+        known programs, stablecoins, DEX programs, AND all tracked wallet addresses."""
+        excluded = self._KNOWN_ADDRESSES | self._NON_MINT_ADDRESSES
+        # Add all tracked wallet addresses - these are wallets we monitor, NOT tokens
+        excluded = excluded | set(self.wallets.keys())
+        # Add our bot's own wallet
+        if hasattr(self.executor, 'wallet_pubkey') and self.executor.wallet_pubkey:
+            excluded.add(self.executor.wallet_pubkey)
+        return excluded
+
     @staticmethod
     def _is_likely_valid_mint(addr: str) -> bool:
-        """Heuristic check: is this address likely a valid SPL token mint?
-
-        Rejects addresses that are too short, too long, or look like
-        program/authority accounts rather than token mints.
-        """
         if not addr or len(addr) < 32 or len(addr) > 44:
             return False
-        # Must be valid base58 character set
         import re
         if not re.match(r'^[1-9A-HJ-NP-Za-km-z]+$', addr):
             return False
@@ -170,20 +177,14 @@ class CopyTradingStrategy(Strategy):
     def _extract_mint_from_account_data(
         self, account_data: list[dict[str, Any]], fee_payer: str
     ) -> Optional[str]:
-        """Encuentra el mint del token que compro/vendio el fee_payer
-        analizando tokenBalanceChanges en accountData de Helius Enhanced.
-        Prioriza el token con mayor cambio absoluto (el token real de la operacion)."""
+        excluded = self._get_all_excluded_addresses()
         best_mint: Optional[str] = None
         best_abs: int = 0
         for acct in account_data:
             for tbc in acct.get("tokenBalanceChanges", []):
                 user = tbc.get("userAccount", "")
-                if user != fee_payer:
-                    continue
                 mint = tbc.get("mint", "")
-                if not mint or mint in self._KNOWN_ADDRESSES:
-                    continue
-                if mint in self._NON_MINT_ADDRESSES:
+                if not mint or mint in excluded:
                     continue
                 if not self._is_likely_valid_mint(mint):
                     continue
@@ -201,18 +202,14 @@ class CopyTradingStrategy(Strategy):
     def _extract_mint_from_sent_tokens(
         self, account_data: list[dict[str, Any]], fee_payer: str
     ) -> Optional[str]:
-        """Extrae el mint del token que envio (vendio) el fee_payer."""
+        excluded = self._get_all_excluded_addresses()
         best_mint: Optional[str] = None
         best_abs: int = 0
         for acct in account_data:
             for tbc in acct.get("tokenBalanceChanges", []):
                 user = tbc.get("userAccount", "")
-                if user != fee_payer:
-                    continue
                 mint = tbc.get("mint", "")
-                if not mint or mint in self._KNOWN_ADDRESSES:
-                    continue
-                if mint in self._NON_MINT_ADDRESSES:
+                if not mint or mint in excluded:
                     continue
                 if not self._is_likely_valid_mint(mint):
                     continue
@@ -228,11 +225,10 @@ class CopyTradingStrategy(Strategy):
         return best_mint
 
     def _extract_mint_from_description(self, description: str) -> Optional[str]:
-        """Busca un mint en la descripcion de la transaccion, excluyendo
-        direcciones conocidas (programas DEX, SOL mint)."""
+        excluded = self._get_all_excluded_addresses()
         candidates = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,44}', description)
         for candidate in candidates:
-            if candidate not in self._KNOWN_ADDRESSES and candidate not in self._NON_MINT_ADDRESSES:
+            if candidate not in excluded:
                 return candidate
         return None
 
@@ -361,12 +357,13 @@ class CopyTradingStrategy(Strategy):
             if nt.get("toUserAccount") == trader
         )
 
-        # Analizar transfers de tokens (excluyendo SOL y stablecoins)
+        # Analizar transfers de tokens (excluyendo SOL, stablecoins y wallets)
+        excluded = self._get_all_excluded_addresses()
         tokens_received = []
         tokens_sent = []
         for tt in token_transfers:
             mint = tt.get("mint", "")
-            if not mint or mint in self._KNOWN_ADDRESSES:
+            if not mint or mint in excluded:
                 continue
             amount = tt.get("tokenAmount", 0)
             if tt.get("toUserAccount") == trader:

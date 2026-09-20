@@ -239,6 +239,8 @@ async def process_sell_and_notify(
                 "[DRY_RUN] Venta simulada de {} ({}) por {} (PnL {:.2f}%)",
                 symbol, mint, reason, pnl,
             )
+            # Also clean up executor.positions so MAX_OPEN_POSITIONS isn't blocked
+            tracker.executor.positions.pop(mint, None)
         else:
             pos = tracker.get_position(mint)
             token_amount = (pos.amount / pos.buy_price) if pos and pos.buy_price else 0.0
