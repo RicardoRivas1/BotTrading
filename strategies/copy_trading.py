@@ -255,9 +255,98 @@ class CopyTradingStrategy(Strategy):
         return None
 
     async def start(self) -> None:
-        """Inicia la estrategia de copy trading."""
+        """Inicia la estrategia de copy trading y el polling de RPC."""
         self._set_state(StrategyState.RUNNING)
         logger.info("CopyTrading: estrategia iniciada ({} wallets)", len(self.wallets))
+        asyncio.create_task(self._rpc_poll_loop())
+
+    async def _rpc_poll_loop(self) -> None:
+        """Poll every 1.5s via getSignaturesForAddress to detect new trades faster than webhooks."""
+        import aiohttp
+        from config import load_config
+
+        cfg = load_config()
+        rpc_url = cfg.solana.HELIUS_RPC_URL
+        helius_api_key = os.getenv("HELIUS_API_KEY", "")
+        if not helius_api_key and "api-key=" in rpc_url:
+            helius_api_key = rpc_url.split("api-key=")[-1].split("&")[0]
+
+        # Track last seen signature per wallet
+        last_sig: dict[str, str] = {}
+        # Initialize with current latest sig for each wallet
+        try:
+            async with aiohttp.ClientSession() as session:
+                for addr in self.wallets:
+                    payload = {
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "getSignaturesForAddress",
+                        "params": [addr, {"limit": 1}],
+                    }
+                    async with session.post(rpc_url, json=payload) as resp:
+                        data = await resp.json()
+                        sigs = data.get("result", [])
+                        if sigs:
+                            last_sig[addr] = sigs[0]["signature"]
+            logger.info("RPC polling initialized for {} wallets", len(last_sig))
+        except Exception as exc:
+            logger.warning("RPC polling init failed: {}", exc)
+
+        while True:
+            await asyncio.sleep(1.5)
+            if self._state != StrategyState.RUNNING:
+                continue
+            try:
+                await self._poll_wallets(rpc_url, helius_api_key, last_sig)
+            except Exception as exc:
+                logger.debug("RPC poll error: {}", exc)
+
+    async def _poll_wallets(
+        self, rpc_url: str, helius_api_key: str, last_sig: dict[str, str]
+    ) -> None:
+        """Check each wallet for new signatures and fetch enhanced tx data."""
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            for addr in self.wallets:
+                try:
+                    payload = {
+                        "jsonrpc": "2.0", "id": 1,
+                        "method": "getSignaturesForAddress",
+                        "params": [addr, {"limit": 5}],
+                    }
+                    async with session.post(rpc_url, json=payload) as resp:
+                        data = await resp.json()
+
+                    sigs = data.get("result", [])
+                    if not sigs:
+                        continue
+
+                    prev = last_sig.get(addr, "")
+                    new_sigs = []
+                    for s in sigs:
+                        if s["signature"] == prev:
+                            break
+                        new_sigs.append(s["signature"])
+                    if not new_sigs:
+                        continue
+
+                    last_sig[addr] = sigs[0]["signature"]
+
+                    # Fetch enhanced transaction data from Helius
+                    if not helius_api_key:
+                        continue
+                    enhance_url = f"https://api.helius.xyz/v0/transactions/?api-key={helius_api_key}"
+                    enhance_payload = {"transactions": new_sigs}
+                    async with session.post(enhance_url, json=enhance_payload) as resp:
+                        if resp.status != 200:
+                            continue
+                        enhanced_txs = await resp.json()
+
+                    for tx in enhanced_txs:
+                        await self._process_transaction(tx)
+
+                except Exception as exc:
+                    logger.debug("Poll error for {}: {}", addr[:8], exc)
 
     async def stop(self) -> None:
         """Detiene la estrategia."""
