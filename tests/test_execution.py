@@ -397,6 +397,37 @@ class TestUtilities:
         monkeypatch.setattr("core.execution.AsyncClient", lambda *a, **k: client)
         assert await executor._get_token_decimals(MINT_RAYDIUM) == 6
 
+    async def test_get_token_decimals_error_cachea_fallo_no_spam(
+        self, executor: JupiterExecutor
+    ) -> None:
+        client = AsyncMock()
+        client.get_token_supply.side_effect = RuntimeError("429 rate limit")
+
+        executor._rpc_client = client
+        assert await executor._get_token_decimals(MINT_RAYDIUM) == 6
+        assert MINT_RAYDIUM in executor._decimals_cache
+        client.get_token_supply.reset_mock()
+        assert await executor._get_token_decimals(MINT_RAYDIUM) == 6
+        client.get_token_supply.assert_not_awaited()
+
+    async def test_get_token_decimals_acierto_se_cachea(
+        self, executor: JupiterExecutor
+    ) -> None:
+        class _FakeResp:
+            class _Inner:
+                decimals = 9
+
+            value = _Inner()
+
+        client = AsyncMock()
+        client.get_token_supply.return_value = _FakeResp()
+
+        executor._rpc_client = client
+        assert await executor._get_token_decimals(MINT_RAYDIUM) == 9
+        client.get_token_supply.reset_mock()
+        assert await executor._get_token_decimals(MINT_RAYDIUM) == 9
+        client.get_token_supply.assert_not_awaited()
+
 
 class TestCompraVenta:
     """Flujo de compra/venta (según DRY_RUN)."""

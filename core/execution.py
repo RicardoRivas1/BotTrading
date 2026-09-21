@@ -196,6 +196,11 @@ class JupiterExecutor:
         # Tokens detectados en la bonding curve de Pump.fun (sin ruta en
         # Jupiter/Raydium): para ellos se salta Jupiter y se vende directo.
         self.pump_bonding_tokens: set[str] = set()
+        # Caché de decimales (mint -> (decimales|None, expira_en)).
+        # Positiva: 24h (los decimales de un token no cambian).
+        # Negativa: 10 min tras un fallo/429, para no martillar al RPC
+        # (GetTokenSupply erró todos a la vez cada ~2.5s antes del fix).
+        self._decimals_cache: dict[str, tuple[Optional[int], float]] = {}
 
     @staticmethod
     def _decode_transaction(raw_tx: Any) -> bytes:
@@ -1095,12 +1100,32 @@ class JupiterExecutor:
 
     # ------------------------------------------------------------ Decimals
     async def _get_token_decimals(self, token_mint: str) -> int:
-        """Consulta los decimales del token vía RPC mediante get_token_supply."""
+        """Consulta los decimales del token vía RPC mediante get_token_supply.
+
+        Con caché: los aciertos duran 24h y los fallos (p.ej. 429 de
+        GetTokenSupply) se guardan 10 min y se anotan solo una vez, para no
+        inundar de warnings y no volver a pegarle al RPC con cada polling.
+        """
+        now = time.monotonic()
+        cached = self._decimals_cache.get(token_mint)
+        if cached is not None:
+            decimals, expires = cached
+            if now < expires:
+                if decimals is None:
+                    return 6
+                return decimals
+
         try:
             resp = await self._rpc_client.get_token_supply(Pubkey.from_string(token_mint))
             if resp.value and resp.value.decimals is not None:
+                self._decimals_cache[token_mint] = (resp.value.decimals, now + 86400)
                 return resp.value.decimals
+            self._decimals_cache[token_mint] = (None, now + 600)
         except Exception as exc:
-            logger.warning("No se pudieron obtener decimales para {}: {}", token_mint, exc)
+            logger.warning(
+                "No se pudieron obtener decimales para {}: {} (se reintentará en ~10 min)",
+                token_mint, exc,
+            )
+            self._decimals_cache[token_mint] = (None, now + 600)
 
         return 6
