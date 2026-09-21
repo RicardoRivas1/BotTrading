@@ -593,16 +593,20 @@ class CopyTradingStrategy(Strategy):
         )
 
         # Fallback: si no hay nativeTransfers del trader, usar accountData.nativeBalanceChange
-        # Esto captura ventas en bonding curve donde el SOL viene via programa
-        if sol_spent == 0 and sol_received == 0:
+        # Esto captura ventas en bonding curve donde el SOL viene via programa.
+        # IMPORTANTE: el fallback NO debe saltarse por dust de nativeTransfers
+        # (0.001575/0.002039 = alquiler ATA / fees constantes, NO proceeds reales).
+        # En ventas por programa el trader RECIBE SOL via programa; el unico
+        # reflejo fiel es nativeBalanceChange > 0.
+        if sol_received == 0 or sol_spent == 0:
             for acct in account_data:
                 if acct.get("account") != trader:
                     continue
-                nbc = acct.get("nativeBalanceChange", 0)
-                if nbc > 0:
-                    sol_received = nbc / 1e9
-                elif nbc < 0:
-                    sol_spent = abs(nbc) / 1e9
+                nbc = acct.get("nativeBalanceChange", 0) / 1e9
+                if nbc > 0 and sol_received == 0:
+                    sol_received = nbc
+                elif nbc < 0 and sol_spent == 0:
+                    sol_spent = abs(nbc)
                 break
 
         # Analizar transfers de tokens (excluyendo SOL, stablecoins y wallets)
@@ -1015,9 +1019,13 @@ class CopyTradingStrategy(Strategy):
         if action == "buy" and amount_sol < 0.0001:
             return None
 
-        # Para sells con amount_sol=0 (DEX program), usar sol_spent como referencia
+        # Para sells: el monto de la venta = SOL REAL recibido (nativeTransfers o
+        # nativeBalanceChange > 0 si el SOL vino por programa). NUNCA usar
+        # sol_spent como proceeds: en transfers/ventas por programa aparece dust
+        # constante (0.001575 / alquiler ATA) que como monto vendido fabrica
+        # PnL -99% falsos. Sin ingreso real => amount_sol=0 (PnL cae a precio).
         if action == "sell" and amount_sol <= 0:
-            amount_sol = sol_spent if sol_spent > 0 else 0.01
+            amount_sol = sol_received if sol_received > 0 else 0.0
 
         # Para buys: monto minimo realista (evita falsos positivos de fees/tiny transfers)
         if action == "buy" and amount_sol < MIN_BUY_SOL:
