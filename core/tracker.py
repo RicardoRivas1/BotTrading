@@ -373,7 +373,20 @@ class PositionTracker:
             if ok:
                 self.remove_position(mint)
             return
-        if stop_loss_pct and pnl_pct <= -stop_loss_pct:
+        # PnL -100% (precio colapsado a dust respecto de la entrada) es casi
+        # siempre un dato sucio (cotización sin decimales / quote de dust), no
+        # una caída real del token. Ignorarlo evita ventas y avisos falsos
+        # "🛑 STOP LOSS (-100.00%)". Los stop-loss reales (-30%, -50%, etc.)
+        # siguen disparándose con normalidad.
+        if pnl_pct <= -99.0:
+            logger.warning(
+                "PnL {:.2f}% implausible para {} ({}) a precio {:.10g} SOL vs "
+                "entrada {:.10g} SOL; cotización descartada (sin STOP LOSS)",
+                pnl_pct, pos.symbol, mint, current_price, pos.buy_price,
+            )
+            pos.current_price = 0.0
+            pos.current_price_updated_at = 0.0
+        elif stop_loss_pct and pnl_pct <= -stop_loss_pct:
             logger.info("🛑 STOP LOSS ({:.2f}%) para {} ({})", pnl_pct, mint, pos.symbol)
             ok = await process_sell_and_notify(
                 pos.mint, pos.symbol, reason="STOP_LOSS", pnl=pnl_pct
