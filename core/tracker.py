@@ -34,6 +34,14 @@ CHECK_INTERVAL_SEC = 2.0
 # salida (TIME_EXPIRED), independientemente de su PnL. Configurable via .env.
 MAX_HOLD_TIME_SEC = int(os.getenv("MAX_HOLD_TIME_SEC", "180"))
 
+# Nº de ciclos consecutivos con PnL <= -99% requeridos para confirmar una
+# cotización colapsada ("token muerto"). Pasado ese streak se deja de martillar
+# la red a plena cadencia (DexScreener/Pump.fun/Jupiter) y se espacia el polling.
+CONFIRMED_RUG_STREAK = int(os.getenv("CONFIRMED_RUG_STREAK", "5"))
+# Cadencia (segundos) de re-consulta de una posición confirmada como muerta.
+# Mientras tanto, TIME_EXPIRED (max_hold) cierra la posición con normalidad.
+IMPLAUSIBLE_POLL_INTERVAL_SEC = float(os.getenv("IMPLAUSIBLE_POLL_INTERVAL_SEC", "60"))
+
 # API directa de Pump.fun para la cotización en SOL por token. Se usan
 # cabeceras de navegador para evitar el bloqueo 403 de Cloudflare.
 PUMPFUN_API = "https://frontend-api.pump.fun/coins/{mint}"
@@ -105,6 +113,11 @@ class TrackerPosition:
     last_progress_notify_at: float = 0.0
     last_notified_pnl_pct: float = 0.0
     source_wallet: str = ""  # wallet address that triggered this buy
+    # Streak de ciclos consecutivos con PnL <= -99% (cotización colapsada).
+    implausible_streak: int = 0
+    # Próximo instante permitido para re-consultar la red de una posición
+    # confirmada como muerta (throttle de polling).
+    next_throttle_refresh: float = 0.0
 
 
 class PositionTracker:
@@ -355,6 +368,12 @@ class PositionTracker:
         take_profit_pct = float(self.config.trading.TAKE_PROFIT_PCT)
         stop_loss_pct = float(self.config.trading.STOP_LOSS_PCT)
 
+        # Si el precio volvió a un rango creíble, resetear el streak de muerto
+        # y el throttle para volver a monitorear con normalidad.
+        if pnl_pct > -99.0 and pos.implausible_streak:
+            pos.implausible_streak = 0
+            pos.next_throttle_refresh = 0.0
+
         # --- Log periódico cada 15-30 segundos ---
         if now - pos.last_log_time >= 20:
             logger.info(
@@ -375,17 +394,28 @@ class PositionTracker:
             return
         # PnL -100% (precio colapsado a dust respecto de la entrada) es casi
         # siempre un dato sucio (cotización sin decimales / quote de dust), no
-        # una caída real del token. Ignorarlo evita ventas y avisos falsos
-        # "🛑 STOP LOSS (-100.00%)". Los stop-loss reales (-30%, -50%, etc.)
-        # siguen disparándose con normalidad.
+        # una caída real del token. Los stop-loss reales (-30%, -50%, etc.)
+        # siguen disparándose con normalidad. Tras N ciclos consecutivos se
+        # confirma y se espacia el polling (sin resetear la caché, que forzaba
+        # una llamada de red por ciclo); TIME_EXPIRED cierra la posición.
         if pnl_pct <= -99.0:
-            logger.warning(
-                "PnL {:.2f}% implausible para {} ({}) a precio {:.10g} SOL vs "
-                "entrada {:.10g} SOL; cotización descartada (sin STOP LOSS)",
-                pnl_pct, pos.symbol, mint, current_price, pos.buy_price,
-            )
-            pos.current_price = 0.0
-            pos.current_price_updated_at = 0.0
+            pos.implausible_streak += 1
+            streak = pos.implausible_streak
+            if streak >= CONFIRMED_RUG_STREAK:
+                if now >= pos.next_throttle_refresh:
+                    pos.next_throttle_refresh = time.time() + IMPLAUSIBLE_POLL_INTERVAL_SEC
+                    logger.warning(
+                        "PnL {:.2f}% confirmado por {} ciclos para {} ({}); polling "
+                        "throttled a {:.0f}s; TIME_EXPIRED cerrará la posición",
+                        pnl_pct, streak, pos.symbol, mint, IMPLAUSIBLE_POLL_INTERVAL_SEC,
+                    )
+            else:
+                logger.warning(
+                    "PnL {:.2f}% implausible para {} ({}) a precio {:.10g} SOL vs "
+                    "entrada {:.10g} SOL; cotización descartada (ciclo {}/{})",
+                    pnl_pct, pos.symbol, mint, current_price, pos.buy_price,
+                    streak, CONFIRMED_RUG_STREAK,
+                )
         elif stop_loss_pct and pnl_pct <= -stop_loss_pct:
             logger.info("🛑 STOP LOSS ({:.2f}%) para {} ({})", pnl_pct, mint, pos.symbol)
             ok = await process_sell_and_notify(
@@ -491,6 +521,17 @@ class PositionTracker:
             fresh = pos.current_price > 0 and (now - pos.current_price_updated_at) < fallback_gap
             if fresh:
                 return pos.current_price
+
+        # Posición confirmada como muerta (cotización colapsada/ilegible): no
+        # martillar la red. Devuelve la última cotización conocida (o 0.0 para
+        # que el bucle aplique TIME_EXPIRED por edad) hasta que venza el throttle.
+        if (
+            pos.implausible_streak >= CONFIRMED_RUG_STREAK
+            and now < pos.next_throttle_refresh
+        ):
+            if pos.current_price > 0:
+                return pos.current_price
+            return 0.0
 
         try:
             price = await self._get_current_price(pos.mint)

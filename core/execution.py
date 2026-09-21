@@ -819,7 +819,14 @@ class JupiterExecutor:
         # entry_price (bonding curve virtual) y el current_price (jupiter/gecko)
         # fueran de ordenes de magnitud distintos => PnL inflado falso.
         # Regla: Pump.fun API si sigue en bonding curve, si no DexScreener, fallback Jupiter.
-        try_sequence = ("pumpfun", "bonding_curve", "dexscreener", "jupiter")
+        # En DRY_RUN se omite Jupiter: no hay swap real que cotizar, consume el
+        # rate limit de la API de trading y las quotes simuladas (~1 SOL/tk)
+        # contaminarían el PnL del monitor con valores absurdos.
+        try_sequence = (
+            ("pumpfun", "bonding_curve", "dexscreener")
+            if self.dry_run
+            else ("pumpfun", "bonding_curve", "dexscreener", "jupiter")
+        )
 
         price_sol = 0.0
         for source in try_sequence:

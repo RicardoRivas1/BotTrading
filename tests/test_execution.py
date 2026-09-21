@@ -117,6 +117,8 @@ class TestFallbackPrecio:
     async def test_pump_mint_usa_jupiter_como_ultimo_recurso(
         self, executor: JupiterExecutor
     ) -> None:
+        # Modo real: jupiter sigue siendo el último recurso de la cascada.
+        executor.dry_run = False
         executor._get_token_decimals = AsyncMock(return_value=6)
         executor._get_quote = AsyncMock(
             return_value={"outAmount": 1_000_000}
