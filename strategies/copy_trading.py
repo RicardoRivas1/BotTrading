@@ -1218,9 +1218,6 @@ class CopyTradingStrategy(Strategy):
                             entry, signal.token_mint[:12] + "...",
                         )
 
-                    # SOL real recibido por el trader (sin el cap de MAX_COPY_TRADE_SOL)
-                    sell_proceeds = signal.sell_sol_raw if signal.sell_sol_raw > 0 else signal.amount_sol
-
                     def _sol_invested():
                         si = 0.0
                         if position:
@@ -1240,29 +1237,34 @@ class CopyTradingStrategy(Strategy):
                     # los traders venden 20-40% de su posicion, no todo.
                     wm_key = (signal.wallet, signal.token_mint)
                     accumulated = self._wallet_mint_tokens.get(wm_key, 0.0)
+                    w_sol = self._wallet_mint_sol.get(wm_key, 0.0)
 
                     # Fuente AUTORITATIVA: balance on-chain del trader tras la venta.
                     # total_antes = balance_actual + vendido_en_esta_tx. Si cerro todo
                     # el ATA queda en 0 => pct=100%. Si vendio 30% le quedan 70% => 30%.
                     # Funciona aunque el bot empezo a copiar tarde o se reinicio
                     # (el tracking acumulado _wallet_mint_tokens puede estar vacio).
+                    held_after = 0.0
+                    tokens_before_sell = accumulated
+                    rpc_error = False
                     if signal.trade_token_amount > 0:
                         try:
-                            held_after = await self.executor.get_wallet_token_balance(
+                            bal = await self.executor.get_wallet_token_balance(
                                 signal.wallet, signal.token_mint
                             )
                             # -1.0 = error de RPC => no podemos confiar en el
                             # balance; usar tracking acumulado como fallback.
-                            rpc_error = held_after < 0
-                            total_before = held_after + signal.trade_token_amount
-                            if not rpc_error and total_before > 0:
+                            rpc_error = bal < 0
+                            held_after = max(0.0, bal) if not rpc_error else 0.0
+                            if not rpc_error and (held_after + signal.trade_token_amount) > 0:
+                                tokens_before_sell = held_after + signal.trade_token_amount
                                 real_pct = (
-                                    (signal.trade_token_amount / total_before) * 100.0
+                                    (signal.trade_token_amount / tokens_before_sell) * 100.0
                                 )
                                 real_pct = max(1.0, min(real_pct, 100.0))
                                 pct = real_pct
                                 # Re-sincronizar el tracking con la realidad on-chain
-                                self._wallet_mint_tokens[wm_key] = max(0.0, held_after)
+                                self._wallet_mint_tokens[wm_key] = held_after
                                 logger.info(
                                     "CopyTrading: sell pct on-chain {:.1f}% (trader balance post-venta {:.4g} tk + vendidos {:.4g} tk) para {}",
                                     real_pct, held_after, signal.trade_token_amount,
@@ -1277,76 +1279,88 @@ class CopyTradingStrategy(Strategy):
                             )
                             # Fallback al tracking acumulado si RPC falla
                             if signal.trade_token_amount > 0 and accumulated > 0:
+                                tokens_before_sell = accumulated
                                 real_pct = (signal.trade_token_amount / accumulated) * 100.0
                                 real_pct = min(real_pct, 100.0)
                                 if real_pct > 1.0:
                                     pct = real_pct
-                                self._wallet_mint_tokens[wm_key] = max(
-                                    0.0, accumulated - signal.trade_token_amount
-                                )
+                                held_after = max(0.0, accumulated - signal.trade_token_amount)
+                                self._wallet_mint_tokens[wm_key] = held_after
                     elif signal.trade_token_amount <= 0:
                         logger.debug(
                             "CopyTrading: sin cantidad de tokens vendidos medible para {}",
                             signal.token_mint[:12] + "...",
                         )
 
+                    # --- PnL REAL del trader (resultado de ESTA venta) ---
+                    # costo promedio por token = costo_total_acumulado / tokens. Se usa
+                    # la cantidad REAL vendida en esta tx; el costo se reduce en
+                    # proporcion a lo vendido para que las ventas parciales
+                    # subsiguientes NO inflen ni el % ni el PnL (el bug de los
+                    # -97%/-99% falsos: solo se re-sincronizaban los tokens, nunca
+                    # el costo, y el PnL se media contra nuestro entry, que difiere
+                    # del costo real del trader).
+                    pnl_pct = 0.0
+                    sell_proceeds = signal.sell_sol_raw if signal.sell_sol_raw > 0 else signal.amount_sol
+                    sold_tok = signal.trade_token_amount if signal.trade_token_amount > 0 else 0.0
+                    avg_cost = (w_sol / accumulated) if accumulated > 0 and w_sol > 0 else 0.0
+                    if avg_cost > 0 and sold_tok > 0 and tokens_before_sell > 0:
+                        # Rebalancear el costo si el on-chain mostro mas tokens de
+                        # los que teniamos trackeados (empezamos a copiar tarde):
+                        basis_ratio = max(1.0, tokens_before_sell / max(accumulated, 1e-12))
+                        cost_of_sold = min(w_sol, avg_cost * sold_tok * basis_ratio)
+                        if sell_proceeds > 0 and cost_of_sold > 0:
+                            pnl_pct = (sell_proceeds - cost_of_sold) / cost_of_sold * 100.0
+                            logger.info(
+                                "CopyTrading: PnL REAL trader {:.2f}% | sell={:.6f} SOL vs costo vendido={:.6f} SOL ({} tk @ {:.10g}) {}",
+                                pnl_pct, sell_proceeds, cost_of_sold,
+                                f"{sold_tok:.6g}", avg_cost, signal.token_mint[:8] + "...",
+                            )
+                        # Reducir la base de costo en proporcion a lo vendido
+                        self._wallet_mint_sol[wm_key] = max(0.0, w_sol - cost_of_sold)
+
                     # Fallback entry desde compras acumuladas del trader si no tenemos entry
-                    w_sol = self._wallet_mint_sol.get(wm_key, 0.0)
-                    if entry <= 0 and accumulated > 0 and w_sol > 0:
-                        entry = w_sol / accumulated
+                    if entry <= 0 and avg_cost > 0:
+                        entry = avg_cost
                         logger.info(
                             "PnL: entry_price calculado desde compras del trader = {:.10g} for {}",
                             entry, signal.token_mint[:12] + "...",
                         )
 
-                    if entry > 0 and current_price > 0:
-                        pnl_pct = (current_price - entry) / entry * 100
-                        logger.debug(
-                            "PnL calculado: entry={:.10g} current={:.10g} => {:.2f}% for {}",
-                            entry, current_price, pnl_pct, signal.token_mint[:12] + "...",
-                        )
-                    elif current_price > 0 and entry <= 0:
-                        # Precio disponible sin entry: valor de tokens vs invertido
-                        si = _sol_invested()
-                        token_held = 0.0
-                        if position:
-                            token_held = getattr(position, "token_amount_ui", 0.0) or 0.0
-                        if token_held <= 0 and tracker_pos:
-                            token_held = getattr(tracker_pos, "token_amount_ui", 0.0) or 0.0
-                        if token_held > 0 and si > 0:
-                            current_value = token_held * current_price
-                            pnl_pct = (current_value - si) / si * 100
-                            logger.info(
-                                "PnL estimado (precio sin entry): valor={:.6f} vs invested={:.6f} => {:.2f}%",
-                                current_value, si, pnl_pct,
+                    # Fallback de PnL si no hubo costo/venta medible: precio de
+                    # mercado vs entry (nuestro copy). Es lo que antes se usaba y
+                    # NO coincide con el resultado real del trader (el 99% falso).
+                    if pnl_pct == 0.0:
+                        if entry > 0 and current_price > 0:
+                            pnl_pct = (current_price - entry) / entry * 100
+                            logger.debug(
+                                "PnL (fallback precio): entry={:.10g} current={:.10g} => {:.2f}% for {}",
+                                entry, current_price, pnl_pct, signal.token_mint[:12] + "...",
                             )
-                        else:
-                            pnl_pct = 0.0
-                    elif sell_proceeds > 0.0001:
-                        # Fallback: SOL recibido por el trader vs el COSTO del trader
-                        sold_tok = (
-                            signal.trade_token_amount
-                            if signal.trade_token_amount > 0
-                            else 0.0
-                        )
-                        if accumulated > 0 and sold_tok > 0 and w_sol > 0:
-                            cost_per_tk = w_sol / accumulated
-                            sold_cost = cost_per_tk * sold_tok
-                            if sold_cost > 0:
-                                pnl_pct = (sell_proceeds - sold_cost) / sold_cost * 100
+                        elif current_price > 0 and entry <= 0:
+                            # Precio disponible sin entry: valor de tokens vs invertido
+                            si = _sol_invested()
+                            token_held = 0.0
+                            if position:
+                                token_held = getattr(position, "token_amount_ui", 0.0) or 0.0
+                            if token_held <= 0 and tracker_pos:
+                                token_held = getattr(tracker_pos, "token_amount_ui", 0.0) or 0.0
+                            if token_held > 0 and si > 0:
+                                current_value = token_held * current_price
+                                pnl_pct = (current_value - si) / si * 100
                                 logger.info(
-                                    "PnL estimado (costo trader): sell={:.6f} vs costo vendido={:.6f} ({} tk) => {:.2f}%",
-                                    sell_proceeds, sold_cost, f"{sold_tok:.6g}", pnl_pct,
+                                    "PnL estimado (precio sin entry): valor={:.6f} vs invested={:.6f} => {:.2f}%",
+                                    current_value, si, pnl_pct,
                                 )
-                            else:
-                                pnl_pct = 0.0
-                        else:
-                            pnl_pct = 0.0
-                    else:
-                        pnl_pct = 0.0
 
                     # Clamp PnL: en spot trading la pérdida nunca puede ser peor que -100%
                     pnl_pct = max(-100.0, pnl_pct)
+                    if abs(pnl_pct) >= 99.9:
+                        logger.warning(
+                            "CopyTrading: PnL {:.2f}% cerca del limite para {} (sell_proceeds={} sold_tok={} w_sol={} accumulated={} avg_cost={})",
+                            pnl_pct, signal.token_mint[:12] + "...",
+                            sell_proceeds, sold_tok, w_sol, accumulated, avg_cost,
+                        )
 
                     # Record sell in stats before cleaning positions
                     from core.stats import get_trade_stats
