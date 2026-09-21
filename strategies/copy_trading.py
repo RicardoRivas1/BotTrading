@@ -817,20 +817,18 @@ class CopyTradingStrategy(Strategy):
                         signature[:16] + "...", token_mint[:12] + "...", sol_spent, max(sell_pct, 1.0),
                     )
                 elif sell_pct < 5.0:
-                    # Solo clasificar como "inverted transfer" (compra) si el
-                    # trader gasto SOL real (>= MIN_BUY_SOL). Si sol_spent es solo
-                    # un fee (~0.000005), es una VENTA cuya devolucion llego via
-                    # programa (Axiom/pump) o un transfer menor: NO es compra.
-                    # Guard extra: si el trader ya ACUMULO tokens de ese mint
-                    # (buys previos trackeados) y NO gasto SOL real (es solo un
-                    # fee ~0.000005), entonces tokens_sent es una reduccion de
-                    # posicion (= VENTA), no una compra nueva. Si gasto
-                    # SOL >= MIN_BUY_SOL, es una compra (el trader paga de verdad).
+                    # La señal mas fuerte para venta: el trader ya tenia tokens de
+                    # ese mint (buys previos trackeados en _wallet_mint_tokens). Si
+                    # ademas hay tokens_sent, es una REDUCCION de posicion (venta),
+                    # aunque sol_spent >= 0.005 por un priority fee de la venta
+                    # (fees de pump/axiom van al programa, no a nativeTransfers).
+                    # El "inverted transfer buy" de Helius (token en tokens_sent)
+                    # SOLO aplica cuando el trader NO acumulo nada de ese mint
+                    # (compra inicial / primera vez que lo vemos comprar).
                     trader_held = self._wallet_mint_tokens.get(
                         (tracked.address, token_mint), 0.0
                     )
-                    is_real_buy_spend = sol_spent >= MIN_BUY_SOL
-                    if trader_held > 0 and not is_real_buy_spend:
+                    if trader_held > 0:
                         action = "sell"
                         amount_sol = 0.0
                         logger.info(
@@ -838,7 +836,7 @@ class CopyTradingStrategy(Strategy):
                             f"{trader_held:.6g}", sol_spent, signature[:16] + "...",
                             f"{tokens_sent[0]['amount']:.6g}", token_mint[:12] + "...",
                         )
-                    elif is_real_buy_spend:
+                    elif sol_spent >= MIN_BUY_SOL:
                         logger.info(
                             "CopyTrade: pump.fun buy (Helius inverted transfer) {} | tokens_sent would-be {} | SOL_spent={:.6f}",
                             signature[:16] + "...", token_mint[:12] + "...", sol_spent,
