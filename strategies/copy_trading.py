@@ -1044,6 +1044,15 @@ class CopyTradingStrategy(Strategy):
                 if t["mint"] == token_mint:
                     trade_token_amount = t["amount"]
                     break
+            # Pump.fun buys: Helius lista el token en tokens_sent (inverted
+            # transfer) en vez de tokens_received. Sin esto, trade_token_amount
+            # queda 0 y el tracking _wallet_mint_tokens nunca acumula -> el costo
+            # del trader no se puede calcular -> PnL -98% falsos.
+            if trade_token_amount <= 0:
+                for t in tokens_sent:
+                    if t["mint"] == token_mint:
+                        trade_token_amount = t["amount"]
+                        break
 
         logger.info(
             "CopyTrading: signal {} {} | mint={} | {:.6f} SOL | trader={} | src={}{} | delta={:+.4f} | tk={:.4g}",
@@ -1325,10 +1334,11 @@ class CopyTradingStrategy(Strategy):
                     sold_tok = signal.trade_token_amount if signal.trade_token_amount > 0 else 0.0
                     avg_cost = (w_sol / accumulated) if accumulated > 0 and w_sol > 0 else 0.0
                     if avg_cost > 0 and sold_tok > 0 and tokens_before_sell > 0:
-                        # Rebalancear el costo si el on-chain mostro mas tokens de
-                        # los que teniamos trackeados (empezamos a copiar tarde):
-                        basis_ratio = max(1.0, tokens_before_sell / max(accumulated, 1e-12))
-                        cost_of_sold = min(w_sol, avg_cost * sold_tok * basis_ratio)
+                        # costo proporcional de los tokens vendidos. NO inflamos con
+                        # basis_ratio (empezamos a copiar tarde): eso exageraba el
+                        # costo y daba PnL -98% falsos. Solo conocemos el costo de lo
+                        # que trackeamos (w_sol/accumulated).
+                        cost_of_sold = min(w_sol, avg_cost * sold_tok)
                         if sell_proceeds > 0 and cost_of_sold > 0:
                             pnl_pct = (sell_proceeds - cost_of_sold) / cost_of_sold * 100.0
                             logger.info(
