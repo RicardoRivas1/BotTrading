@@ -444,6 +444,14 @@ class PositionTracker:
         ≥ ±2 puntos porcentuales respecto de la última notificación.
         """
         now = time.time()
+        # Si las notificaciones de progreso están deshabilitadas, solo actualizamos
+        # el marcador de PnL para que el próximo on/off no resetee el tracking.
+        if not bool(
+            getattr(self.config.trading, "ENABLE_PROGRESS_NOTIFICATIONS", False)
+        ):
+            pos.last_progress_notify_at = now
+            pos.last_notified_pnl_pct = pnl_pct
+            return
         interval = float(
             getattr(self.config.trading, "POSITION_UPDATE_INTERVAL_SECONDS", 30.0)
         )

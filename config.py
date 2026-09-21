@@ -118,6 +118,10 @@ class TradingSettings(BaseSettings):
         gt=0,
         description="Intervalo (s) entre notificaciones periódicas de progreso de posiciones",
     )
+    ENABLE_PROGRESS_NOTIFICATIONS: bool = Field(
+        default=False,
+        description="Envía el mensaje periódico 'PROGRESO DE POSICIÓN' (si False solo se notifican compras y ventas)",
+    )
     PRICE_POLL_FALLBACK_SECONDS: int = Field(
         default=5,
         gt=0,
