@@ -76,7 +76,8 @@ class TradingSettings(BaseSettings):
         default=0.005,
         gt=0,
         validation_alias=AliasChoices("TRADE_AMOUNT_SOL", "BUY_AMOUNT_SOL"),
-        description="Monto fijo por compra en SOL (~$0.80-$1.00 USD)",)
+        description="Monto fijo por compra en SOL (~$0.80-$1.00 USD)",
+    )
     MAX_OPEN_POSITIONS: int = Field(
         default=1, gt=0, description="Número máximo de posiciones abiertas simultáneas"
     )
@@ -99,9 +100,13 @@ class TradingSettings(BaseSettings):
     )
 
     # --- Parámetros de red y ejecución en Solana ---
-    SLIPPAGE_BPS: int = Field(default=500, ge=1, le=10000, description="Slippage máximo en basis points (5%)")
+    SLIPPAGE_BPS: int = Field(
+        default=500, ge=1, le=10000, description="Slippage máximo en basis points (5%)"
+    )
     COMPUTE_UNIT_PRICE_MICRO_LAMPORTS: int = Field(
-        default=50000, ge=0, description="Priority fee en micro-lamports por unidad de cómputo"
+        default=50000,
+        ge=0,
+        description="Priority fee en micro-lamports por unidad de cómputo",
     )
     JUPITER_QUOTE_URL: str = Field(
         default="https://lite-api.jup.ag/v6/quote",
@@ -129,19 +134,27 @@ class TradingSettings(BaseSettings):
     )
 
     # --- Comportamiento de trading ---
-    AUTO_SELL: bool = Field(default=True, description="Si vende automáticamente tras take-profit/stop-loss")
+    AUTO_SELL: bool = Field(
+        default=True, description="Si vende automáticamente tras take-profit/stop-loss"
+    )
     TRAILING_STOP_PCT: float = Field(
         default=float(os.getenv("TRAILING_STOP_PCT", "0.0")),
         ge=0,
         description="Ganancia que activa el trailing stop (0 = desactivado)",
     )
     TRAILING_STOP_ACTIVATION_PCT: float = Field(
-        default=20.0, gt=0, description="Ganancia mínima para activar el trailing stop: +20%"
+        default=20.0,
+        gt=0,
+        description="Ganancia mínima para activar el trailing stop: +20%",
     )
     TRAILING_STOP_DISTANCE_PCT: float = Field(
-        default=15.0, gt=0, description="Distancia de retroceso tolerada desde el máximo: -15%"
+        default=15.0,
+        gt=0,
+        description="Distancia de retroceso tolerada desde el máximo: -15%",
     )
-    DRY_RUN: bool = Field(default=DRY_RUN, description="False = REAL | True = SIMULACIÓN")
+    DRY_RUN: bool = Field(
+        default=DRY_RUN, description="False = REAL | True = SIMULACIÓN"
+    )
     FORCE_TEST_BUY: bool = Field(
         default=False,
         description=(
@@ -172,10 +185,21 @@ class SecuritySettings(BaseSettings):
 
     model_config = BASE_SETTINGS
 
-    RUGCHECK_MAX_SCORE: int = Field(default=1500, ge=0, description="Score máximo aceptable de RugCheck")
-    DEV_MAX_SUPPLY_PCT: float = Field(default=10.0, ge=0, le=100, description="% máximo del supply que puede tener el Dev")
-    REQUIRE_MINT_RENOUNCED: bool = Field(default=True, description="Rechazar si Mint authority no está renunciada")
-    REQUIRE_FREEZE_RENOUNCED: bool = Field(default=True, description="Rechazar si Freeze authority no está renunciada")
+    RUGCHECK_MAX_SCORE: int = Field(
+        default=1500, ge=0, description="Score máximo aceptable de RugCheck"
+    )
+    DEV_MAX_SUPPLY_PCT: float = Field(
+        default=10.0,
+        ge=0,
+        le=100,
+        description="% máximo del supply que puede tener el Dev",
+    )
+    REQUIRE_MINT_RENOUNCED: bool = Field(
+        default=True, description="Rechazar si Mint authority no está renunciada"
+    )
+    REQUIRE_FREEZE_RENOUNCED: bool = Field(
+        default=True, description="Rechazar si Freeze authority no está renunciada"
+    )
 
 
 class TelegramSettings(BaseSettings):
@@ -223,6 +247,17 @@ class CopyTradingSettings(BaseSettings):
             "Independiente de MAX_OPEN_POSITIONS del bot general."
         ),
     )
+    MAX_COPY_TRADE_HOLD_SECONDS: int = Field(
+        default=100000,
+        ge=0,
+        description=(
+            "Tiempo maximo (s) que una posicion de copy trading puede estar "
+            "abierta antes de forzar la salida (TIME_EXPIRED). Evita que el "
+            "mirror se quede eternamente abierto, sature "
+            "MAX_COPY_TRADE_POSITIONS y bloquee nuevos copy buys. "
+            "0 = sin limite (comportamiento antiguo)."
+        ),
+    )
     COPY_TRADE_BUY_AMOUNT_SOL: float = Field(
         default=0.005,
         gt=0,
@@ -256,7 +291,9 @@ class BotSettings(BaseSettings):
     model_config = BASE_SETTINGS
 
     LOG_LEVEL: str = Field(default="INFO", description="Nivel de logging")
-    POLL_INTERVAL_SECONDS: float = Field(default=2.0, gt=0, description="Intervalo entre ciclos del bot")
+    POLL_INTERVAL_SECONDS: float = Field(
+        default=2.0, gt=0, description="Intervalo entre ciclos del bot"
+    )
 
 
 class AppConfig:

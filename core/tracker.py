@@ -231,9 +231,70 @@ class PositionTracker:
                         raise
                     except Exception as exc:  # noqa: BLE001 - nunca detener el monitor
                         logger.warning("Error monitoreando {}: {}", mint, exc)
+                await self._reap_orphan_exec_positions()
         except asyncio.CancelledError:
             logger.info("Monitoreo de posiciones detenido.")
             raise
+
+    async def _reap_orphan_exec_positions(self) -> None:
+        """Limpia posiciones del executor sin tracking en el tracker.
+
+        Son posiciones que quedaron registradas sin su contrapartida en
+        `self.positions` (p.ej. de ejecuciones antiguas o crash). No las vigila
+        nadie, no vencen por si solas y siguen contando para
+        MAX_COPY_TRADE_POSITIONS, bloqueando nuevos copy buys aunque esten
+        muertas. En DRY_RUN se eliminan con seguridad; con fondos reales solo se
+        avisa para que el operador decida (evita perder tokens en silencio).
+        """
+        positions = getattr(self.executor, "positions", None)
+        if not positions:
+            return
+        dry_run = bool(getattr(self.config.trading, "DRY_RUN", True))
+        for mint in list(positions.keys()):
+            if mint in self.positions:
+                continue
+            try:
+                created = float(getattr(positions[mint], "created_at", 0.0) or 0.0)
+            except Exception:
+                created = 0.0
+            if not created:
+                continue
+            age = time.time() - created
+            if age <= float(MAX_HOLD_TIME_SEC):
+                continue
+            if dry_run:
+                positions.pop(mint, None)
+                try:
+                    self.executor._save_exec_positions()
+                except Exception:
+                    pass
+                logger.info(
+                    "⏳ TIME EXPIRED (posicion huerfana del executor) para {} tras {:.0f}s",
+                    mint[:8] + "...", age,
+                )
+            else:
+                logger.warning(
+                    "Posicion huerfana sin tracking {} ({}s) ocupando un slot de "
+                    "MAX_COPY_TRADE_POSITIONS; revisar manualmente exec_positions.json",
+                    mint[:8] + "...", age,
+                )
+
+    def _effective_hold(self, pos: Any) -> float:
+        """Tiempo maximo de vida aplicable a una posicion.
+
+        - Posiciones normales (sniper, sin source_wallet): usan
+          `max_hold_seconds` / MAX_HOLD_TIME_SEC.
+        - Posiciones de copy trading (con source_wallet): usan
+          MAX_COPY_TRADE_HOLD_SECONDS si > 0; si es 0, no vencen por tiempo
+          (comportamiento antiguo, para replicar al trader todo el tiempo).
+        """
+        if not getattr(pos, "source_wallet", ""):
+            return float(getattr(pos, "max_hold_seconds", 0.0) or float(MAX_HOLD_TIME_SEC))
+        copy_cfg = getattr(self.config, "copy_trading", None)
+        if copy_cfg is None:
+            return 0.0
+        copy_hold = float(getattr(copy_cfg, "MAX_COPY_TRADE_HOLD_SECONDS", 0.0) or 0.0)
+        return max(0.0, copy_hold)
 
     # ------------------------------------------------------- Evaluación
     async def _evaluate(self, mint: str) -> None:
@@ -253,11 +314,15 @@ class PositionTracker:
             logger.warning("No se pudo obtener precio de {} ({}): {}", mint, pos.symbol, exc)
 
         if current_price is None or current_price <= 0:
-            # Sin precio conocido: verificar TIME_EXPIRED para posiciones sin trader
-            if not getattr(pos, "source_wallet", "") and (now - pos.created_at > MAX_HOLD_TIME_SEC):
+            # Sin precio conocido: aplicar vencimiento por tiempo tambien a las
+            # posiciones de copy trading (si MAX_COPY_TRADE_HOLD_SECONDS > 0).
+            # Sin esto, una posicion mirror sin cotizacion queda abierta para
+            # siempre, satura MAX_COPY_TRADE_POSITIONS y bloquea nuevos buys.
+            max_hold = self._effective_hold(pos)
+            if max_hold > 0 and (now - pos.created_at > max_hold):
                 logger.info(
                     "⏳ TIME EXPIRED (sin precio) para {} ({}) tras {:.0f}s",
-                    mint, pos.symbol, MAX_HOLD_TIME_SEC,
+                    mint, pos.symbol, max_hold,
                 )
                 ok = await process_sell_and_notify(
                     pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=0.0,
@@ -341,9 +406,9 @@ class PositionTracker:
                         self.remove_position(mint)
                     return
 
-        # --- TIME_EXPIRED: solo para posiciones sin trader (sniper), no para copy trading ---
-        max_hold = getattr(pos, "max_hold_seconds", 0.0) or float(MAX_HOLD_TIME_SEC)
-        if not getattr(pos, "source_wallet", "") and max_hold > 0 and (now - pos.created_at > max_hold):
+        # --- TIME_EXPIRED: sniper y copy trading (configurable) ---
+        max_hold = self._effective_hold(pos)
+        if max_hold > 0 and (now - pos.created_at > max_hold):
             logger.info(
                 "⏳ TIME EXPIRED para {} ({}) tras {:.0f}s (PnL {:+.2f}%)",
                 mint, pos.symbol, max_hold, pnl_pct,
