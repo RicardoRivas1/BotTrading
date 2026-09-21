@@ -1015,6 +1015,22 @@ class CopyTradingStrategy(Strategy):
             )
             return None
 
+        # REGLA: una venta solo es real si el trader RECIBIO SOL de vuelta
+        # (nativeTransfers o nativeBalanceChange > 0). Los movimientos/redistribuciones
+        # de tokens sin retorno SOL (dust constante 0.001575/0.002039 = alquiler ATA,
+        # fees) NO son ventas: copiarlas fabrica PnL 0.00%/-99% y ventas fantasma.
+        # Se ignoran del todo (ni ejecución ni stats).
+        if action == "sell" and sol_received <= 0:
+            logger.debug(
+                "CopyTrading: SELL sin SOL de vuelta al trader se IGNORA "
+                "(movimiento/redistribucion de tokens, no venta) {} | mint={} | "
+                "tokens_sent={} | sol_spent={:.6f} | sol_received={:.6f}",
+                signature[:16] + "...", token_mint[:12] + "...",
+                f"{tokens_sent[0]['amount']:.6g}" if tokens_sent else 0,
+                sol_spent, sol_received,
+            )
+            return None
+
         # Filtrar transfers de SOL minimos (fees de red) - solo para buys
         if action == "buy" and amount_sol < 0.0001:
             return None
