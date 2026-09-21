@@ -297,37 +297,39 @@ class CopyTradingStrategy(Strategy):
         return None
 
     def _calc_sell_pct(self, mint: str, tokens_sent_amount: float, wallet: str) -> float:
-        """Calculate what percentage of our position is being sold.
+        """Calculate what percentage of the trader's position is being sold.
 
-        Compares tokens_sent in the transfer vs what we hold in executor
-        and tracker positions. Returns 0-100.
+        Denominador preferente: los tokens que el TRADER acumuló de ese mint
+        (suma de sus BUY vía webhooks). Comparar contra nuestra posición
+        copiada (0.01 SOL, mucho más pequeña que la del trader) siempre da
+        ~100% en ventas parciales reales del trader, lo que cerraba toda la
+        posición del bot ante una venta del 20% del trader. Returns 0-100.
         """
         if tokens_sent_amount <= 0:
             return 0.0
 
-        # Try executor position first (has token_amount_ui)
+        accumulated = self._wallet_mint_tokens.get((wallet, mint), 0.0)
+        if accumulated > 0:
+            return min((tokens_sent_amount / accumulated) * 100.0, 100.0)
+
+        # Fallback: nuestra posición (solo si no tenemos tracking del trader).
         pos = self.executor.positions.get(mint)
         if pos and pos.token_amount_ui > 0:
             pct = (tokens_sent_amount / pos.token_amount_ui) * 100.0
             return min(pct, 100.0)
 
-        # Try tracker position (has amount in SOL, estimate tokens)
         tracker_pos = self.tracker.positions.get(mint)
         if tracker_pos and tracker_pos.amount > 0 and tracker_pos.buy_price > 0:
             estimated_tokens = tracker_pos.amount / tracker_pos.buy_price
             if estimated_tokens > 0:
                 pct = (tokens_sent_amount / estimated_tokens) * 100.0
-                # Guard: if pct > 1000, tokens_sent is likely in raw units (lamports),
-                # divide by 10^decimals to convert to UI
                 if pct > 1000.0:
                     pct = (tokens_sent_amount / (estimated_tokens * 1e6)) * 100.0
                 return min(pct, 100.0)
 
-        # If we have a position but can't estimate, assume full sell
         if tracker_pos or pos:
             return 100.0
 
-        # No position found - not a sell at all
         return 0.0
 
     async def start(self) -> None:
@@ -1285,44 +1287,65 @@ class CopyTradingStrategy(Strategy):
                     tokens_before_sell = accumulated
                     rpc_error = False
                     if signal.trade_token_amount > 0:
-                        try:
-                            bal = await self.executor.get_wallet_token_balance(
-                                signal.wallet, signal.token_mint
+                        if accumulated > 0 and signal.trade_token_amount <= accumulated:
+                            # Denominador FIEL: los tokens que vimos acumular al
+                            # trader via webhooks. Evita el falso 100% cuando el
+                            # balance on-chain viene desfasado o en 0 (ventas
+                            # encadenadas/traspasos) y el trader solo vendio una
+                            # fraccion (p.ej. CENTED 20.5M de 87.8M acumulados = 23%).
+                            tokens_before_sell = accumulated
+                            real_pct = (signal.trade_token_amount / accumulated) * 100.0
+                            real_pct = max(1.0, min(real_pct, 100.0))
+                            pct = real_pct
+                            held_after = max(0.0, accumulated - signal.trade_token_amount)
+                            self._wallet_mint_tokens[wm_key] = held_after
+                            logger.info(
+                                "CopyTrading: sell pct {:.1f}% por tracking (acumulado {:.4g} tk, vendidos en esta tx {:.4g} tk) para {}",
+                                real_pct, accumulated, signal.trade_token_amount,
+                                signal.token_mint[:8] + "...",
                             )
-                            # -1.0 = error de RPC => no podemos confiar en el
-                            # balance; usar tracking acumulado como fallback.
-                            rpc_error = bal < 0
-                            held_after = max(0.0, bal) if not rpc_error else 0.0
-                            if not rpc_error and (held_after + signal.trade_token_amount) > 0:
-                                tokens_before_sell = held_after + signal.trade_token_amount
-                                real_pct = (
-                                    (signal.trade_token_amount / tokens_before_sell) * 100.0
+                        else:
+                            # Tracking vacio (empezamos tarde) o vendio mas de lo
+                            # registrado: balance on-chain del trader es autoritativo.
+                            # total_antes = balance_actual + vendido_en_esta_tx.
+                            try:
+                                bal = await self.executor.get_wallet_token_balance(
+                                    signal.wallet, signal.token_mint
                                 )
-                                real_pct = max(1.0, min(real_pct, 100.0))
-                                pct = real_pct
-                                # Re-sincronizar el tracking con la realidad on-chain
-                                self._wallet_mint_tokens[wm_key] = held_after
-                                logger.info(
-                                    "CopyTrading: sell pct on-chain {:.1f}% (trader balance post-venta {:.4g} tk + vendidos {:.4g} tk) para {}",
-                                    real_pct, held_after, signal.trade_token_amount,
-                                    signal.token_mint[:8] + "...",
-                                )
-                            elif rpc_error:
-                                raise RuntimeError("RPC error en balance on-chain")
-                        except Exception as exc:
-                            logger.debug(
-                                "CopyTrading: fallo balance on-chain de {} para sell pct; usando tracking: {}",
-                                signal.token_mint[:12] + "...", exc,
-                            )
-                            # Fallback al tracking acumulado si RPC falla
-                            if signal.trade_token_amount > 0 and accumulated > 0:
-                                tokens_before_sell = accumulated
-                                real_pct = (signal.trade_token_amount / accumulated) * 100.0
-                                real_pct = min(real_pct, 100.0)
-                                if real_pct > 1.0:
+                                # -1.0 = error de RPC => no podemos confiar en el
+                                # balance; usar tracking acumulado como fallback.
+                                rpc_error = bal < 0
+                                held_after = max(0.0, bal) if not rpc_error else 0.0
+                                if not rpc_error and (held_after + signal.trade_token_amount) > 0:
+                                    tokens_before_sell = held_after + signal.trade_token_amount
+                                    real_pct = (
+                                        (signal.trade_token_amount / tokens_before_sell) * 100.0
+                                    )
+                                    real_pct = max(1.0, min(real_pct, 100.0))
                                     pct = real_pct
-                                held_after = max(0.0, accumulated - signal.trade_token_amount)
-                                self._wallet_mint_tokens[wm_key] = held_after
+                                    # Re-sincronizar el tracking con la realidad on-chain
+                                    self._wallet_mint_tokens[wm_key] = held_after
+                                    logger.info(
+                                        "CopyTrading: sell pct {:.1f}% on-chain (trader balance post-venta {:.4g} tk + vendidos {:.4g} tk) para {}",
+                                        real_pct, held_after, signal.trade_token_amount,
+                                        signal.token_mint[:8] + "...",
+                                    )
+                                elif rpc_error:
+                                    raise RuntimeError("RPC error en balance on-chain")
+                            except Exception as exc:
+                                logger.debug(
+                                    "CopyTrading: fallo balance on-chain de {} para sell pct; usando tracking: {}",
+                                    signal.token_mint[:12] + "...", exc,
+                                )
+                                # Fallback: tracking acumulado si RPC falla
+                                if signal.trade_token_amount > 0 and accumulated > 0:
+                                    tokens_before_sell = accumulated
+                                    real_pct = (signal.trade_token_amount / accumulated) * 100.0
+                                    real_pct = min(real_pct, 100.0)
+                                    if real_pct > 1.0:
+                                        pct = real_pct
+                                    held_after = max(0.0, accumulated - signal.trade_token_amount)
+                                    self._wallet_mint_tokens[wm_key] = held_after
                     elif signal.trade_token_amount <= 0:
                         logger.debug(
                             "CopyTrading: sin cantidad de tokens vendidos medible para {}",

@@ -75,6 +75,13 @@ def _is_rate_limit(exc: Exception) -> bool:
     message = str(exc).lower()
     return any(phrase in message for phrase in ("429", "rate limit", "too many requests"))
 
+# Presión a la API de Jupiter: caché de quotes (mismas compras DCA del mismo
+# token y mismo monto reutilizan la última cotización real) + intervalo mínimo
+# entre llamadas HTTP + circuit-breaker de 10s tras un 429.
+JUPITER_QUOTE_CACHE_TTL_SECONDS = 2.0
+JUPITER_MIN_CALL_INTERVAL_SECONDS = 0.25
+JUPITER_RATE_LIMIT_BACKOFF_SECONDS = 10.0
+
 
 def cargar_keypair_desde_env(rpc_url: str = "") -> Keypair:
     """Carga la wallet escaneando rutas BIP44 y seleccionando la que tenga saldo SOL."""
@@ -201,6 +208,18 @@ class JupiterExecutor:
         # Negativa: 10 min tras un fallo/429, para no martillar al RPC
         # (GetTokenSupply erró todos a la vez cada ~2.5s antes del fix).
         self._decimals_cache: dict[str, tuple[Optional[int], float]] = {}
+        # Caché de quotes de Jupiter: (input, output, amount, slippage) -> (ts, quote).
+        # Las compras DCA del mismo token y mismo SOL (muy frecuentes) reaprovechan
+        # la última cotización real en vez de multiplicar llamadas a Jupiter.
+        self._quote_cache: dict[tuple, tuple[float, dict]] = {}
+        # Throttle global: nunca dejar pasar menos de JUPITER_MIN_CALL_INTERVAL_SECONDS
+        # entre llamadas HTTP a Jupiter, sea cual sea el llamador (buy/sell/price).
+        self._jupiter_lock = asyncio.Lock()
+        self._jupiter_last_call = 0.0
+        # Circuit-breaker: tras un 429 se evita llamar a Jupiter durante
+        # JUPITER_RATE_LIMIT_BACKOFF_SECONDS (el fallback cae a caché/cotización
+        # simulada en DRY_RUN en vez de re-peguntar y quemar el rate limit).
+        self._jupiter_blocked_until = 0.0
 
     @staticmethod
     def _decode_transaction(raw_tx: Any) -> bytes:
@@ -228,23 +247,71 @@ class JupiterExecutor:
             "slippageBps": self.slippage_bps if slippage_bps is None else slippage_bps,
             "onlyDirectRoutes": "false",
         }
-        try:
+        cache_key = (input_mint, output_mint, amount_lamports, params["slippageBps"])
+
+        # Caché: cotización real reciente -> reutilizar sin llamar a Jupiter.
+        # Evita que las ráfagas DCA (mismo mint, mismo monto) martillen la API.
+        now = time.monotonic()
+        cached = self._quote_cache.get(cache_key)
+        if cached and now - cached[0] < JUPITER_QUOTE_CACHE_TTL_SECONDS:
+            return cached[1]
+
+        async with self._jupiter_lock:
+            now = time.monotonic()
+            cached = self._quote_cache.get(cache_key)
+            if cached and now - cached[0] < JUPITER_QUOTE_CACHE_TTL_SECONDS:
+                return cached[1]
+
+            # Circuit-breaker: tras un 429 no tocar Jupiter un rato.
+            if now < self._jupiter_blocked_until:
+                if simulate:
+                    logger.warning(
+                        "⚠️ Jupiter en backoff tras 429 ({:.0f}s restantes). Cotización simulada.",
+                        self._jupiter_blocked_until - now,
+                    )
+                    return self._simulated_quote(input_mint, output_mint, amount_lamports)
+                raise SwapExecutionError(
+                    f"Jupiter rate limit (backoff {self._jupiter_blocked_until - now:.0f}s)"
+                )
+
+            # Throttle: respetar el intervalo mínimo entre llamadas HTTP.
+            wait = self._jupiter_last_call + JUPITER_MIN_CALL_INTERVAL_SECONDS - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+
             try:
-                return await self._request_quote(session, JUPITER_QUOTE_URL, params)
-            except (aiohttp.ClientConnectorError, OSError, asyncio.TimeoutError) as exc:
-                logger.warning(
-                    "Jupiter principal {} falló por red ({}); reintentando con fallback {}",
-                    JUPITER_QUOTE_URL, exc, JUPITER_FALLBACK_URL,
-                )
-                return await self._request_quote(session, JUPITER_FALLBACK_URL, params)
-        except (SwapExecutionError, aiohttp.ClientConnectorError, OSError, asyncio.TimeoutError) as exc:
-            if simulate:
-                logger.warning(
-                    "⚠️ Token sin ruta en Jupiter (Pump.fun reciente). "
-                    "Generando cotización simulada para test. ({})", exc,
-                )
-                return self._simulated_quote(input_mint, output_mint, amount_lamports)
-            raise
+                try:
+                    quote = await self._request_quote(session, JUPITER_QUOTE_URL, params)
+                except (aiohttp.ClientConnectorError, OSError, asyncio.TimeoutError) as exc:
+                    logger.warning(
+                        "Jupiter principal {} falló por red ({}); reintentando con fallback {}",
+                        JUPITER_QUOTE_URL, exc, JUPITER_FALLBACK_URL,
+                    )
+                    quote = await self._request_quote(session, JUPITER_FALLBACK_URL, params)
+            except (SwapExecutionError, aiohttp.ClientConnectorError, OSError, asyncio.TimeoutError) as exc:
+                if _is_rate_limit(exc):
+                    self._jupiter_blocked_until = time.monotonic() + JUPITER_RATE_LIMIT_BACKOFF_SECONDS
+                    logger.warning(
+                        "Jupiter 429 → backoff de {:.0f}s. ({})",
+                        JUPITER_RATE_LIMIT_BACKOFF_SECONDS, exc,
+                    )
+                    if simulate:
+                        return self._simulated_quote(input_mint, output_mint, amount_lamports)
+                    raise
+                if simulate:
+                    logger.warning(
+                        "⚠️ Token sin ruta en Jupiter (Pump.fun reciente). "
+                        "Generando cotización simulada para test. ({})", exc,
+                    )
+                    return self._simulated_quote(input_mint, output_mint, amount_lamports)
+                raise
+            finally:
+                self._jupiter_last_call = time.monotonic()
+
+            # Solo cachear cotizaciones reales (no simuladas).
+            if not quote.get("simulated"):
+                self._quote_cache[cache_key] = (time.monotonic(), quote)
+            return quote
 
     def _simulated_quote(
         self,
