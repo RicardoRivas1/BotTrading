@@ -94,6 +94,13 @@ class CopyTradingStrategy(Strategy):
         self._wallet_mint_tokens: dict[tuple[str, str], float] = {}  # (wallet,mint)->tokens acumulados (SUMA via BUY)
         self._wallet_mint_sol: dict[tuple[str, str], float] = {}  # (wallet,mint)->SOL invertido acumulado (sin cap)
         self._lock = asyncio.Lock()
+        # Serializa TODO el pipeline (parse + execute) para que _parse_trade
+        # SIEMPRE lea el estado (_wallet_mint_tokens, posiciones) ya actualizado.
+        # Sin esto, webhooks concurrentes leen estado viejo: una VENTA que llega
+        # mientras otro webhook aun no ejecuto su BUY ve trader_held=0 y se
+        # clasifica como COMPRA (el famoso "compro la venta"). Distinto de
+        # self._lock (protege solo la ejecucion): este protege parse+execute.
+        self._webhook_lock = asyncio.Lock()
         self.webhook_path = "/webhook/copy-trading"
         self._load_wallets()
 
@@ -538,10 +545,13 @@ class CopyTradingStrategy(Strategy):
             tracked.label, fee_payer[:8] + "...", tx_type, signature[:16] + "...",
         )
 
-        signal = self._parse_trade(tx, tracked, wallet_address=wallet_address)
-
-        if signal:
-            await self._execute_copy_trade(signal)
+        # Serializa parse+execute: el parse lee el estado acumulado y debe verlo
+        # ya actualizado por txs anteriores (mismo webhook o anteriores). Si no,
+        # una venta concurrente ve trader_held=0 y se lee como compra.
+        async with self._webhook_lock:
+            signal = self._parse_trade(tx, tracked, wallet_address=wallet_address)
+            if signal:
+                await self._execute_copy_trade(signal)
 
     def _parse_trade(self, tx: dict[str, Any], tracked: TrackedWallet, wallet_address: str = "") -> Optional[CopyTradeSignal]:
         """Extrae la senal de trading de una transaccion.
