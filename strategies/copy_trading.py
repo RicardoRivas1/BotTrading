@@ -26,6 +26,10 @@ from core.engine.strategy import Strategy, StrategyState
 # Token SOL nativo
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
+# Monto minimo en SOL que debe gastar el trader para considerar una compra real
+# (evita clasificar fees o tiny transfers como compras)
+MIN_BUY_SOL = 0.005
+
 # Tipos de transaccion que nos interesan
 COPY_TRADE_TYPES = {"SWAP", "TRANSFER"}
 
@@ -817,7 +821,24 @@ class CopyTradingStrategy(Strategy):
                     # trader gasto SOL real (>= MIN_BUY_SOL). Si sol_spent es solo
                     # un fee (~0.000005), es una VENTA cuya devolucion llego via
                     # programa (Axiom/pump) o un transfer menor: NO es compra.
-                    if is_pump_fun and sol_spent >= 0.005:
+                    # Guard extra: si el trader ya ACUMULO tokens de ese mint
+                    # (buys previos trackeados) y NO gasto SOL real (es solo un
+                    # fee ~0.000005), entonces tokens_sent es una reduccion de
+                    # posicion (= VENTA), no una compra nueva. Si gasto
+                    # SOL >= MIN_BUY_SOL, es una compra (el trader paga de verdad).
+                    trader_held = self._wallet_mint_tokens.get(
+                        (tracked.address, token_mint), 0.0
+                    )
+                    is_real_buy_spend = sol_spent >= MIN_BUY_SOL
+                    if trader_held > 0 and not is_real_buy_spend:
+                        action = "sell"
+                        amount_sol = 0.0
+                        logger.info(
+                            "CopyTrading: SELL (inverted transfer, trader tenia {} tk acumulados, SOL_spent={:.6f}) {} | tokens_sent={} | mint={}",
+                            f"{trader_held:.6g}", sol_spent, signature[:16] + "...",
+                            f"{tokens_sent[0]['amount']:.6g}", token_mint[:12] + "...",
+                        )
+                    elif is_real_buy_spend:
                         logger.info(
                             "CopyTrade: pump.fun buy (Helius inverted transfer) {} | tokens_sent would-be {} | SOL_spent={:.6f}",
                             signature[:16] + "...", token_mint[:12] + "...", sol_spent,
@@ -989,7 +1010,6 @@ class CopyTradingStrategy(Strategy):
             amount_sol = sol_spent if sol_spent > 0 else 0.01
 
         # Para buys: monto minimo realista (evita falsos positivos de fees/tiny transfers)
-        MIN_BUY_SOL = 0.005
         if action == "buy" and amount_sol < MIN_BUY_SOL:
             logger.debug(
                 "CopyTrade ignorado: buy demasiado pequeno ({:.6f} < {:.6f} SOL) | {}",
