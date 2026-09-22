@@ -246,8 +246,19 @@ async def process_sell_and_notify(
     raw_pnl = float(pnl)
     pnl = max(-100.0, min(raw_pnl, MAX_PLAUSIBLE_PNL_PCT))
 
+    # En DRY_RUN las salidas automáticas del tracker (TAKE_PROFIT / STOP_LOSS /
+    # TRAILING_STOP / TIME_EXPIRED) nacen de cotizaciones simuladas, a menudo
+    # oscilantes (+59% y luego -13% para el mismo token) o dust, y no representan
+    # un resultado real. No deben spamear Telegram ni contaminar las stats de
+    # /stats. Las salidas por COPY_TRADE_SELL (el trader vendió de verdad) sí se
+    # notifican y se registran por la estrategia de copy trading.
+    quiet_dry_run_exit = (
+        bool(cfg.trading.DRY_RUN)
+        and reason in ("TAKE_PROFIT", "STOP_LOSS", "TRAILING_STOP", "TIME_EXPIRED")
+    )
+
     # Registrar venta en estadísticas para salidas del tracker (TP/SL/TRAILING_STOP/etc.)
-    if reason != "COPY_TRADE_SELL" and pos:
+    if reason != "COPY_TRADE_SELL" and pos and not quiet_dry_run_exit:
         try:
             from core.stats import get_trade_stats
             _entry = getattr(pos, "buy_price", 0.0) or 0.0
@@ -319,7 +330,12 @@ async def process_sell_and_notify(
         await notifier.send_error(f"No se pudo vender {symbol} ({mint}) por {reason}: {exc}")
         return False
 
-    if reason == "TAKE_PROFIT":
+    if quiet_dry_run_exit:
+        logger.info(
+            "[DRY_RUN] Salida {} silenciada (sin stats ni notificación): {} ({}) PnL {:.2f}%",
+            reason, symbol, mint, pnl,
+        )
+    elif reason == "TAKE_PROFIT":
         if raw_pnl > MAX_PLAUSIBLE_PNL_PCT:
             logger.warning(
                 "TAKE PROFIT con PnL +{:.2f}% implausible para {} ({}) no se notifica",

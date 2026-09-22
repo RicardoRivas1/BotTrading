@@ -81,7 +81,8 @@ class TestProcessSellAndNotify:
             telegram=SimpleNamespace(TELEGRAM_TOKEN="t", TELEGRAM_CHAT_ID="c"),
         )
 
-    async def test_dry_run_registra_salida(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_dry_run_no_notifica_tp_ni_stats(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """En DRY_RUN el TP del tracker se simula en silencio (sin Telegram ni stats)."""
         notifier = _make_notifier()
         monkeypatch.setattr("config.load_config", lambda: self._fake_cfg(dry_run=True))
         monkeypatch.setattr(
@@ -93,7 +94,8 @@ class TestProcessSellAndNotify:
         ok = await ws_module.process_sell_and_notify("MINT123ABC", "MET", "TAKE_PROFIT", 150.0)
 
         assert ok is True
-        notifier.send_take_profit.assert_awaited_once()
+        notifier.send_take_profit.assert_not_awaited()
+        tracker.positions.pop.assert_called()
 
     async def test_real_sin_posicion_omite_y_devuelve_false(
         self, monkeypatch: pytest.MonkeyPatch
@@ -133,6 +135,52 @@ class TestProcessSellAndNotify:
         assert tracker.executor.sell_token.await_args.args[0] == "MINT123ABC"
         notifier.send_stop_loss.assert_awaited_once()
 
+    async def test_real_tp_sigue_notificando(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """En modo REAL el TP del tracker sí notifica (resultado real)."""
+        notifier = _make_notifier()
+        monkeypatch.setattr("config.load_config", lambda: self._fake_cfg(dry_run=False))
+        monkeypatch.setattr(
+            "core.notifier.TelegramNotifier", lambda **kwargs: notifier
+        )
+        pos = SimpleNamespace(amount=0.05, buy_price=0.001)
+        tracker = MagicMock()
+        tracker.get_position.return_value = pos
+        tracker.executor.sell_token = AsyncMock()
+        monkeypatch.setattr("core.tracker.get_global_tracker", lambda: tracker)
+
+        ok = await ws_module.process_sell_and_notify("MINT123ABC", "MET", "TAKE_PROFIT", 59.14)
+
+        assert ok is True
+        notifier.send_take_profit.assert_awaited_once()
+
+    async def test_dry_run_tp_no_registra_stats(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """El TP simulado en DRY_RUN no contamina las stats de /stats."""
+        stats_mock = MagicMock()
+        monkeypatch.setattr(
+            "core.stats.get_trade_stats", lambda: stats_mock
+        )
+        monkeypatch.setattr("config.load_config", lambda: self._fake_cfg(dry_run=True))
+        monkeypatch.setattr(
+            "core.notifier.TelegramNotifier", lambda **kwargs: _make_notifier()
+        )
+        pos = SimpleNamespace(
+            buy_price=0.001, amount=0.05, symbol="MET",
+            source_wallet="", created_at=0.0,
+        )
+        tracker = MagicMock()
+        tracker.get_position.return_value = pos
+        tracker.positions.pop = MagicMock()
+        tracker.executor._save_exec_positions = MagicMock()
+        tracker._save_positions = MagicMock()
+        monkeypatch.setattr("core.tracker.get_global_tracker", lambda: tracker)
+
+        ok = await ws_module.process_sell_and_notify(
+            "MINT123ABC", "MET", "TAKE_PROFIT", 59.14
+        )
+
+        assert ok is True
+        stats_mock.record_sell.assert_not_called()
+
     async def test_fallo_vende_y_notifica_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         notifier = _make_notifier()
         notifier.send_error = AsyncMock()
@@ -151,8 +199,8 @@ class TestProcessSellAndNotify:
         assert ok is False
         notifier.send_error.assert_awaited_once()
 
-    async def test_razon_no_tp_nl_notifica_estado(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Cualquier motivo que no sea TP/SL se reporta como estado."""
+    async def test_dry_run_no_notifica_salidas_varias(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """TIME_EXPIRED/TRAILING_STOP en DRY_RUN tampoco notifican."""
         notifier = _make_notifier()
         monkeypatch.setattr("config.load_config", lambda: self._fake_cfg(dry_run=True))
         monkeypatch.setattr(
@@ -164,7 +212,8 @@ class TestProcessSellAndNotify:
         ok = await ws_module.process_sell_and_notify("MINT123ABC", "MET", "TIME_EXPIRED", 5.0)
 
         assert ok is True
-        notifier.send_status.assert_awaited_once()
+        notifier.send_status.assert_not_awaited()
+        notifier.send_trailing_stop.assert_not_awaited()
 
 
 class TestProcessBuyAndNotify:
