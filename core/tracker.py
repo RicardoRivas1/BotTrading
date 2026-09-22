@@ -41,6 +41,11 @@ CONFIRMED_RUG_STREAK = int(os.getenv("CONFIRMED_RUG_STREAK", "5"))
 # Cadencia (segundos) de re-consulta de una posición confirmada como muerta.
 # Mientras tanto, TIME_EXPIRED (max_hold) cierra la posición con normalidad.
 IMPLAUSIBLE_POLL_INTERVAL_SEC = float(os.getenv("IMPLAUSIBLE_POLL_INTERVAL_SEC", "60"))
+# Ventana (s) que una posición CONFIRMADA como muerta (streak >=
+# CONFIRMED_RUG_STREAK) puede seguir abierta antes de forzar su cierre, sin
+# depender de MAX_COPY_TRADE_HOLD_SECONDS. Libera el slot de
+# MAX_COPY_TRADE_POSITIONS que de otro modo quedaría bloqueado ~27h.
+IMPLAUSIBLE_MAX_AGE_SEC = float(os.getenv("IMPLAUSIBLE_MAX_AGE_SEC", "300"))
 
 # API directa de Pump.fun para la cotización en SOL por token. Se usan
 # cabeceras de navegador para evitar el bloqueo 403 de Cloudflare.
@@ -118,6 +123,9 @@ class TrackerPosition:
     # Próximo instante permitido para re-consultar la red de una posición
     # confirmada como muerta (throttle de polling).
     next_throttle_refresh: float = 0.0
+    # Instante en que la posición pasó a estar CONFIRMADA como muerta (streak
+    # >= CONFIRMED_RUG_STREAK). Tras IMPLAUSIBLE_MAX_AGE_SEC se fuerza el cierre.
+    implausible_confirm_time: float = 0.0
 
 
 class PositionTracker:
@@ -373,6 +381,7 @@ class PositionTracker:
         if pnl_pct > -99.0 and pos.implausible_streak:
             pos.implausible_streak = 0
             pos.next_throttle_refresh = 0.0
+            pos.implausible_confirm_time = 0.0
 
         # --- Log periódico cada 15-30 segundos ---
         if now - pos.last_log_time >= 20:
@@ -402,12 +411,33 @@ class PositionTracker:
             pos.implausible_streak += 1
             streak = pos.implausible_streak
             if streak >= CONFIRMED_RUG_STREAK:
-                if now >= pos.next_throttle_refresh:
-                    pos.next_throttle_refresh = time.time() + IMPLAUSIBLE_POLL_INTERVAL_SEC
+                if pos.implausible_confirm_time == 0.0:
+                    pos.implausible_confirm_time = time.time()
                     logger.warning(
                         "PnL {:.2f}% confirmado por {} ciclos para {} ({}); polling "
-                        "throttled a {:.0f}s; TIME_EXPIRED cerrará la posición",
+                        "throttled a {:.0f}s; cierre forzado tras {}s de confirmación",
                         pnl_pct, streak, pos.symbol, mint, IMPLAUSIBLE_POLL_INTERVAL_SEC,
+                        int(IMPLAUSIBLE_MAX_AGE_SEC),
+                    )
+                elif now - pos.implausible_confirm_time >= IMPLAUSIBLE_MAX_AGE_SEC:
+                    logger.warning(
+                        "Posición {} ({}) confirmada muerta (-99%) por >{}s; "
+                        "cerrando para liberar slot (PnL {:.2f}%)",
+                        mint, pos.symbol, int(IMPLAUSIBLE_MAX_AGE_SEC), pnl_pct,
+                    )
+                    ok = await process_sell_and_notify(
+                        pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=pnl_pct
+                    )
+                    if ok:
+                        self.remove_position(mint)
+                    return
+                elif now >= pos.next_throttle_refresh:
+                    pos.next_throttle_refresh = time.time() + IMPLAUSIBLE_POLL_INTERVAL_SEC
+                    logger.debug(
+                        "PnL {:.2f}% persistente para {} ({}) (ciclo {}); polling "
+                        "throttled a {:.0f}s; cierre en {:.0f}s",
+                        pnl_pct, streak, pos.symbol, mint, IMPLAUSIBLE_POLL_INTERVAL_SEC,
+                        max(0.0, (pos.implausible_confirm_time + IMPLAUSIBLE_MAX_AGE_SEC) - now),
                     )
             else:
                 logger.warning(

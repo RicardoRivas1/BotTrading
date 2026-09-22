@@ -90,6 +90,10 @@ class CopyTradingStrategy(Strategy):
         super().__init__(executor, notifier, tracker, config)
         self.wallets: dict[str, TrackedWallet] = {}
         self._recent_signals: dict[str, float] = {}
+        # Dedup de entregas repetidas de webhook (Helius reentrega el mismo
+        # evento varias veces cuando la respuesta no se ACKa rápido). Clave:
+        # signature + blockTime. Evita reprocesar N veces la misma tx.
+        self._recent_webhook_txs: dict[str, float] = {}
         self._traded_mints: set[str] = set()  # mints que el bot ha comprado alguna vez
         self._wallet_mint_tokens: dict[tuple[str, str], float] = {}  # (wallet,mint)->tokens acumulados (SUMA via BUY)
         self._wallet_mint_sol: dict[tuple[str, str], float] = {}  # (wallet,mint)->SOL invertido acumulado (sin cap)
@@ -480,6 +484,19 @@ class CopyTradingStrategy(Strategy):
         tx_type = tx.get("type", "")
         fee_payer = tx.get("feePayer", "")
         signature = tx.get("signature", "")
+
+        # Dedup temprano: Helius puede reentregar el MISMO evento (misma sig +
+        # blockTime) varias veces seguidas si la respuesta tarda o se reenvía.
+        # Procesar el duplicado no aporta nada y satura el loop/logs. (El dedup
+        # de la línea ~536 queda como segunda barrera para señales de trade.)
+        dedup_key = f"{signature}:{tx.get('blockTime', '')}"
+        if dedup_key in self._recent_webhook_txs:
+            return
+        self._recent_webhook_txs[dedup_key] = time.time()
+        cutoff = time.time() - 300
+        self._recent_webhook_txs = {
+            k: v for k, v in self._recent_webhook_txs.items() if v > cutoff
+        }
 
         logger.info(
             "CopyTrading: tx type={} fee_payer={} sig={}",
