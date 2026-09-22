@@ -11,6 +11,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# Tope de PnL plausible para una venta real (100x). Un PnL superior casi
+# siempre es una cotización dust o un costo de entrada mal calculado
+# (p.ej. +1659118% por cost_of_sold de polvo), y su sola presencia confunde
+# los mensajes y distorsiona las stats (promedio, mejor trade).
+MAX_PLAUSIBLE_PNL_PCT = 10_000.0
+
 
 @dataclass
 class TradeRecord:
@@ -153,6 +159,7 @@ class TradeStats:
         sell_pct: float = 100.0,
     ) -> TradeRecord:
         """Record a completed sell trade."""
+        pnl_pct = max(-100.0, min(float(pnl_pct), MAX_PLAUSIBLE_PNL_PCT))
         trade = TradeRecord(
             mint=mint,
             symbol=symbol,

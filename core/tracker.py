@@ -27,6 +27,8 @@ from typing import Any, Optional
 import aiohttp
 from loguru import logger
 
+from core.stats import MAX_PLAUSIBLE_PNL_PCT
+
 # Intervalo del bucle de monitoreo de posiciones activas (segundos).
 CHECK_INTERVAL_SEC = 2.0
 
@@ -371,7 +373,11 @@ class PositionTracker:
         # cotización válida conocida (jamás se iguala al precio de entrada).
         pnl_pct = (current_price - pos.buy_price) / pos.buy_price * 100.0
         pos.latest_pnl_pct = pnl_pct
-        if pnl_pct > pos.highest_pnl_pct:
+        # Un PnL disparatadamente alto (> MAX_PLAUSIBLE_PNL_PCT) casi siempre es
+        # una cotización/entrada dust. No debe disparar TP, ni activar el
+        # trailing, ni inflar el pico: es dato sucio, no una ganancia real.
+        implausible_high = pnl_pct > MAX_PLAUSIBLE_PNL_PCT
+        if not implausible_high and pnl_pct > pos.highest_pnl_pct:
             pos.highest_pnl_pct = pnl_pct
         take_profit_pct = float(self.config.trading.TAKE_PROFIT_PCT)
         stop_loss_pct = float(self.config.trading.STOP_LOSS_PCT)
@@ -385,15 +391,24 @@ class PositionTracker:
 
         # --- Log periódico cada 15-30 segundos ---
         if now - pos.last_log_time >= 20:
-            logger.info(
-                "📊 Monitoreando {}: PnL actual {:+.2f}% (Precio: {:.10g} SOL)",
-                pos.symbol, pnl_pct, current_price,
-            )
+            if implausible_high:
+                logger.warning(
+                    "PnL +{:.2f}% implausible (max {:.0f}%) para {} ({}) a precio "
+                    "{:.10g} SOL vs entrada {:.10g} SOL; TP/trailing descartados, "
+                    "TIME_EXPIRED cerrará la posición",
+                    pnl_pct, MAX_PLAUSIBLE_PNL_PCT, pos.symbol, mint,
+                    current_price, pos.buy_price,
+                )
+            else:
+                logger.info(
+                    "📊 Monitoreando {}: PnL actual {:+.2f}% (Precio: {:.10g} SOL)",
+                    pos.symbol, pnl_pct, current_price,
+                )
             pos.last_log_time = now
 
         # --- TP / SL primero (incluso en DRY_RUN) para salir antes de agotar
         # el hold máximo ---
-        if take_profit_pct and pnl_pct >= take_profit_pct:
+        if take_profit_pct and pnl_pct >= take_profit_pct and not implausible_high:
             logger.info("🎯 TAKE PROFIT (+{:.2f}%) para {} ({})", pnl_pct, mint, pos.symbol)
             ok = await process_sell_and_notify(
                 pos.mint, pos.symbol, reason="TAKE_PROFIT", pnl=pnl_pct
@@ -463,7 +478,7 @@ class PositionTracker:
             getattr(self.config.trading, "TRAILING_STOP_DISTANCE_PCT", 0.0) or 0.0
         )
         if trailing_activation > 0 and trailing_distance > 0:
-            if pnl_pct >= trailing_activation:
+            if not implausible_high and pnl_pct >= trailing_activation:
                 pos.trailing_active = True
             if pos.trailing_active and pos.highest_pnl_pct > 0:
                 drawdown = pos.highest_pnl_pct - pnl_pct
@@ -601,6 +616,16 @@ class PositionTracker:
             pos.last_progress_notify_at = now
             pos.last_notified_pnl_pct = pnl_pct
             return
+        if abs(pnl_pct) > MAX_PLAUSIBLE_PNL_PCT or abs(
+            float(getattr(pos, "highest_pnl_pct", 0.0) or 0.0)
+        ) > MAX_PLAUSIBLE_PNL_PCT:
+            logger.debug(
+                "Progreso no notificado para {} ({}): PnL implausible {:.2f}%",
+                pos.symbol, getattr(pos, "mint", ""), pnl_pct,
+            )
+            pos.last_progress_notify_at = now
+            pos.last_notified_pnl_pct = pnl_pct
+            return
         interval = float(
             getattr(self.config.trading, "POSITION_UPDATE_INTERVAL_SECONDS", 30.0)
         )
@@ -670,7 +695,13 @@ class PositionTracker:
         take_profit_pct = float(self.config.trading.TAKE_PROFIT_PCT)
         stop_loss_pct = float(self.config.trading.STOP_LOSS_PCT)
 
-        if take_profit_pct and pnl_pct >= take_profit_pct:
+        if pnl_pct > MAX_PLAUSIBLE_PNL_PCT:
+            logger.warning(
+                "PnL +{:.2f}% implausible (max {:.0f}%) para {}; TP descartado "
+                "(cotización/entrada dust, no una ganancia real)",
+                pnl_pct, MAX_PLAUSIBLE_PNL_PCT, token_mint,
+            )
+        elif take_profit_pct and pnl_pct >= take_profit_pct:
             logger.info("🎯 TAKE PROFIT (+{:.2f}%) para {}", pnl_pct, token_mint)
             await self._close(token_mint, "TAKE_PROFIT", pnl_pct)
             await self.notifier.send_take_profit(token_mint, pnl_pct)

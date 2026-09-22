@@ -240,6 +240,12 @@ async def process_sell_and_notify(
 
     sell_pct = max(0.0, min(100.0, sell_pct))
 
+    # Red de seguridad central: ningún PnL absurdo (cotización dust / entrada mal
+    # calculada) debe colarse a las stats ni a las notificaciones.
+    from core.stats import MAX_PLAUSIBLE_PNL_PCT
+    raw_pnl = float(pnl)
+    pnl = max(-100.0, min(raw_pnl, MAX_PLAUSIBLE_PNL_PCT))
+
     # Registrar venta en estadísticas para salidas del tracker (TP/SL/TRAILING_STOP/etc.)
     if reason != "COPY_TRADE_SELL" and pos:
         try:
@@ -314,7 +320,13 @@ async def process_sell_and_notify(
         return False
 
     if reason == "TAKE_PROFIT":
-        await notifier.send_take_profit(mint, pnl)
+        if raw_pnl > MAX_PLAUSIBLE_PNL_PCT:
+            logger.warning(
+                "TAKE PROFIT con PnL +{:.2f}% implausible para {} ({}) no se notifica",
+                raw_pnl, symbol, mint,
+            )
+        else:
+            await notifier.send_take_profit(mint, pnl)
     elif reason == "STOP_LOSS":
         await notifier.send_stop_loss(mint, pnl)
     elif reason == "TRAILING_STOP":

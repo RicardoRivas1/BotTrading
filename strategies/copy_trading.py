@@ -22,6 +22,7 @@ import aiohttp
 from loguru import logger
 
 from core.engine.strategy import Strategy, StrategyState
+from core.stats import MAX_PLAUSIBLE_PNL_PCT
 
 # Token SOL nativo
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -1457,6 +1458,16 @@ class CopyTradingStrategy(Strategy):
 
                     # Clamp PnL: en spot trading la pérdida nunca puede ser peor que -100%
                     pnl_pct = max(-100.0, pnl_pct)
+                    # Un PnL disparatadamente alto (>100x) casi siempre es costo de
+                    # polvo (cost_of_sold dust) o sell_proceeds mal atribuido. Se
+                    # limita para no confundir mensajes ni distorsionar las stats.
+                    if pnl_pct > MAX_PLAUSIBLE_PNL_PCT:
+                        logger.warning(
+                            "CopyTrading: PnL {:.2f}% implausible para {} (sell_proceeds={:.6f} sold_tok={:.6g} avg_cost={:.10g}); limitado a {:.0f}% en stats/notificación",
+                            pnl_pct, signal.token_mint[:12] + "...",
+                            sell_proceeds, sold_tok, avg_cost, MAX_PLAUSIBLE_PNL_PCT,
+                        )
+                        pnl_pct = MAX_PLAUSIBLE_PNL_PCT
                     if abs(pnl_pct) >= 99.9:
                         logger.warning(
                             "CopyTrading: PnL {:.2f}% cerca del limite para {} (sell_proceeds={} sold_tok={} w_sol={} accumulated={} avg_cost={})",
