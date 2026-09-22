@@ -297,9 +297,13 @@ class CopyTrader:
 
             # Verificar max posiciones abiertas
             max_positions = int(
-                getattr(self.config.trading, "MAX_OPEN_POSITIONS", 3)
+                getattr(self.config.trading, "MAX_OPEN_POSITIONS", 0)
             )
-            if signal.action == "buy" and len(self.executor.positions) >= max_positions:
+            if (
+                max_positions > 0
+                and signal.action == "buy"
+                and len(self.executor.positions) >= max_positions
+            ):
                 logger.info(
                     " Maximo de posiciones abiertas ({}) alcanzado; omitiendo copy buy",
                     max_positions,

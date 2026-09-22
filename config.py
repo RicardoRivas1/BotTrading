@@ -79,7 +79,9 @@ class TradingSettings(BaseSettings):
         description="Monto fijo por compra en SOL (~$0.80-$1.00 USD)",
     )
     MAX_OPEN_POSITIONS: int = Field(
-        default=1, gt=0, description="Número máximo de posiciones abiertas simultáneas"
+        default=0,
+        ge=0,
+        description="Número máximo de posiciones abiertas simultáneas (0 = sin límite)",
     )
     TAKE_PROFIT_PERCENT: float = Field(
         default=15.0,
@@ -240,15 +242,16 @@ class CopyTradingSettings(BaseSettings):
         description="Monto maximo por copy trade en SOL",
     )
     MAX_COPY_TRADE_POSITIONS: int = Field(
-        default=50,
-        gt=0,
+        default=0,
+        ge=0,
         description=(
             "Maximo de posiciones abiertas simultaneas del copy trading. "
-            "Independiente de MAX_OPEN_POSITIONS del bot general."
+            "Independiente de MAX_OPEN_POSITIONS del bot general. "
+            "0 = sin limite (posiciones infinitas)."
         ),
     )
     MAX_COPY_TRADE_HOLD_SECONDS: int = Field(
-        default=100000,
+        default=0,
         ge=0,
         description=(
             "Tiempo maximo (s) que una posicion de copy trading puede estar "

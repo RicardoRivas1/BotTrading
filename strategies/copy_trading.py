@@ -1183,9 +1183,9 @@ class CopyTradingStrategy(Strategy):
                         return
 
                     max_pos = int(
-                        getattr(self.config.copy_trading, "MAX_COPY_TRADE_POSITIONS", 50)
+                        getattr(self.config.copy_trading, "MAX_COPY_TRADE_POSITIONS", 0)
                     )
-                    if len(self.executor.positions) >= max_pos:
+                    if max_pos > 0 and len(self.executor.positions) >= max_pos:
                         logger.info(
                             "CopyTrading: BUY ignorado {} - max posiciones ({})",
                             signal.source, signal.token_mint[:8] + "...",
