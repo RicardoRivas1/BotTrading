@@ -1760,73 +1760,101 @@ class CopyTradingStrategy(Strategy):
                             signal.token_mint[:12] + "...",
                         )
 
-                    # --- PnL de NUESTRA copia (entry vs precio en la venta) ---
-                    # PRIMARIO y honesto: lo que realmente ganamos/perdimos es
-                    # nuestra ENTRADA vs la SALIDA, no el PnL especulativo del
-                    # trader. El "PnL real del trader" por costos acumulados
-                    # (w_sol/accumulated) distorsiona (p.ej. -40% vs +96% real)
-                    # cuando el SOL de vuelta no se captura en la tx o cuando la
-                    # base de costo acumulada no cuadra con los tokens comprados.
-                    # En DRY_RUN ambas puntas se ejecutan a get_token_price, asi
-                    # que (current-entry)/entry ES el resultado real de la copia.
+                    # --- PnL REAL del TRADER (resultado de la senal) ---
+                    # HEADLINE segun decision del usuario: debe coincidir con el
+                    # resultado real del trader copiado (lo que se ve en el grupo,
+                    # p.ej. +96%). Costo: proporcional a lo vendido, con el costo
+                    # promedio del trader (avg_cost = w_sol/accumulated).
+                    # Proceeds: se PREFIERE el valor a precio de mercado
+                    # (sold_tok * current_price). El SOL "observado" en la tx
+                    # (sell_sol_raw) suele quedar SUB-CAPTURADO cuando el retorno
+                    # va por el programa del pool y Helius no lo expone: esa era
+                    # la fuente de los PnL -40% frente a +96% reales. Solo se usa
+                    # el observado si es plausible (>=50% del esperado).
                     pnl_pct = 0.0
-                    trader_pnl = 0.0
                     sell_proceeds = signal.sell_sol_raw if signal.sell_sol_raw > 0 else signal.amount_sol
                     sold_tok = signal.trade_token_amount if signal.trade_token_amount > 0 else 0.0
                     avg_cost = (w_sol / accumulated) if accumulated > 0 and w_sol > 0 else 0.0
+                    cost_of_sold = 0.0
+                    proceeds_used = 0.0
+                    observed_proceeds = 0.0
+                    expected_proceeds = 0.0
                     if avg_cost > 0 and sold_tok > 0 and tokens_before_sell > 0:
                         # costo proporcional de los tokens vendidos. NO inflamos con
                         # basis_ratio (empezamos a copiar tarde): eso exageraba el
                         # costo y daba PnL -98% falsos. Solo conocemos el costo de lo
                         # que trackeamos (w_sol/accumulated).
                         cost_of_sold = min(w_sol, avg_cost * sold_tok)
-                        if sell_proceeds > 0 and cost_of_sold > 0:
-                            trader_pnl = (sell_proceeds - cost_of_sold) / cost_of_sold * 100.0
-                            logger.info(
-                                "CopyTrading: PnL trader (diag) {:.2f}% | sell={:.6f} SOL vs costo vendido={:.6f} SOL ({} tk @ {:.10g}) {}",
-                                trader_pnl, sell_proceeds, cost_of_sold,
-                                f"{sold_tok:.6g}", avg_cost, signal.token_mint[:8] + "...",
-                            )
+                        if cost_of_sold > 0:
+                            if current_price > 0:
+                                expected_proceeds = sold_tok * current_price
+                            observed_proceeds = sell_proceeds
+                            if (
+                                observed_proceeds > 0
+                                and expected_proceeds > 0
+                                and observed_proceeds >= 0.5 * expected_proceeds
+                            ):
+                                proceeds_used = observed_proceeds
+                            elif expected_proceeds > 0:
+                                proceeds_used = expected_proceeds
+                                if observed_proceeds > 0:
+                                    logger.warning(
+                                        "CopyTrading: SOL de venta sub-capturado ({:.6f} < 50% de {:.6f}); PnL estimado por precio para {}",
+                                        observed_proceeds, expected_proceeds,
+                                        signal.token_mint[:12] + "...",
+                                    )
+                            else:
+                                proceeds_used = observed_proceeds
+                            if proceeds_used > 0:
+                                pnl_pct = (proceeds_used - cost_of_sold) / cost_of_sold * 100.0
+                                logger.info(
+                                    "CopyTrading: PnL trader {:.2f}% | proceeds={:.6f} SOL (obs={:.6f} exp={:.6f}) vs costo vendido={:.6f} SOL ({} tk @ {:.10g}) {}",
+                                    pnl_pct, proceeds_used, observed_proceeds,
+                                    expected_proceeds, cost_of_sold,
+                                    f"{sold_tok:.6g}", avg_cost, signal.token_mint[:8] + "...",
+                                )
                         # Reducir la base de costo en proporcion a lo vendido
                         self._wallet_mint_sol[wm_key] = max(0.0, w_sol - cost_of_sold)
 
-                    # Fallback entry desde compras acumuladas del trader si no tenemos entry
-                    if entry <= 0 and avg_cost > 0:
-                        entry = avg_cost
+                    # PnL de NUESTRA copia (info secundaria, solo log/notificacion)
+                    copy_pnl = None
+                    if entry > 0 and current_price > 0:
+                        copy_pnl = (current_price - entry) / entry * 100.0
                         logger.info(
-                            "PnL: entry_price calculado desde compras del trader = {:.10g} for {}",
-                            entry, signal.token_mint[:12] + "...",
+                            "CopyTrading: PnL copia {:.2f}% | entry={:.10g} current={:.10g} {}",
+                            copy_pnl, entry, current_price, signal.token_mint[:8] + "...",
                         )
 
-                    # PnL REPORTADO = nuestra copia por precio de mercado.
-                    if entry > 0 and current_price > 0:
-                        pnl_pct = (current_price - entry) / entry * 100.0
-                        logger.info(
-                            "CopyTrading: PnL NUESTRA copia {:.2f}% | entry={:.10g} current={:.10g} {}",
-                            pnl_pct, entry, current_price, signal.token_mint[:8] + "...",
-                        )
-                    elif trader_pnl != 0.0:
-                        # Sin entry/precio de la copia: usamos el PnL del trader
-                        pnl_pct = trader_pnl
-                        logger.debug(
-                            "PnL (fallback trader): {:.2f}% for {}",
-                            pnl_pct, signal.token_mint[:12] + "...",
-                        )
-                    elif current_price > 0 and entry <= 0:
-                        # Precio disponible sin entry: valor de tokens vs invertido
-                        si = _sol_invested()
-                        token_held = 0.0
-                        if position:
-                            token_held = getattr(position, "token_amount_ui", 0.0) or 0.0
-                        if token_held <= 0 and tracker_pos:
-                            token_held = getattr(tracker_pos, "token_amount_ui", 0.0) or 0.0
-                        if token_held > 0 and si > 0:
-                            current_value = token_held * current_price
-                            pnl_pct = (current_value - si) / si * 100
+                    # Fallback solo si no hubo dato del trader (sin costo trackeado):
+                    # precio de mercado vs entry
+                    if pnl_pct == 0.0:
+                        if entry <= 0 and avg_cost > 0:
+                            entry = avg_cost
                             logger.info(
-                                "PnL estimado (precio sin entry): valor={:.6f} vs invested={:.6f} => {:.2f}%",
-                                current_value, si, pnl_pct,
+                                "PnL: entry_price calculado desde compras del trader = {:.10g} for {}",
+                                entry, signal.token_mint[:12] + "...",
                             )
+                        if entry > 0 and current_price > 0:
+                            pnl_pct = (current_price - entry) / entry * 100.0
+                            logger.debug(
+                                "PnL (fallback precio): entry={:.10g} current={:.10g} => {:.2f}% for {}",
+                                entry, current_price, pnl_pct, signal.token_mint[:12] + "...",
+                            )
+                        elif current_price > 0 and entry <= 0:
+                            # Precio disponible sin entry: valor de tokens vs invertido
+                            si = _sol_invested()
+                            token_held = 0.0
+                            if position:
+                                token_held = getattr(position, "token_amount_ui", 0.0) or 0.0
+                            if token_held <= 0 and tracker_pos:
+                                token_held = getattr(tracker_pos, "token_amount_ui", 0.0) or 0.0
+                            if token_held > 0 and si > 0:
+                                current_value = token_held * current_price
+                                pnl_pct = (current_value - si) / si * 100
+                                logger.info(
+                                    "PnL estimado (precio sin entry): valor={:.6f} vs invested={:.6f} => {:.2f}%",
+                                    current_value, si, pnl_pct,
+                                )
 
                     # Clamp PnL: en spot trading la pérdida nunca puede ser peor que -100%
                     pnl_pct = max(-100.0, pnl_pct)
@@ -1868,6 +1896,7 @@ class CopyTradingStrategy(Strategy):
                         symbol=signal.token_symbol,
                         reason="COPY_TRADE_SELL",
                         pnl=pnl_pct,
+                        pnl_copy=copy_pnl,
                         sell_pct=pct,
                         trader=signal.trader_label,
                     )

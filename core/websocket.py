@@ -217,6 +217,7 @@ async def process_sell_and_notify(
     symbol: str = "N/A",
     reason: str = "",
     pnl: float = 0.0,
+    pnl_copy: Optional[float] = None,
     sell_pct: float = 100.0,
     trader: str = "",
 ) -> bool:
@@ -348,10 +349,13 @@ async def process_sell_and_notify(
     elif reason == "TRAILING_STOP":
         await notifier.send_trailing_stop(mint, pnl)
     else:
+        copy_txt = ""
+        if pnl_copy is not None:
+            copy_txt = f" | Copia {pnl_copy:+.2f}%"
         trader_txt = f" | Trader: {trader}" if trader else ""
         await notifier.send_status(
             f"Venta de {symbol} ({mint}) por {reason} "
-            f"({sell_pct:.0f}% | PnL {pnl:.2f}%){trader_txt}"
+            f"({sell_pct:.0f}% | PnL {pnl:.2f}%){copy_txt}{trader_txt}"
         )
     return True
 
