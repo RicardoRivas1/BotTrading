@@ -616,7 +616,12 @@ class CopyTradingStrategy(Strategy):
                 if owner in (DEX_PROGRAMS["PUMP_FUN"], DEX_PROGRAMS["PUMP_AMM"]):
                     is_pump_fun = True
 
-        # Calcular SOL enviado/recibido por el trader
+        # Calcular SOL enviado/recibido por el trader.
+        # IMPORTANTE: en swaps de DEX agregador (METEORA, Raydium, etc.) el SOL se
+        # mueve como TOKEN (mint=So111..., wrapped SOL) via SPL transfer y aparece
+        # en tokenTransfers, NO en nativeTransfers. El nativeTransfers y el
+        # nativeBalanceChange del trader solo reflejan fees/dust si el SOL salio
+        # del ATA del trader a traves del programa. Contamos AMBOS mecanismos.
         sol_spent = sum(
             nt.get("amount", 0) / 1e9
             for nt in native_transfers
@@ -626,6 +631,16 @@ class CopyTradingStrategy(Strategy):
             nt.get("amount", 0) / 1e9
             for nt in native_transfers
             if nt.get("toUserAccount") == trader
+        )
+        sol_spent += sum(
+            tt.get("tokenAmount", 0)
+            for tt in token_transfers
+            if tt.get("mint") == SOL_MINT and tt.get("fromUserAccount") == trader
+        )
+        sol_received += sum(
+            tt.get("tokenAmount", 0)
+            for tt in token_transfers
+            if tt.get("mint") == SOL_MINT and tt.get("toUserAccount") == trader
         )
 
         # Fallback: si no hay nativeTransfers del trader, usar accountData.nativeBalanceChange
@@ -1086,10 +1101,13 @@ class CopyTradingStrategy(Strategy):
             amount_sol = sol_received if sol_received > 0 else 0.0
 
         # Para buys: monto minimo realista (evita falsos positivos de fees/tiny transfers)
-        if action == "buy" and amount_sol < MIN_BUY_SOL:
+        min_tuple_sol = float(
+            getattr(self.config.copy_trading, "MIN_COPY_TRADE_SOL", MIN_BUY_SOL)
+        )
+        if action == "buy" and amount_sol < min_tuple_sol:
             logger.debug(
                 "CopyTrade ignorado: buy demasiado pequeno ({:.6f} < {:.6f} SOL) | {}",
-                amount_sol, MIN_BUY_SOL, signature[:16] + "...",
+                amount_sol, min_tuple_sol, signature[:16] + "...",
             )
             return None
 

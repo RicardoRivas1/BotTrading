@@ -261,6 +261,15 @@ class CopyTradingSettings(BaseSettings):
             "0 = sin limite (comportamiento antiguo)."
         ),
     )
+    MIN_COPY_TRADE_SOL: float = Field(
+        default=0.005,
+        ge=0.00001,
+        description=(
+            "Monto minimo (SOL) que el trader debe gastar/recibir en su trade "
+            "para que el bot lo copie. Bajalo (ej: 0.0001) si tu wallet hace "
+            "trades de polvo (compras de 0.0001-0.0003 SOL)."
+        ),
+    )
     COPY_TRADE_BUY_AMOUNT_SOL: float = Field(
         default=0.005,
         gt=0,
