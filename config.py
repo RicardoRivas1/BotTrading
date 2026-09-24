@@ -294,7 +294,7 @@ class CopyTradingSettings(BaseSettings):
         ),
     )
     COPY_TRADE_ORDER_BUFFER_SECONDS: float = Field(
-        default=1.0,
+        default=0.5,
         ge=0,
         description=(
             "Buffer (s) que reordena las txs por tiempo de bloque antes de "
@@ -302,7 +302,8 @@ class CopyTradingSettings(BaseSettings):
             "rapido, Helius puede entregar la VENTA antes que la COMPRA o en "
             "el mismo webhook desordenado; al procesar la venta sin tracking "
             "previo el bot la lee como COMPRA (doble compra). Con el buffer la "
-            "compra se procesa primero. 0 = deshabilitado (sin esperar)."
+            "compra se procesa primero. 0.5s equilibra orden vs latencia en "
+            "operaciones rapidas (0 = deshabilitado, sin esperar)."
         ),
     )
     COPY_TRADE_BUY_AMOUNT_SOL: float = Field(

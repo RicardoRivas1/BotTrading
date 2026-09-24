@@ -58,6 +58,7 @@ class CopyTradeSignal:
     amount_sol: float
     tx_signature: str
     timestamp: float = field(default_factory=time.time)
+    block_time: float = 0.0  # blockTime de Helius (para ordenar compra/venta stale)
     source: str = "helius_webhook"
     sell_pct: float = 0.0  # 0-100: percentage to sell (100 = full, 25 = quarter)
     trader_label: str = ""  # nombre del trader copiado (ej: cupsey)
@@ -120,7 +121,16 @@ class CopyTradingStrategy(Strategy):
         # ejecuta UNA sola vez (evita doble compra por reentregas, solape
         # RPC+webhook o sniper splitting de una compra en txs iguales).
         self._last_buy_key: dict[tuple[str, str], tuple[float, float]] = {}
+        # Ultima venta VISTA por (wallet, mint) y su blockTime. Cuando llega un
+        # BUY cuyo blockTime es <= al de la ultima venta vista, es una compra
+        # ESTANCADA (el comprador ya vendio ese token): abrir posicion ahi es
+        # la "compra de mas" que deja el bag sin vender. El buy se descarta
+        # hasta que llega una compra mas NUEVA que el sell (re-entry real).
+        self._last_sell_block: dict[tuple[str, str], float] = {}
         self._traded_mints: set[str] = set()  # mints que el bot ha comprado alguna vez
+        self._diag_path = str(
+            Path(__file__).resolve().parent.parent / "copy_trading_diag.jsonl"
+        )
         self._wallet_mint_tokens: dict[tuple[str, str], float] = {}  # (wallet,mint)->tokens acumulados (SUMA via BUY)
         self._wallet_mint_sol: dict[tuple[str, str], float] = {}  # (wallet,mint)->SOL invertido acumulado (sin cap)
         self._lock = asyncio.Lock()
@@ -427,7 +437,13 @@ class CopyTradingStrategy(Strategy):
                     payload = {
                         "jsonrpc": "2.0", "id": 1,
                         "method": "getSignaturesForAddress",
-                        "params": [addr, {"limit": 5}],
+                        # limit=100 (no 5): si el trader hace una RAFAGA de txs
+                        # rapidas (compra+venta en segundos, shards, bundlers),
+                        # con limit 5 el cursor `prev` saltaba las primeras de la
+                        # rafaga -> el poll veia SOLO la venta sin su compra y la
+                        # ignoraba ("no detecta / no vende"). Con 100 cubrimos
+                        # cualquier rafaga real de un trader en un ciclo de 30s.
+                        "params": [addr, {"limit": 100}],
                     }
                     async with session.post(rpc_url, json=payload) as resp:
                         if resp.status == 429:
@@ -633,6 +649,39 @@ class CopyTradingStrategy(Strategy):
             return False
         return abs(a - b) <= max(a, b) * tol
 
+    def _diag_log(self, kind: str, sig: str, note: str, tx: dict[str, Any]) -> None:
+        """Guarda en disco un rastro JSONL de cada decision (signal/drop/exec/ignore/error).
+
+        Con los datos crudos de Helius podremos diagnosticar el siguiente caso
+        real sin depender de los logs de Render. Archivo rotativo (~5 MB).
+        """
+        try:
+            entry = {
+                "ts": time.time(),
+                "kind": kind,
+                "sig": sig[:24] if sig else "",
+                "blockTime": tx.get("blockTime") or 0,
+                "feePayer": (tx.get("feePayer") or "")[:16],
+                "type": tx.get("type", ""),
+                "note": note[:400],
+                "tx": {
+                    "nativeTransfers": tx.get("nativeTransfers") or [],
+                    "tokenTransfers": tx.get("tokenTransfers") or [],
+                    "accountData": [
+                        {k: a.get(k) for k in ("account", "nativeBalanceChange", "tokenBalanceChanges")}
+                        for a in (tx.get("accountData") or [])
+                    ],
+                    "description": (tx.get("description") or "")[:200],
+                },
+            }
+            path = Path(self._diag_path)
+            if path.exists() and path.stat().st_size > 5 * 1024 * 1024:
+                path.unlink()
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     async def _process_transaction(self, tx: dict[str, Any]) -> None:
         """Parsea una transaccion Enhanced de Helius y detecta trades."""
         tx_type = tx.get("type", "")
@@ -711,15 +760,6 @@ class CopyTradingStrategy(Strategy):
                 return
             wallet_address = tracked.address
 
-        # Deduplicacion
-        if signature in self._recent_signals:
-            return
-        self._recent_signals[signature] = time.time()
-        cutoff = time.time() - 300
-        self._recent_signals = {
-            k: v for k, v in self._recent_signals.items() if v > cutoff
-        }
-
         self._inc_stat("trades_executed")
         logger.info(
             "CopyTrading: trade detectado de {} ({}) | type={} | sig={}",
@@ -730,9 +770,50 @@ class CopyTradingStrategy(Strategy):
         # ya actualizado por txs anteriores (mismo webhook o anteriores). Si no,
         # una venta concurrente ve trader_held=0 y se lee como compra.
         async with self._webhook_lock:
-            signal = self._parse_trade(tx, tracked, wallet_address=wallet_address)
-            if signal:
+            try:
+                signal = self._parse_trade(tx, tracked, wallet_address=wallet_address)
+            except Exception as exc:
+                # Un crash en el parse NO debe tumbar el batch: se loguea y se
+                # deja la firma sin registrar para que el proximo redelivery de
+                # Helius (o el RPC poll) la reintente.
+                logger.error(
+                    "CopyTrading: crash parseando tx {}: {}. Se reintentara.",
+                    signature[:16] + "...", exc,
+                )
+                self._diag_log("parse_error", signature, f"excepcion parse: {exc!r}", tx)
+                return
+
+            if not signal:
+                # Rastro diagnostico: había movimientos de tokens/SOL pero no se
+                # generó señal (posible trade perdido). Con esto podremos afinar
+                # el clasificador con el caso real.
+                if tx.get("tokenTransfers") or tx.get("nativeTransfers"):
+                    self._diag_log("drop", signature, "sin señal accionable", tx)
+                return
+
+            # Deduplicacion por firma SOLO tras un parse EXITOSO. Si el parse
+            # fallo, la firma NO queda registrada y el redelivery/poll puede
+            # reintentarla; antes se registraba pre-parse y una tx problematica
+            # se perdia para siempre (quedaba "vista" aunque nunca se ejecutara).
+            if signature in self._recent_signals:
+                return
+            self._recent_signals[signature] = time.time()
+            cutoff = time.time() - 300
+            self._recent_signals = {
+                k: v for k, v in self._recent_signals.items() if v > cutoff
+            }
+
+            self._diag_log("signal", signature, f"signal {signal.action} {signal.token_mint[:12]} {signal.amount_sol:.6f} SOL", tx)
+            try:
                 await self._execute_copy_trade(signal)
+            except Exception as exc:
+                # _execute_copy_trade ya captura sus errores; esto es solo la
+                # red de seguridad + rastro para el diagnostico.
+                logger.error(
+                    "CopyTrading: fallo ejecutando {} {}: {}",
+                    signal.action, signature[:16] + "...", exc,
+                )
+                self._diag_log("exec_error", signature, f"{signal.action} excepcion: {exc!r}", tx)
 
     def _parse_trade(self, tx: dict[str, Any], tracked: TrackedWallet, wallet_address: str = "") -> Optional[CopyTradeSignal]:
         """Extrae la senal de trading de una transaccion.
@@ -1017,61 +1098,30 @@ class CopyTradingStrategy(Strategy):
                     -trader_delta, signature[:16] + "...", token_mint[:12] + "...", sol_spent,
                 )
             else:
-                # Delta no disponible (fallback): usar sell_pct vs nuestra posicion
-                sell_pct = self._calc_sell_pct(token_mint, tokens_sent[0]["amount"], tracked.address)
-                # Si ya tenemos posicion del mint, siempre es venta aunque el % sea
-                # pequeno: los scalpers venden fracciones chicas varias veces.
-                have_pos = bool(
-                    self.executor.positions.get(token_mint)
-                    or self.tracker.positions.get(token_mint)
-                )
-                if have_pos:
-                    action = "sell"
-                    amount_sol = 0.0
+                # SIN tokenBalanceChanges (Helius las omite en pump.fun): el
+                # unico dato confiable es la DIRECCION DEL SOL. Con
+                # sol_spent > 0 y sol_received == 0 el trader PAGO SOL: es una
+                # COMPRA (inverted transfer de Helius: el token sale del trader).
+                # El que ya tengamos posicion (o que el trader acumule $MINT en
+                # buys DCA/shardeados) NO convierte la compra en venta: la
+                # heuristica "have_pos/trader_held => SELL" cerraba posiciones
+                # con buys repetidos del mismo token (phantom sell / doble
+                # compra). Una venta real con SOL de vuelta "invisible" cae en
+                # case2/case2c/case4, que SI ejecutan SELL cuando tenemos
+                # posicion.
+                if sol_spent >= MIN_BUY_SOL:
                     logger.info(
-                        "CopyTrading: SELL (dex program, posicion) {} | tokens_sent={} | SOL_out={:.6f} | sell_pct={:.0f}%",
-                        signature[:16] + "...", token_mint[:12] + "...", sol_spent, max(sell_pct, 1.0),
+                        "CopyTrade: pump.fun buy (inverted transfer, SOL pagado, deltas ausentes) {} | tokens_sent would-be {} | SOL_spent={:.6f}",
+                        signature[:16] + "...", token_mint[:12] + "...", sol_spent,
                     )
-                elif sell_pct < 5.0:
-                    # La señal mas fuerte para venta: el trader ya tenia tokens de
-                    # ese mint (buys previos trackeados en _wallet_mint_tokens). Si
-                    # ademas hay tokens_sent, es una REDUCCION de posicion (venta),
-                    # aunque sol_spent >= 0.005 por un priority fee de la venta
-                    # (fees de pump/axiom van al programa, no a nativeTransfers).
-                    # El "inverted transfer buy" de Helius (token en tokens_sent)
-                    # SOLO aplica cuando el trader NO acumulo nada de ese mint
-                    # (compra inicial / primera vez que lo vemos comprar).
-                    trader_held = self._wallet_mint_tokens.get(
-                        (tracked.address, token_mint), 0.0
-                    )
-                    if trader_held > 0:
-                        action = "sell"
-                        amount_sol = 0.0
-                        logger.info(
-                            "CopyTrading: SELL (inverted transfer, trader tenia {} tk acumulados, SOL_spent={:.6f}) {} | tokens_sent={} | mint={}",
-                            f"{trader_held:.6g}", sol_spent, signature[:16] + "...",
-                            f"{tokens_sent[0]['amount']:.6g}", token_mint[:12] + "...",
-                        )
-                    elif sol_spent >= MIN_BUY_SOL:
-                        logger.info(
-                            "CopyTrade: pump.fun buy (Helius inverted transfer) {} | tokens_sent would-be {} | SOL_spent={:.6f}",
-                            signature[:16] + "...", token_mint[:12] + "...", sol_spent,
-                        )
-                        action = "buy"
-                        amount_sol = sol_spent
-                    else:
-                        logger.debug(
-                            "CopyTrade ignorado: small token transfer ({:.1f}%) {} | {}",
-                            sell_pct, signature[:16] + "...", token_mint[:12] + "...",
-                        )
-                        return None
+                    action = "buy"
+                    amount_sol = sol_spent
                 else:
-                    action = "sell"
-                    amount_sol = 0.0
-                    logger.info(
-                        "CopyTrading: SELL (dex program) {} | tokens_sent={} | SOL_out={:.6f} | sell_pct={:.0f}%",
-                        signature[:16] + "...", token_mint[:12] + "...", sol_spent, sell_pct,
+                    logger.debug(
+                        "CopyTrade ignorado: transferencia chica sin deltas ni SOL ({:.6f}) {} | {}",
+                        sol_spent, signature[:16] + "...", token_mint[:12] + "...",
                     )
+                    return None
 
         # Caso 2c: Envia tokens sin SOL = possible DEX sell (SOL via program) or wallet transfer
         elif tokens_sent and sol_spent == 0 and sol_received == 0:
@@ -1215,21 +1265,45 @@ class CopyTradingStrategy(Strategy):
             )
             return None
 
-        # REGLA: una venta solo es real si el trader RECIBIO SOL de vuelta
-        # (nativeTransfers o nativeBalanceChange > 0). Los movimientos/redistribuciones
-        # de tokens sin retorno SOL (dust constante 0.001575/0.002039 = alquiler ATA,
-        # fees) NO son ventas: copiarlas fabrica PnL 0.00%/-99% y ventas fantasma.
-        # Se ignoran del todo (ni ejecución ni stats).
+        # REGLA: una venta solo es real si el trader RECIBIO SOL de vuelta o hay
+        # EVIDENCIA FIRME de que tenia el token.
+        # - El SOL de vuelta sale de nativeTransfers o nativeBalanceChange > 0.
+        # - El "movimiento de tokens sin SOL" (dust 0.001575/0.002039 = alquiler
+        #   ATA, fees) NO es venta: copiarlo fabrica ventas fantasma.
+        # - PERO en rutas DEX/agregadores el SOL de vuelta NO siempre aparece
+        #   (missing accountData / SOL via programa sin nativeBalanceChange) y
+        #   descartar la venta dejaba la posicion del bot abierta para siempre
+        #   ("no vende cuando debe"). Si el mint es una posicion que NOSOTROS
+        #   tenemos, o el trader acumulo ese mint (confirmado por _wallet_mint_tokens),
+        #   la venta se ejecuta SIEMPRE; amount_sol=0 (PnL por precio si no hay
+        #   proceeds). Solo se ignoran las ventas sin SOL y sin evidencia previa.
         if action == "sell" and sol_received <= 0:
-            logger.debug(
-                "CopyTrading: SELL sin SOL de vuelta al trader se IGNORA "
-                "(movimiento/redistribucion de tokens, no venta) {} | mint={} | "
-                "tokens_sent={} | sol_spent={:.6f} | sol_received={:.6f}",
-                signature[:16] + "...", token_mint[:12] + "...",
-                f"{tokens_sent[0]['amount']:.6g}" if tokens_sent else 0,
-                sol_spent, sol_received,
+            held_by_us = bool(
+                self.executor.positions.get(token_mint)
+                or self.tracker.positions.get(token_mint)
             )
-            return None
+            trader_accumulated = self._wallet_mint_tokens.get(
+                (tracked.address, token_mint), 0.0
+            )
+            has_direct_evidence = (
+                held_by_us or trader_accumulated > 0
+            )
+            if not has_direct_evidence:
+                logger.debug(
+                    "CopyTrading: SELL sin SOL de vuelta al trader se IGNORA "
+                    "(movimiento/redistribucion de tokens, sin posicion ni tracking) {} | mint={} | "
+                    "tokens_sent={} | sol_spent={:.6f} | sol_received={:.6f}",
+                    signature[:16] + "...", token_mint[:12] + "...",
+                    f"{tokens_sent[0]['amount']:.6g}" if tokens_sent else 0,
+                    sol_spent, sol_received,
+                )
+                return None
+            logger.info(
+                "CopyTrading: SELL sin SOL detectable pero con evidencia (posicion={}, trader_acumulado={:.4g}) {} | mint={} | tokens_sent={}",
+                held_by_us, trader_accumulated, signature[:16] + "...",
+                token_mint[:12] + "...",
+                f"{tokens_sent[0]['amount']:.6g}" if tokens_sent else 0,
+            )
 
         # Filtrar transfers de SOL minimos (fees de red) - solo para buys
         if action == "buy" and amount_sol < 0.0001:
@@ -1305,6 +1379,7 @@ class CopyTradingStrategy(Strategy):
             amount_sol=amount_sol,
             tx_signature=signature,
             timestamp=float(timestamp) if timestamp else time.time(),
+            block_time=float(tx.get("blockTime") or 0),
             source=f"helius:{tracked.label}:{source_label}",
             sell_pct=sell_pct,
             trader_label=tracked.label,
@@ -1319,14 +1394,36 @@ class CopyTradingStrategy(Strategy):
 
         async with self._lock:
             try:
-                # Marcar la signature como EJECUTADA de forma PERSISTENTE:
-                # Helius reentrega mismo webhook no ACKeado y el RPC poll
-                # redispara la tx; tras un reinicio el dedup en memoria se
-                # pierde. Sin esto, la misma compra se re-ejecuta -> doble
-                # compra. Grabado a disco antes de ejecutar la orden.
-                self._mark_executed(signal.tx_signature or "")
+                # BUY: marcar la firma como EJECUTADA (persistente) ANTES de la
+                # orden -> la misma compra nunca se re-ejecuta (doble compra por
+                # redelivery de Helius / RPC poll / restart).
+                # SELL: NO se marca antes: si la venta FALLA (error RPC/slippage),
+                # debe poder reintentarse en el proximo redelivery/poll. Se marca
+                # al final, solo si la venta fue exitosa.
+                is_sell = signal.action == "sell"
+                if not is_sell:
+                    self._mark_executed(signal.tx_signature or "")
 
                 if signal.action == "buy":
+                    # Compra ESTANCADA: si ya vimos una VENTA de este (wallet,
+                    # mint) con blockTime >= al de esta compra, el trader primero
+                    # vendio (o compro-y-vendio rapidisimo) y esta compra es un
+                    # evento viejo que llego tarde. Abrir posicion ahi = "compra
+                    # de mas" + un bag que ya se vendio y nunca se cierra.
+                    sell_block = self._last_sell_block.get(
+                        (signal.wallet, signal.token_mint)
+                    )
+                    if sell_block is not None and (
+                        signal.block_time <= sell_block
+                    ):
+                        logger.info(
+                            "CopyTrading: BUY ESTANCADO ignorado {} ({}) | mint={} | buy_block={} <= ultima venta vista {}",
+                            signal.trader_label or signal.source, signal.wallet[:8] + "...",
+                            signal.token_mint[:8] + "...",
+                            int(signal.block_time), int(sell_block),
+                        )
+                        return
+
                     # Coalesce de la MISMA compra: si ya ejecutamos un buy del
                     # mismo (wallet, mint) con un monto similar en la ventana
                     # COPY_TRADE_BUY_DEDUP_SECONDS, este evento es un duplicado
@@ -1462,6 +1559,16 @@ class CopyTradingStrategy(Strategy):
                         self.executor.buy_amount_sol = original_amount
 
                     if sig is None:
+                        # Compra fallida (sin liquidez): QUITAR el dedup para que
+                        # el redelivery/poll la REINTENTE cuando haya liquidez.
+                        # No puede duplicar: la compra no se ejecuto.
+                        if signal.tx_signature:
+                            self._recent_signals.pop(signal.tx_signature, None)
+                            self._executed_signatures.pop(signal.tx_signature, None)
+                        logger.info(
+                            "CopyTrading: BUY {} sin liquidez, se reintentara en el proximo redelivery",
+                            signal.token_mint[:8] + "...",
+                        )
                         return
 
                     self._traded_mints.add(signal.token_mint)
@@ -1517,6 +1624,19 @@ class CopyTradingStrategy(Strategy):
                         logger.info(
                             "CopyTrading: SELL ignorado {} ({}) - posicion no encontrada: {}",
                             signal.source, signal.token_mint[:8] + "...", motivo,
+                        )
+                        # Aunque no podamos vender, ANOTAMOS que el trader vendio
+                        # este token en este bloque: cualquier BUY con blockTime
+                        # <= a este sera una compra ESTANCADA y no debe abrir
+                        # posicion (el trader ya salio). Evita la compra fantasma
+                        # cuando la venta llega antes que su compra.
+                        self._last_sell_block[(signal.wallet, signal.token_mint)] = (
+                            max(
+                                self._last_sell_block.get(
+                                    (signal.wallet, signal.token_mint), 0.0
+                                ),
+                                signal.block_time,
+                            )
                         )
                         return
 
@@ -1751,6 +1871,16 @@ class CopyTradingStrategy(Strategy):
                         # ENTRADA nueva (re-entry), no un duplicado, y debe
                         # ejecutarse. Evita que un sell+rebuy rapido se coma.
                         self._last_buy_key.pop((signal.wallet, signal.token_mint), None)
+                        # Anotar la venta (con su bloque) para descartar compras
+                        # ESTANCADAS de ese token que lleguen tarde.
+                        self._last_sell_block[(signal.wallet, signal.token_mint)] = (
+                            max(
+                                self._last_sell_block.get(
+                                    (signal.wallet, signal.token_mint), 0.0
+                                ),
+                                signal.block_time,
+                            )
+                        )
                     else:
                         if position:
                             position.sol_invested = max(0.0, getattr(position, "sol_invested", 0.0) - _sol_portion_invested)
@@ -1780,11 +1910,30 @@ class CopyTradingStrategy(Strategy):
                         signal.trader_label or signal.source, signal.wallet[:8] + "...",
                         signal.token_mint[:8] + "...", pnl_pct, pct,
                     )
+                    # Venta EXITOSA: recien ahora marcar como ejecutada (persistente)
+                    # para que los redeliveries/poll tras un restart no la repitan.
+                    self._mark_executed(signal.tx_signature or "")
 
             except Exception as exc:
                 self._inc_stat("trades_failed")
                 logger.error("CopyTrading: error ejecutando copy trade: {}", exc)
                 self._notify(self.notifier.send_error(f"Copy trade fallido ({signal.source}): {exc}"))
+                # RETRY de trades FALLIDOS: si la orden fallo (RPC, slippage,
+                # sin liquidez), QUITAMOS la firma del dedup en memoria (y del
+                # persistente en buys, que se pre-marca) para que el proximo
+                # redelivery de Helius o el RPC poll la reintente. Antes quedaba
+                # "vista" y la posicion se quedaba abierta sin vender / el buy
+                # se perdia para siempre.
+                if signal.tx_signature:
+                    self._recent_signals.pop(signal.tx_signature, None)
+                    if signal.action == "buy":
+                        self._executed_signatures.pop(signal.tx_signature, None)
+                    self._diag_log(
+                        "trade_retry",
+                        signal.tx_signature,
+                        f"{signal.action} fallido, se reintentara: {exc!r}",
+                        {},
+                    )
 
     # ----------------------------------------------------------- Helius webhook setup
     async def setup_helius_webhook(self, webhook_url: str) -> Optional[str]:
