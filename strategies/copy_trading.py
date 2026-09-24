@@ -1472,7 +1472,11 @@ class CopyTradingStrategy(Strategy):
                             acc_before + signal.trade_token_amount
                         )
                     sol_before = self._wallet_mint_sol.get(wt_key, 0.0)
-                    if signal.buy_sol_raw > 0:
+                    # Creditar SOL SOLO si tambien se trackearon los tokens que
+                    # esa compra otorga. Si no, la base de costo crece sin
+                    # denominador (tokens) y el avg_cost se infla => PnL de
+                    # ventas falsamente negativo (p.ej. -40% cuando fue +96%).
+                    if signal.buy_sol_raw > 0 and signal.trade_token_amount > 0:
                         self._wallet_mint_sol[wt_key] = sol_before + signal.buy_sol_raw
 
                     # Re-compra del MISMO token mientras ya tenemos posicion abierta:
@@ -1756,15 +1760,17 @@ class CopyTradingStrategy(Strategy):
                             signal.token_mint[:12] + "...",
                         )
 
-                    # --- PnL REAL del trader (resultado de ESTA venta) ---
-                    # costo promedio por token = costo_total_acumulado / tokens. Se usa
-                    # la cantidad REAL vendida en esta tx; el costo se reduce en
-                    # proporcion a lo vendido para que las ventas parciales
-                    # subsiguientes NO inflen ni el % ni el PnL (el bug de los
-                    # -97%/-99% falsos: solo se re-sincronizaban los tokens, nunca
-                    # el costo, y el PnL se media contra nuestro entry, que difiere
-                    # del costo real del trader).
+                    # --- PnL de NUESTRA copia (entry vs precio en la venta) ---
+                    # PRIMARIO y honesto: lo que realmente ganamos/perdimos es
+                    # nuestra ENTRADA vs la SALIDA, no el PnL especulativo del
+                    # trader. El "PnL real del trader" por costos acumulados
+                    # (w_sol/accumulated) distorsiona (p.ej. -40% vs +96% real)
+                    # cuando el SOL de vuelta no se captura en la tx o cuando la
+                    # base de costo acumulada no cuadra con los tokens comprados.
+                    # En DRY_RUN ambas puntas se ejecutan a get_token_price, asi
+                    # que (current-entry)/entry ES el resultado real de la copia.
                     pnl_pct = 0.0
+                    trader_pnl = 0.0
                     sell_proceeds = signal.sell_sol_raw if signal.sell_sol_raw > 0 else signal.amount_sol
                     sold_tok = signal.trade_token_amount if signal.trade_token_amount > 0 else 0.0
                     avg_cost = (w_sol / accumulated) if accumulated > 0 and w_sol > 0 else 0.0
@@ -1775,10 +1781,10 @@ class CopyTradingStrategy(Strategy):
                         # que trackeamos (w_sol/accumulated).
                         cost_of_sold = min(w_sol, avg_cost * sold_tok)
                         if sell_proceeds > 0 and cost_of_sold > 0:
-                            pnl_pct = (sell_proceeds - cost_of_sold) / cost_of_sold * 100.0
+                            trader_pnl = (sell_proceeds - cost_of_sold) / cost_of_sold * 100.0
                             logger.info(
-                                "CopyTrading: PnL REAL trader {:.2f}% | sell={:.6f} SOL vs costo vendido={:.6f} SOL ({} tk @ {:.10g}) {}",
-                                pnl_pct, sell_proceeds, cost_of_sold,
+                                "CopyTrading: PnL trader (diag) {:.2f}% | sell={:.6f} SOL vs costo vendido={:.6f} SOL ({} tk @ {:.10g}) {}",
+                                trader_pnl, sell_proceeds, cost_of_sold,
                                 f"{sold_tok:.6g}", avg_cost, signal.token_mint[:8] + "...",
                             )
                         # Reducir la base de costo en proporcion a lo vendido
@@ -1792,31 +1798,35 @@ class CopyTradingStrategy(Strategy):
                             entry, signal.token_mint[:12] + "...",
                         )
 
-                    # Fallback de PnL si no hubo costo/venta medible: precio de
-                    # mercado vs entry (nuestro copy). Es lo que antes se usaba y
-                    # NO coincide con el resultado real del trader (el 99% falso).
-                    if pnl_pct == 0.0:
-                        if entry > 0 and current_price > 0:
-                            pnl_pct = (current_price - entry) / entry * 100
-                            logger.debug(
-                                "PnL (fallback precio): entry={:.10g} current={:.10g} => {:.2f}% for {}",
-                                entry, current_price, pnl_pct, signal.token_mint[:12] + "...",
+                    # PnL REPORTADO = nuestra copia por precio de mercado.
+                    if entry > 0 and current_price > 0:
+                        pnl_pct = (current_price - entry) / entry * 100.0
+                        logger.info(
+                            "CopyTrading: PnL NUESTRA copia {:.2f}% | entry={:.10g} current={:.10g} {}",
+                            pnl_pct, entry, current_price, signal.token_mint[:8] + "...",
+                        )
+                    elif trader_pnl != 0.0:
+                        # Sin entry/precio de la copia: usamos el PnL del trader
+                        pnl_pct = trader_pnl
+                        logger.debug(
+                            "PnL (fallback trader): {:.2f}% for {}",
+                            pnl_pct, signal.token_mint[:12] + "...",
+                        )
+                    elif current_price > 0 and entry <= 0:
+                        # Precio disponible sin entry: valor de tokens vs invertido
+                        si = _sol_invested()
+                        token_held = 0.0
+                        if position:
+                            token_held = getattr(position, "token_amount_ui", 0.0) or 0.0
+                        if token_held <= 0 and tracker_pos:
+                            token_held = getattr(tracker_pos, "token_amount_ui", 0.0) or 0.0
+                        if token_held > 0 and si > 0:
+                            current_value = token_held * current_price
+                            pnl_pct = (current_value - si) / si * 100
+                            logger.info(
+                                "PnL estimado (precio sin entry): valor={:.6f} vs invested={:.6f} => {:.2f}%",
+                                current_value, si, pnl_pct,
                             )
-                        elif current_price > 0 and entry <= 0:
-                            # Precio disponible sin entry: valor de tokens vs invertido
-                            si = _sol_invested()
-                            token_held = 0.0
-                            if position:
-                                token_held = getattr(position, "token_amount_ui", 0.0) or 0.0
-                            if token_held <= 0 and tracker_pos:
-                                token_held = getattr(tracker_pos, "token_amount_ui", 0.0) or 0.0
-                            if token_held > 0 and si > 0:
-                                current_value = token_held * current_price
-                                pnl_pct = (current_value - si) / si * 100
-                                logger.info(
-                                    "PnL estimado (precio sin entry): valor={:.6f} vs invested={:.6f} => {:.2f}%",
-                                    current_value, si, pnl_pct,
-                                )
 
                     # Clamp PnL: en spot trading la pérdida nunca puede ser peor que -100%
                     pnl_pct = max(-100.0, pnl_pct)
