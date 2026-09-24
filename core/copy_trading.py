@@ -486,8 +486,11 @@ class CopyTrader:
                 async with session.get(list_url) as resp:
                     if resp.status == 200:
                         existing = await resp.json()
+                        base_origin = webhook_url.rstrip("/") + "/"
                         for wh in existing:
-                            if wh.get("webhookURL", "").endswith(self.webhook_path):
+                            wh_url = wh.get("webhookURL", "")
+                            wh_id = wh.get("webhookID")
+                            if wh_url.endswith(self.webhook_path):
                                 # Actualizar webhook existente
                                 wh_id = wh.get("webhookID")
                                 update_url = f"https://api.helius.xyz/v0/webhooks/{wh_id}?api-key={helius_api_key}"
@@ -501,6 +504,16 @@ class CopyTrader:
                                     else:
                                         error = await update_resp.text()
                                         logger.error("Error actualizando webhook: {}", error)
+                            elif wh_id and wh_url.startswith(base_origin):
+                                # Solo borrar webhooks viejos del MISMO bot (mismo
+                                # origen); nunca los de otro bot que comparta la API key.
+                                try:
+                                    del_url = f"https://api.helius.xyz/v0/webhooks/{wh_id}?api-key={helius_api_key}"
+                                    async with session.delete(del_url) as del_resp:
+                                        if del_resp.status == 200:
+                                            logger.info(" Helius webhook viejo eliminado: {}", wh_id)
+                                except Exception:
+                                    pass
 
                 # Crear nuevo webhook
                 create_url = f"https://api.helius.xyz/v0/webhooks?api-key={helius_api_key}"

@@ -38,7 +38,7 @@ async def start_health_server(engine: StrategyEngine) -> None:
 
     Endpoints:
     - GET /: Health check
-    - POST /webhook/copy-trading: Webhook de Helius para copy trading
+    - POST {copy_strategy.webhook_path}: Webhook de Helius para copy trading
     - GET /stats: Estadisticas del engine y todas las estrategias
     """
     app = web.Application()
@@ -76,8 +76,16 @@ async def start_health_server(engine: StrategyEngine) -> None:
         return web.json_response(engine_stats)
 
     app.router.add_get("/", health_handler)
-    app.router.add_post("/webhook/copy-trading", copy_trade_webhook)
     app.router.add_get("/stats", stats_handler)
+
+    # Registrar el webhook de copy trading en el path configurado
+    # (COPY_TRADE_WEBHOOK_PATH permite correr varios bots con el MISMO
+    # HELIUS_API_KEY sin que sus webhooks se pisen).
+    for strategy in engine.strategies.values():
+        if isinstance(strategy, CopyTradingStrategy):
+            app.router.add_post(strategy.webhook_path, copy_trade_webhook)
+            logger.info("Webhook HTTP registrado en {}", strategy.webhook_path)
+            break
 
     runner = web.AppRunner(app)
     await runner.setup()

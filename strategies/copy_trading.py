@@ -106,7 +106,12 @@ class CopyTradingStrategy(Strategy):
         # clasifica como COMPRA (el famoso "compro la venta"). Distinto de
         # self._lock (protege solo la ejecucion): este protege parse+execute.
         self._webhook_lock = asyncio.Lock()
-        self.webhook_path = "/webhook/copy-trading"
+        # Path configurable: permite correr DOS bots con el MISMO HELIUS_API_KEY
+        # usando un path distinto por bot (COPY_TRADE_WEBHOOK_PATH).
+        self.webhook_path = (
+            getattr(self.config.copy_trading, "COPY_TRADE_WEBHOOK_PATH", "")
+            or "/webhook/copy-trading"
+        )
         self._load_wallets()
 
     def _notify(self, coro: Any) -> None:
@@ -1576,6 +1581,7 @@ class CopyTradingStrategy(Strategy):
                 async with session.get(list_url) as resp:
                     if resp.status == 200:
                         existing = await resp.json()
+                        base_origin = webhook_url.rstrip("/") + "/"
                         for wh in existing:
                             wh_url = wh.get("webhookURL", "")
                             wh_id = wh.get("webhookID")
@@ -1586,8 +1592,11 @@ class CopyTradingStrategy(Strategy):
                                     if update_resp.status == 200:
                                         logger.success("Helius webhook actualizado: {}", wh_id)
                                         return wh_id
-                            elif wh_id:
-                                # Delete stale/other webhooks to free up slots
+                            elif wh_id and wh_url.startswith(base_origin):
+                                # Solo borrar webhooks VIEJOS del MISMO bot (mismo
+                                # origen, p.ej. de un deploy previo con otro path).
+                                # Nunca webhooks de OTRO bot que comparta la API key
+                                # (tiene origin distinto).
                                 try:
                                     del_url = f"https://api.helius.xyz/v0/webhooks/{wh_id}?api-key={helius_api_key}"
                                     async with session.delete(del_url) as del_resp:

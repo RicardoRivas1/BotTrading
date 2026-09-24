@@ -275,6 +275,15 @@ class CopyTradingSettings(BaseSettings):
             "trader pero nunca supera este % del balance real (0 = deshabilitado)."
         ),
     )
+    COPY_TRADE_WEBHOOK_PATH: str = Field(
+        default="/webhook/copy-trading",
+        description=(
+            "Path del webhook de Helius para copy trading. Si corres DOS bots "
+            "con el MISMO HELIUS_API_KEY, usa paths distintos en cada uno "
+            "(ej: /webhook/copy-trading y /webhook/copy-trading-propio) para "
+            "que cada bot gestione su propio webhook sin pisarse."
+        ),
+    )
     AUTO_SETUP_WEBHOOK: bool = Field(
         default=True,
         description="Crear webhook de Helius automaticamente al iniciar",
