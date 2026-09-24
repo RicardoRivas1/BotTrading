@@ -425,6 +425,16 @@ class CopyTradingStrategy(Strategy):
 
                     consecutive_429 = 0
 
+                    # Helius devuelve http 200 con error JSON cuando la api-key
+                    # es invalida o el plan no cubre el endpoint. Detectarlo y
+                    # avisarlo en vez de quedarse en silencio.
+                    if isinstance(data, dict) and data.get("error"):
+                        logger.warning(
+                            "CopyTrading: RPC poll error para {}: {}",
+                            addr[:8] + "...", data.get("error"),
+                        )
+                        continue
+
                     sigs = data.get("result", [])
                     if not sigs:
                         continue
@@ -456,7 +466,10 @@ class CopyTradingStrategy(Strategy):
                         await self._process_transaction(tx)
 
                 except Exception as exc:
-                    logger.debug("CopyTrading: poll error para {}: {}", addr[:8], exc)
+                    logger.warning(
+                        "CopyTrading: RPC poll fallo para {}: {}",
+                        addr[:8] + "...", exc,
+                    )
 
         if disabled:
             logger.info("CopyTrading: operando solo via webhooks (RPC polling deshabilitado)")
