@@ -634,14 +634,20 @@ class CopyTradingStrategy(Strategy):
         # (0.001575/0.002039 = alquiler ATA / fees constantes, NO proceeds reales).
         # En ventas por programa el trader RECIBE SOL via programa; el unico
         # reflejo fiel es nativeBalanceChange > 0.
-        if sol_received == 0 or sol_spent == 0:
+        # NOTA: usar un UMBRAL de polvo (no == 0): muchas compras de DEX salen
+        # por el contrato del pool y nativeTransfers solo muestra fees/dust
+        # (0.0001-0.0015). El SOL real gastado/recibido esta en el cambio de
+        # balance del trader y siempre es MAYOR que el dust.
+        if sol_received < MIN_BUY_SOL or sol_spent < MIN_BUY_SOL:
             for acct in account_data:
                 if acct.get("account") != trader:
                     continue
                 nbc = acct.get("nativeBalanceChange", 0) / 1e9
-                if nbc > 0 and sol_received == 0:
+                if nbc > 0 and sol_received < nbc:
+                    # SELL: el SOL real recibido via programa es mayor que el dust
                     sol_received = nbc
-                elif nbc < 0 and sol_spent == 0:
+                elif nbc < 0 and sol_spent < abs(nbc):
+                    # BUY: el SOL real gastado via programa es mayor que el dust
                     sol_spent = abs(nbc)
                 break
 
