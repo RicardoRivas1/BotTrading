@@ -9,3 +9,5 @@ venv/
 exec_positions.json
 open_positions.json
 trade_stats.json
+copy_trading_recent_sigs.json
+htmlcov/

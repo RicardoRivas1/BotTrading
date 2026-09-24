@@ -12,10 +12,12 @@ Soporta:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -95,6 +97,29 @@ class CopyTradingStrategy(Strategy):
         # evento varias veces cuando la respuesta no se ACKa rápido). Clave:
         # signature + blockTime. Evita reprocesar N veces la misma tx.
         self._recent_webhook_txs: dict[str, float] = {}
+        # Dedup PERSISTENTE de txs YA EJECUTADAS: sobrevive reinicios. Un
+        # reinicio vacía _recent_signals, y Helius reentrega los webhooks no
+        # ACKeados de los últimos minutos: sin esta barrera la misma compra se
+        # vuelve a ejecutar (doble compra tras restart). Se persiste a disco.
+        self._executed_signatures: dict[str, float] = {}
+        self._signatures_file = str(
+            Path(__file__).resolve().parent.parent / "copy_trading_recent_sigs.json"
+        )
+        self._load_executed_signatures()
+        # Buffer de reordenamiento por blockTime: cuando el trader compra y
+        # vende en el mismo bloque (o muy rápido), Helius puede entregar la
+        # VENTA antes que la COMPRA. Procesar la venta sin tracking previo la
+        # clasifica como COMPRA (el famoso "compro la venta" -> doble compra).
+        # Retener las txs esta fracción de segundos y procesarlas en orden
+        # ascendente de bloque garantiza que el BUY actualice el tracking
+        # antes de que se parsee su SELL.
+        self._pending_txs: dict[int, list[dict[str, Any]]] = {}
+        # Coalesce de buys duplicados de la MISMA compra: (wallet, mint) ->
+        # (ultimo_time, ultimo_monto). Si el mismo trader compra el mismo token
+        # con un monto similar en la ventana COPY_TRADE_BUY_DEDUP_SECONDS, se
+        # ejecuta UNA sola vez (evita doble compra por reentregas, solape
+        # RPC+webhook o sniper splitting de una compra en txs iguales).
+        self._last_buy_key: dict[tuple[str, str], tuple[float, float]] = {}
         self._traded_mints: set[str] = set()  # mints que el bot ha comprado alguna vez
         self._wallet_mint_tokens: dict[tuple[str, str], float] = {}  # (wallet,mint)->tokens acumulados (SUMA via BUY)
         self._wallet_mint_sol: dict[tuple[str, str], float] = {}  # (wallet,mint)->SOL invertido acumulado (sin cap)
@@ -347,6 +372,7 @@ class CopyTradingStrategy(Strategy):
         self._set_state(StrategyState.RUNNING)
         logger.info("CopyTrading: estrategia iniciada ({} wallets)", len(self.wallets))
         asyncio.create_task(self._rpc_poll_loop())
+        asyncio.create_task(self._flush_pending_loop())
 
     async def _rpc_poll_loop(self) -> None:
         """Poll wallets via getSignaturesForAddress to detect trades.
@@ -462,8 +488,11 @@ class CopyTradingStrategy(Strategy):
                             continue
                         enhanced_txs = await resp.json()
 
-                    for tx in enhanced_txs:
-                        await self._process_transaction(tx)
+                    for tx in sorted(
+                        enhanced_txs,
+                        key=lambda t: (t.get("blockTime") or 0, t.get("timestamp") or 0),
+                    ):
+                        await self._feed_transaction(tx)
 
                 except Exception as exc:
                     logger.warning(
@@ -491,12 +520,118 @@ class CopyTradingStrategy(Strategy):
 
         try:
             transactions = payload if isinstance(payload, list) else [payload]
+            # Reordenar por blockTime: Helius puede entregar las txs del lote
+            # desordenadas (la VENTA del trader aparece antes que su COMPRA).
+            transactions.sort(
+                key=lambda t: (t.get("blockTime") or 0, t.get("timestamp") or 0)
+            )
             for tx in transactions:
-                await self._process_transaction(tx)
+                await self._feed_transaction(tx)
             return {"status": "ok", "processed": str(len(transactions))}
         except Exception as exc:
             logger.error("CopyTrading: error procesando webhook: {}", exc)
             return {"status": "error", "message": str(exc)}
+
+    # ----------------------------------------------- Pipeline con reorden por tiempo
+    async def _feed_transaction(self, tx: dict[str, Any]) -> None:
+        """Punto unico de entrada para txs (webhook + RPC poll).
+
+        Corta duplicados ya ejecutados/ya vistos y mete la tx en el buffer de
+        reordenamiento por blockTime. Procesar la VENTA del trader ANTES que su
+        COMPRA (entregas desordenadas de Helius o mismo bloque) la clasifica
+        como compra -> "doble compra". El buffer flushea las txs en el mismo
+        orden de bloque en que el trader las ejecuto.
+        """
+        signature = tx.get("signature", "")
+        if signature and signature in self._executed_signatures:
+            return
+        if signature and signature in self._recent_signals:
+            return
+
+        block = tx.get("blockTime") or 0
+        window = float(
+            getattr(self.config.copy_trading, "COPY_TRADE_ORDER_BUFFER_SECONDS", 1.0)
+        )
+        if window > 0 and block:
+            try:
+                self._pending_txs.setdefault(int(block), []).append(tx)
+            except (TypeError, ValueError):
+                await self._process_transaction(tx)
+                return
+            await self._drain_pending(window=window)
+        else:
+            await self._process_transaction(tx)
+
+    async def _drain_pending(self, window: float) -> None:
+        """Procesa en orden ascendente de bloque las txs ya vencidas del buffer."""
+        if not self._pending_txs:
+            return
+        now = time.time()
+        due = sorted(b for b in self._pending_txs if b <= now - window)
+        for block in due:
+            txs = self._pending_txs.pop(block, None)
+            if not txs:
+                continue
+            txs.sort(
+                key=lambda t: (t.get("blockTime") or 0, t.get("timestamp") or 0)
+            )
+            for tx in txs:
+                await self._process_transaction(tx)
+
+    async def _flush_pending_loop(self) -> None:
+        """Task background: drena el buffer aunque no entre ningun webhook nuevo."""
+        window = float(
+            getattr(self.config.copy_trading, "COPY_TRADE_ORDER_BUFFER_SECONDS", 1.0)
+        )
+        while True:
+            await asyncio.sleep(0.1)
+            try:
+                await self._drain_pending(window=window)
+            except Exception as exc:
+                logger.warning("CopyTrading: flush de txs pendientes fallo: {}", exc)
+
+    # --------------------------------------------------- Dedup persistente a disco
+    def _load_executed_signatures(self) -> None:
+        """Carga las signatures ejecutadas persistidas (ventana ~1h)."""
+        try:
+            path = Path(self._signatures_file)
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                cutoff = time.time() - 3600
+                self._executed_signatures = {
+                    str(k): float(v)
+                    for k, v in data.items()
+                    if float(v) > cutoff
+                }
+        except Exception as exc:
+            logger.debug("CopyTrading: no se pudieron cargar signatures: {}", exc)
+
+    def _mark_executed(self, signature: str) -> None:
+        """Persiste la signature de una tx YA EJECUTADA a disco."""
+        if not signature:
+            return
+        self._executed_signatures[signature] = time.time()
+        try:
+            cutoff = time.time() - 7200
+            kept = {
+                k: v for k, v in self._executed_signatures.items() if v > cutoff
+            }
+            if len(kept) > 5000:
+                kept = dict(sorted(kept.items(), key=lambda kv: kv[1])[-5000:])
+            self._executed_signatures = kept
+            Path(self._signatures_file).write_text(
+                json.dumps(kept), encoding="utf-8"
+            )
+        except Exception as exc:
+            logger.debug("CopyTrading: no se persistieron signatures: {}", exc)
+
+    @staticmethod
+    def _close_amounts(a: float, b: float, tol: float = 0.25) -> bool:
+        """Monto similar dentro de una tolerancia % (los shards duplicados de
+        una compra tienen el mismo monto, o el mismo cap de MAX_COPY_TRADE_SOL)."""
+        if a <= 0 or b <= 0:
+            return False
+        return abs(a - b) <= max(a, b) * tol
 
     async def _process_transaction(self, tx: dict[str, Any]) -> None:
         """Parsea una transaccion Enhanced de Helius y detecta trades."""
@@ -516,6 +651,14 @@ class CopyTradingStrategy(Strategy):
         self._recent_webhook_txs = {
             k: v for k, v in self._recent_webhook_txs.items() if v > cutoff
         }
+
+        # Barrera PERSISTENTE: esta signature ya fue ejecutada (grabada en
+        # disco). Tras un reinicio las dicts en memoria se vacian, pero Helius
+        # reentrega los webhooks no ACKeados de los ultimos minutos -> la misma
+        # compra se volveria a ejecutar (doble compra tras restart). Aqui se
+        # corta todo reproceso de una tx ya ejecutada.
+        if signature and signature in self._executed_signatures:
+            return
 
         logger.info(
             "CopyTrading: tx type={} fee_payer={} sig={}",
@@ -1176,7 +1319,48 @@ class CopyTradingStrategy(Strategy):
 
         async with self._lock:
             try:
+                # Marcar la signature como EJECUTADA de forma PERSISTENTE:
+                # Helius reentrega mismo webhook no ACKeado y el RPC poll
+                # redispara la tx; tras un reinicio el dedup en memoria se
+                # pierde. Sin esto, la misma compra se re-ejecuta -> doble
+                # compra. Grabado a disco antes de ejecutar la orden.
+                self._mark_executed(signal.tx_signature or "")
+
                 if signal.action == "buy":
+                    # Coalesce de la MISMA compra: si ya ejecutamos un buy del
+                    # mismo (wallet, mint) con un monto similar en la ventana
+                    # COPY_TRADE_BUY_DEDUP_SECONDS, este evento es un duplicado
+                    # (reentrega de Helius, solape RPC+webhook, o la compra del
+                    # trader dividida en varias txs identicas por un sniper) ->
+                    # NO ejecutar de nuevo. Era la "doble compra" reportada.
+                    dedup_s = float(
+                        getattr(
+                            self.config.copy_trading,
+                            "COPY_TRADE_BUY_DEDUP_SECONDS",
+                            3.0,
+                        )
+                    )
+                    current_time = time.time()
+                    if dedup_s > 0:
+                        bk = (signal.wallet, signal.token_mint)
+                        prev = self._last_buy_key.get(bk)
+                        if prev:
+                            prev_t, prev_amt = prev
+                            if (
+                                (current_time - prev_t) <= dedup_s
+                                and self._close_amounts(signal.amount_sol, prev_amt)
+                            ):
+                                logger.info(
+                                    "CopyTrading: BUY duplicado ignorado {} ({}) | +{:.6f} SOL repetido a {:.1f}s | mint={}",
+                                    signal.trader_label or signal.source,
+                                    signal.wallet[:8] + "...",
+                                    signal.amount_sol,
+                                    current_time - prev_t,
+                                    signal.token_mint[:8] + "...",
+                                )
+                                return
+                        self._last_buy_key[bk] = (current_time, signal.amount_sol)
+
                     existing = self.executor.positions.get(signal.token_mint)
                     tracker_pos = self.tracker.positions.get(signal.token_mint)
 

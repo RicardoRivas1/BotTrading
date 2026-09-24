@@ -270,6 +270,30 @@ class CopyTradingSettings(BaseSettings):
             "trades de polvo (compras de 0.0001-0.0003 SOL)."
         ),
     )
+    COPY_TRADE_BUY_DEDUP_SECONDS: float = Field(
+        default=3.0,
+        ge=0,
+        description=(
+            "Ventana (s) para colapsar copias duplicadas de la MISMA compra. "
+            "Si el mismo trader compra el mismo token con un monto similar 2+ "
+            "veces dentro de esta ventana, el bot ejecuta SOLO la primera. "
+            "Evita la doble compra por reentregas de Helius, solape "
+            "RPC+webhook o compras divididas en varias txs identicas "
+            "(sniper sharding). 0 = deshabilitado (comportamiento antiguo)."
+        ),
+    )
+    COPY_TRADE_ORDER_BUFFER_SECONDS: float = Field(
+        default=1.0,
+        ge=0,
+        description=(
+            "Buffer (s) que reordena las txs por tiempo de bloque antes de "
+            "procesarlas. Cuando un trader compra y vende el mismo token muy "
+            "rapido, Helius puede entregar la VENTA antes que la COMPRA o en "
+            "el mismo webhook desordenado; al procesar la venta sin tracking "
+            "previo el bot la lee como COMPRA (doble compra). Con el buffer la "
+            "compra se procesa primero. 0 = deshabilitado (sin esperar)."
+        ),
+    )
     COPY_TRADE_BUY_AMOUNT_SOL: float = Field(
         default=0.005,
         gt=0,
