@@ -1378,34 +1378,50 @@ class CopyTradingStrategy(Strategy):
                     if signal.buy_sol_raw > 0:
                         self._wallet_mint_sol[wt_key] = sol_before + signal.buy_sol_raw
 
-                    # Accumulate if same token bought again (distributed buys)
+                    # Re-compra del MISMO token mientras ya tenemos posicion abierta:
+                    # por defecto NO se invierte de nuevo (una sola compra por token
+                    # hasta cerrar la posicion). El trader acumula/compra rapido en
+                    # varias txs (shards de sniper, reentregas de Helius, o DCA suyo)
+                    # y el bot hacia 2+ compras del mismo mint. Si el usuario quiere
+                    # escalar con el trader, activar COPY_TRADE_ALLOW_ACCUMULATE.
                     if existing or tracker_pos:
-                        if existing:
-                            existing.sol_invested += signal.amount_sol
-                            if existing.entry_price and existing.entry_price > 0:
-                                existing.token_amount_ui += signal.amount_sol / existing.entry_price
-                                existing.token_amount_ui = max(
-                                    existing.token_amount_ui,
-                                    existing.sol_invested / existing.entry_price,
-                                )
-                        if tracker_pos:
-                            tracker_pos.amount += signal.amount_sol
-                        logger.info(
-                            "CopyTrading: BUY acumulado {} ({}) | +{:.6f} SOL ({}) | total_investido={:.6f}",
-                            signal.trader_label or signal.source, signal.wallet[:8] + "...",
-                            signal.amount_sol,
-                            signal.token_mint[:8] + "...",
-                            existing.sol_invested if existing else tracker_pos.amount,
-                        )
-                        from core.stats import get_trade_stats
-                        get_trade_stats().record_buy(signal.wallet, new_position=False)
-                        self._notify(self.notifier.send_buy(
-                            signal.token_mint,
-                            signal.amount_sol,
-                            symbol=signal.token_symbol or signal.token_mint[:6].upper(),
-                            dry_run=self.config.trading.DRY_RUN,
-                            trader=signal.trader_label,
-                        ))
+                        if getattr(
+                            self.config.copy_trading,
+                            "COPY_TRADE_ALLOW_ACCUMULATE",
+                            False,
+                        ):
+                            if existing:
+                                existing.sol_invested += signal.amount_sol
+                                if existing.entry_price and existing.entry_price > 0:
+                                    existing.token_amount_ui += signal.amount_sol / existing.entry_price
+                                    existing.token_amount_ui = max(
+                                        existing.token_amount_ui,
+                                        existing.sol_invested / existing.entry_price,
+                                    )
+                            if tracker_pos:
+                                tracker_pos.amount += signal.amount_sol
+                            logger.info(
+                                "CopyTrading: BUY acumulado {} ({}) | +{:.6f} SOL ({}) | total_investido={:.6f}",
+                                signal.trader_label or signal.source, signal.wallet[:8] + "...",
+                                signal.amount_sol,
+                                signal.token_mint[:8] + "...",
+                                existing.sol_invested if existing else tracker_pos.amount,
+                            )
+                            from core.stats import get_trade_stats
+                            get_trade_stats().record_buy(signal.wallet, new_position=False)
+                            self._notify(self.notifier.send_buy(
+                                signal.token_mint,
+                                signal.amount_sol,
+                                symbol=signal.token_symbol or signal.token_mint[:6].upper(),
+                                dry_run=self.config.trading.DRY_RUN,
+                                trader=signal.trader_label,
+                            ))
+                        else:
+                            logger.info(
+                                "CopyTrading: BUY ignorado {} ({}) | +{:.6f} SOL - ya copiado este token (una sola compra) | mint={}",
+                                signal.trader_label or signal.source, signal.wallet[:8] + "...",
+                                signal.amount_sol, signal.token_mint[:8] + "...",
+                            )
                         return
 
                     max_pos = int(
@@ -1730,6 +1746,11 @@ class CopyTradingStrategy(Strategy):
                     if pct >= 99.0:
                         self.executor.positions.pop(signal.token_mint, None)
                         self.tracker.positions.pop(signal.token_mint, None)
+                        # Se cerro la posicion: el cooldown de buys duplicados
+                        # pierde sentido. La proxima compra del trader es una
+                        # ENTRADA nueva (re-entry), no un duplicado, y debe
+                        # ejecutarse. Evita que un sell+rebuy rapido se coma.
+                        self._last_buy_key.pop((signal.wallet, signal.token_mint), None)
                     else:
                         if position:
                             position.sol_invested = max(0.0, getattr(position, "sol_invested", 0.0) - _sol_portion_invested)

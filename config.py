@@ -282,6 +282,17 @@ class CopyTradingSettings(BaseSettings):
             "(sniper sharding). 0 = deshabilitado (comportamiento antiguo)."
         ),
     )
+    COPY_TRADE_ALLOW_ACCUMULATE: bool = Field(
+        default=False,
+        description=(
+            "Permite que el bot COMPRE DE NUEVO un token que ya tiene en "
+            "cartera cuando el trader vuelve a comprar el mismo mint. Con False "
+            "(default) el bot hace UNA sola compra por token hasta cerrar la "
+            "posicion; los buys adicionales del trader se ignoran (evita la "
+            "'doble compra' y que una posicion se infline como en el caso "
+            "FUEL: 0.05 SOL invertidos por 5 buys de 0.01)."
+        ),
+    )
     COPY_TRADE_ORDER_BUFFER_SECONDS: float = Field(
         default=1.0,
         ge=0,
