@@ -71,11 +71,24 @@ def _patch_session(monkeypatch, fake_resp: _FakeResponse, session_get_ret) -> No
 
 
 class TestFallbackPrecio:
-    """Cadena de fuentes de precio: Jupiter -> DexScreener -> Pump.fun."""
+    """Cadena de fuentes de precio: Pump.fun -> bonding curve -> DexScreener -> Jupiter.
 
-    async def test_jupiter_primero_y_dexscreener_de_fallback(
-        self, executor: JupiterExecutor
+    El orden importa: las fuentes baratas y rapidas van primero y Jupiter queda
+    como ULTIMO recurso porque es la mas lenta y la que consume el rate limit de
+    la API de trading. Consultarla primero era justo lo que hacia que el monitor
+    se quedara esperando una quote por posicion y ciclo.
+    """
+
+    def _no_bonding_curve(self, monkeypatch) -> None:
+        """La bonding curve on-chain no se consulta en los tests (sin red)."""
+        monkeypatch.setattr(
+            "core.bonding_curve.get_bonding_curve_price", AsyncMock(return_value=None)
+        )
+
+    async def test_dexscreener_gana_si_pumpfun_no_cotiza(
+        self, executor: JupiterExecutor, monkeypatch
     ) -> None:
+        self._no_bonding_curve(monkeypatch)
         executor._get_token_decimals = AsyncMock(return_value=6)
         executor._get_quote = AsyncMock(side_effect=SwapExecutionError("sin ruta"))
         executor._get_price_from_dexscreener = AsyncMock(return_value=0.000123)
@@ -84,34 +97,44 @@ class TestFallbackPrecio:
         price = await executor.get_token_price(MINT_RAYDIUM)
 
         assert price == pytest.approx(0.000123)
-        executor._get_quote.assert_awaited()
+        executor._get_price_from_pumpfun.assert_awaited_once()
         executor._get_price_from_dexscreener.assert_awaited_once()
-        executor._get_price_from_pumpfun.assert_not_awaited()
+        # Pump.fun y DexScreener respondieron: no se llega a la fuente lenta.
+        executor._get_quote.assert_not_awaited()
 
-    async def test_dexscreener_y_pumpfun_como_cadena_completa(
-        self, executor: JupiterExecutor
+    async def test_pumpfun_gana_si_cotiza(
+        self, executor: JupiterExecutor, monkeypatch
     ) -> None:
+        self._no_bonding_curve(monkeypatch)
         executor._get_token_decimals = AsyncMock(return_value=6)
-        executor._get_quote = AsyncMock(side_effect=SwapExecutionError("no route"))
-        executor._get_price_from_dexscreener = AsyncMock(return_value=0.0)
+        executor._get_quote = AsyncMock(return_value={"outAmount": 1_000_000})
+        executor._get_price_from_dexscreener = AsyncMock(return_value=0.000123)
         executor._get_price_from_pumpfun = AsyncMock(return_value=0.0000009)
 
         price = await executor.get_token_price(MINT_RAYDIUM)
 
         assert price == pytest.approx(0.0000009)
-        executor._get_price_from_dexscreener.assert_awaited_once()
         executor._get_price_from_pumpfun.assert_awaited_once()
+        # En cascada se para en la primera fuente util.
+        executor._get_price_from_dexscreener.assert_not_awaited()
+        executor._get_quote.assert_not_awaited()
 
-    async def test_pump_mint_consulta_dexscreener_primero_sin_jupiter(
-        self, executor: JupiterExecutor
+    async def test_bonding_curve_tiene_prioridad_sobre_dexscreener(
+        self, executor: JupiterExecutor, monkeypatch
     ) -> None:
+        """Pump.fun sin cotizacion: la curva on-chain responde antes que DexScreener."""
+        mock_curve = AsyncMock(return_value=0.00042)
+        monkeypatch.setattr("core.bonding_curve.get_bonding_curve_price", mock_curve)
+        executor._get_token_decimals = AsyncMock(return_value=6)
         executor._get_quote = AsyncMock(return_value={"outAmount": 1_000_000})
         executor._get_price_from_dexscreener = AsyncMock(return_value=0.0001)
-        executor._get_price_from_pumpfun = AsyncMock(return_value=0.0002)
+        executor._get_price_from_pumpfun = AsyncMock(return_value=0.0)
 
         price = await executor.get_token_price(MINT_PUMP)
 
-        assert price == pytest.approx(0.0001)
+        assert price == pytest.approx(0.00042)
+        mock_curve.assert_awaited()
+        executor._get_price_from_dexscreener.assert_not_awaited()
         executor._get_quote.assert_not_awaited()
 
     async def test_pump_mint_usa_jupiter_como_ultimo_recurso(
@@ -783,7 +806,12 @@ class TestConfirmacionOnChain:
     """Confirmación obligatoria on-chain de las transacciones."""
 
     def _fake_client(
-        self, executor: JupiterExecutor, *, confirm_result=None, confirm_side_effect=None
+        self,
+        executor: JupiterExecutor,
+        *,
+        confirm_result=None,
+        confirm_side_effect=None,
+        statuses_result=None,
     ) -> None:
         class _FakeClient:
             def __init__(self) -> None:
@@ -798,6 +826,9 @@ class TestConfirmacionOnChain:
                 if confirm_side_effect is not None:
                     raise confirm_side_effect
                 return confirm_result
+
+            async def get_signature_statuses(self, txids):
+                return SimpleNamespace(value=statuses_result)
 
         executor._rpc_client = _FakeClient()  # type: ignore[assignment]
 
@@ -837,14 +868,63 @@ class TestConfirmacionOnChain:
                 self._signed_tx(monkeypatch), require_confirmation=True
             )
 
-    async def test_venta_lenient_devuelve_txid_aunque_no_se_confirme(
+    async def test_venta_sin_confirmar_devuelve_none_y_conserva_la_posicion(
         self, executor: JupiterExecutor, monkeypatch
     ) -> None:
-        self._fake_client(executor, confirm_side_effect=TimeoutError("no confirmó"))
+        """Una venta no verificable on-chain NO se declara ejecutada.
+
+        Antes devolvía el txid de la tx caída: el llamador (que solo mira la
+        verdad del txid) borraba la posición y marcaba la firma como ejecutada,
+        dejando los tokens atrapados en la wallet sin possibility de reintento.
+        """
+        self._fake_client(
+            executor,
+            confirm_side_effect=TimeoutError("no confirmo"),
+            statuses_result=None,
+        )
+        sig = await executor._submit_signed_transaction(
+            self._signed_tx(monkeypatch), require_confirmation=False
+        )
+        assert sig is None
+
+    async def test_venta_revertida_devuelve_none(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        revert = SimpleNamespace(err="BlockhashNotFound")
+        self._fake_client(executor, confirm_result=SimpleNamespace(value=[revert]))
+        sig = await executor._submit_signed_transaction(
+            self._signed_tx(monkeypatch), require_confirmation=False
+        )
+        assert sig is None
+
+    async def test_venta_confirmada_en_la_reconsulta_devuelve_txid(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        """Si el timeout era del RPC pero la tx sí entró, la venta es real."""
+        landed = SimpleNamespace(err=None)
+        self._fake_client(
+            executor,
+            confirm_side_effect=TimeoutError("timeout del RPC"),
+            statuses_result=[landed],
+        )
         sig = await executor._submit_signed_transaction(
             self._signed_tx(monkeypatch), require_confirmation=False
         )
         assert sig == Signature.default()
+
+    async def test_venta_revertida_en_la_reconsulta_devuelve_none(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        self._fake_client(
+            executor,
+            confirm_side_effect=TimeoutError("timeout del RPC"),
+            statuses_result=[SimpleNamespace(err="Transaction expired")],
+        )
+        sig = await executor._submit_signed_transaction(
+            self._signed_tx(monkeypatch), require_confirmation=False
+        )
+        assert sig is None
+
 
 
 class TestClosePosition:

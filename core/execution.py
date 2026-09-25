@@ -374,12 +374,37 @@ class JupiterExecutor:
             signed_tx, require_confirmation=require_confirmation
         )
 
+    async def _await_signature_settled(
+        self, txid: Signature, *, attempts: int = 4, delay: float = 1.5
+    ) -> tuple[bool, Optional[str]]:
+        """Consulta el estado de una tx hasta que se resuelve o se agotan los intentos.
+
+        Devuelve `(resuelta, error)`:
+          - `(True, None)`     -> la tx está en un bloque y NO falló.
+          - `(True, "<err>")`  -> la tx cayó/revirtió on-chain.
+          - `(False, None)`    -> sigue sin resolverse (no se puede afirmar nada).
+        """
+        client = self._rpc_client
+        for attempt in range(attempts):
+            try:
+                resp = await client.get_signature_statuses([txid])
+                value = resp.value[0] if resp.value else None
+                if value is not None:
+                    if value.err is None:
+                        return True, None
+                    return True, str(value.err)
+            except Exception as exc:  # noqa: BLE001 - timeout/RPC del proveedor
+                logger.debug("get_signature_statuses falló para {}: {}", txid, exc)
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
+        return False, None
+
     async def _submit_signed_transaction(
         self,
         signed_tx: VersionedTransaction,
         *,
         require_confirmation: bool = True,
-    ) -> Signature:
+    ) -> Signature | None:
         """Envía y confirma una transacción firmada vía RPC.
 
         En modo estricto (`require_confirmation=True`, compras) la operación
@@ -389,8 +414,14 @@ class JupiterExecutor:
         `SwapExecutionError` para que el llamador NO notifique la compra como
         ejecutada.
 
-        En modo venta (`require_confirmation=False`) no se re-lanza: se devuelve
-        el txid recibido para evitar reintentos que dupliquen la salida.
+        En modo venta (`require_confirmation=False`) NUNCA se declara exitosa una
+        venta que no se puede verificar on-chain: se devuelve `None`. Antes esto
+        devolvía el txid de una tx caída/revertida, y el llamador (que solo
+        comprueba la verdad del txid) borraba la posición y marcaba la firma como
+        ejecutada: los tokens se quedaban en la wallet sin dueño y el reintento
+        era imposible. Ante un timeout/RPC se reconsulta el estado de la tx un
+        número acotado de veces; si aun así no se resuelve, la venta se considera
+        NO ocurida y la posición se conserva para reintentarla.
         """
         client = self._rpc_client
         opts = TxOpts(skip_preflight=True, skip_confirmation=True)
@@ -411,8 +442,22 @@ class JupiterExecutor:
                 raise SwapExecutionError(
                     f"Transacción NO confirmada on-chain ({txid}): {exc}"
                 ) from exc
-            logger.success("Swap enviado pero sin confirmar: {}", txid)
-            return txid
+
+            settled, status_err = await self._await_signature_settled(txid)
+            if settled and status_err is None:
+                logger.success("Venta confirmada on-chain (reconsulta): {}", txid)
+                return txid
+            if settled:
+                logger.error(
+                    "Venta revertida/caída on-chain ({}): {} | la posición se conserva",
+                    status_err, txid,
+                )
+                return None
+            logger.error(
+                "Venta NO verificable on-chain tras reconsultas: {} | "
+                "la posición se conserva para reintentar", txid,
+            )
+            return None
 
         status = confirmation.value[0] if confirmation.value else None
         if status is None or status.err is not None:
@@ -425,8 +470,11 @@ class JupiterExecutor:
                     f"Transacción reversada/descartada ({txid}): "
                     f"{status.err if status else 'sin estado'}"
                 )
-            logger.success("Swap enviado: {}", txid)
-            return txid
+            logger.error(
+                "Venta no ejecutada on-chain: {} | la posición se conserva para reintentar",
+                txid,
+            )
+            return None
 
         logger.success("Transacción confirmada on-chain: {}", txid)
         return txid
@@ -714,7 +762,7 @@ class JupiterExecutor:
         token_mint: str,
         token_balance_ui: float,
         slippage_bps: Optional[int] = None,
-    ) -> Signature:
+    ) -> Signature | None:
         """Vende un token, con fallback directo en Pump.fun para la bonding curve.
 
         Intenta primero la cotización y el swap vía Jupiter. Si Jupiter no
@@ -722,6 +770,10 @@ class JupiterExecutor:
         satura la API (429 / "Rate limit"), redirige a `_sell_via_pumpportal`
         para una venta directa por PumpPortal. Los tokens ya marcados como
         bonding curve saltan directamente a PumpPortal.
+
+        Devuelve `None` si la venta NO se pudo verificar como ejecutada
+        on-chain (tx caída, revertida o irresoluble): el llamador debe entonces
+        conservar la posición y reintentar.
         """
         decimals = await self._get_token_decimals(token_mint)
         raw_amount = int(token_balance_ui * (10 ** decimals))
@@ -773,13 +825,14 @@ class JupiterExecutor:
         mint: str,
         amount_ui: float,
         slippage_bps: Optional[int] = None,
-    ) -> Signature:
+    ) -> Signature | None:
         """Venta directa en la bonding curve de Pump.fun vía PumpPortal.
 
         Realiza el POST a `https://pumpportal.fun/api/trade-local` con el
         payload de venta (tipos estrictos: string "true"/"false", float amount,
         pool "auto"), decodifica la transacción, la firma localmente y la
-        envía/confirma por el RPC. Devuelve el txid (Signature).
+        envía/confirma por el RPC. Devuelve el txid si la venta queda
+        confirmada on-chain, o `None` si no se puede verificar.
         """
         wallet_pubkey_str = str(self.wallet_pubkey).strip()
         slippage_pct = float((self.slippage_bps if slippage_bps is None else slippage_bps) / 100.0)

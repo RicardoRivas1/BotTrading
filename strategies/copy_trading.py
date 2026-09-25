@@ -133,6 +133,13 @@ class CopyTradingStrategy(Strategy):
         )
         self._wallet_mint_tokens: dict[tuple[str, str], float] = {}  # (wallet,mint)->tokens acumulados (SUMA via BUY)
         self._wallet_mint_sol: dict[tuple[str, str], float] = {}  # (wallet,mint)->SOL invertido acumulado (sin cap)
+        # (wallet,mint) cuyo accumulo de tokens se sincronizó con el balance
+        # on-chain: son tokens de compras que el bot NO vio, así que no hay base
+        # de costo válida y el PnL del trader no se puede calcular sin inventarlo.
+        self._wallet_mint_cost_unknown: set[tuple[str, str]] = set()
+        # Poda de los contadores por mint (crecen sin limite con el uptime).
+        self._prune_tick = 0
+        self._PRUNE_EVERY_SIGNALS = 500
         self._lock = asyncio.Lock()
         # Serializa TODO el pipeline (parse + execute) para que _parse_trade
         # SIEMPRE lea el estado (_wallet_mint_tokens, posiciones) ya actualizado.
@@ -147,7 +154,125 @@ class CopyTradingStrategy(Strategy):
             getattr(self.config.copy_trading, "COPY_TRADE_WEBHOOK_PATH", "")
             or "/webhook/copy-trading"
         )
+        # El tracker cierra posiciones por su cuenta (TP/SL/trailing/vencimiento)
+        # sin pasar por la señal de venta del trader. Sin este hook, el
+        # accumulado de tokens del trader nunca se descontaba en esos cierres y
+        # el siguiente ciclo del mismo mint vendía una fracción cada vez menor.
+        try:
+            register = getattr(self.tracker, "register_close_hook", None)
+            if callable(register):
+                register(self._on_tracked_position_closed)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("No se pudo registrar el hook de cierre del tracker: {}", exc)
         self._load_wallets()
+
+    def _debit_trader_tokens(self, wallet: str, mint: str, sold_tokens: float) -> float:
+        """Descuenta del accumulado del trader los tokens que acaba de vender.
+
+        El SOL se descuenta en la MISMA proporción: si solo se descontaran los
+        tokens, el costo medio (w_sol / accumulated) quedaría mezclado entre
+        ciclos y el PnL del trader salía inventado. Al agotarse el accumulado se
+        borra la entrada: si no, estas tablas crecían para siempre y un mint
+        reutilizado arrastraba el costo degeneraciones anteriores.
+        """
+        wm_key = (wallet, mint)
+        accumulated = self._wallet_mint_tokens.get(wm_key, 0.0)
+        if accumulated <= 0 or sold_tokens <= 0:
+            return accumulated
+        remaining = max(0.0, accumulated - sold_tokens)
+        w_sol = self._wallet_mint_sol.get(wm_key, 0.0)
+        if remaining <= 0.0:
+            self._wallet_mint_tokens.pop(wm_key, None)
+            self._wallet_mint_sol.pop(wm_key, None)
+            self._wallet_mint_cost_unknown.discard(wm_key)
+            return 0.0
+        self._wallet_mint_tokens[wm_key] = remaining
+        if w_sol > 0:
+            self._wallet_mint_sol[wm_key] = w_sol * (remaining / accumulated)
+        return remaining
+
+    def _on_tracked_position_closed(
+        self, mint: str, source_wallet: str, sold_pct: float, reason: str
+    ) -> None:
+        """Hook del tracker: un cierre initiated por él tambien sale del trader."""
+        if not source_wallet:
+            return
+        wm_key = (source_wallet, mint)
+        accumulated = self._wallet_mint_tokens.get(wm_key, 0.0)
+        if accumulated <= 0:
+            return
+        frac = max(0.0, min(1.0, float(sold_pct) / 100.0))
+        if frac <= 0.0:
+            return
+        remaining = self._debit_trader_tokens(
+            source_wallet, mint, accumulated * frac
+        )
+        logger.info(
+            "CopyTrading: cierre del tracker ({}) de {} descuenta {:.1f}% de lo "
+            "acumulado del trader ({} -> {} tokens)",
+            reason or "sin motivo", mint[:8] + "...",
+            frac * 100.0, f"{accumulated:.6g}", f"{remaining:.6g}",
+        )
+
+    def _prune_stale_mints(self, max_age_seconds: float = 0.0) -> int:
+        """Olvida los (wallet, mint) que ya no tienen nada que recordar.
+
+        Estos diccionarios crescen con cada mint que el trader toca: un trader
+        activo puede generar miles de claves por hora y, como el proceso vive
+        semanas, la memoria y el guardado en disco crecen sin limite.
+
+        Solo se poda lo que es seguro olvidar:
+        - El acumulado del trader, si el bot no tiene el token en su wallet Y
+          el trader ya no lo tiene segun su ultimo balance conocido.
+        - El marcador de "ultima compra/venta vista", cuya ventana util es el
+          dedup (COPY_TRADE_BUY_DEDUP_SECONDS); pasado ese plazo ya no protege
+          de nada.
+
+        Lo que NO se toca nunca: mints con posicion viva, con tokens en la
+        wallet, o marcados como costo desconocido (necesitan seguir vivos para
+        no volver a fabricar el PnL del trader).
+        """
+        now = time.time()
+        if max_age_seconds <= 0:
+            max_age_seconds = float(
+                getattr(
+                    self.config.copy_trading, "COPY_TRADE_BUY_DEDUP_SECONDS", 3.0
+                )
+                * 600.0
+                or 1800.0
+            )
+        # Tokens que el bot todavía tiene: jamás se podan sus contadores.
+        held = {pos.mint for pos in self.executor.positions.values()}
+        removed = 0
+
+        for wm_key in list(self._wallet_mint_tokens):
+            wallet, mint = wm_key
+            if mint in held or wm_key in self._wallet_mint_cost_unknown:
+                continue
+            if self._wallet_mint_tokens[wm_key] > 0:
+                continue
+            self._wallet_mint_tokens.pop(wm_key, None)
+            self._wallet_mint_sol.pop(wm_key, None)
+            self._last_buy_key.pop(wm_key, None)
+            self._last_sell_block.pop(wm_key, None)
+            removed += 1
+
+        # Marcadores sin acumulado (descartados, o pods ya): dedup caducado.
+        for wm_key in list(self._last_buy_key):
+            if wm_key[1] in held or wm_key in self._wallet_mint_tokens:
+                continue
+            ts = self._last_buy_key.get(wm_key, (0.0, 0.0))[0]
+            if now - ts > max_age_seconds:
+                self._last_buy_key.pop(wm_key, None)
+                self._last_sell_block.pop(wm_key, None)
+                removed += 1
+
+        if removed:
+            logger.info(
+                "CopyTrading: podados {} registros obsoletos de mints sin posicion",
+                removed,
+            )
+        return removed
 
     def _notify(self, coro: Any) -> None:
         """Notifica en background (fire-and-forget) sin bloquear la ruta del trade.
@@ -195,7 +320,7 @@ class CopyTradingStrategy(Strategy):
         labels_str = os.getenv("COPY_TRADE_WALLET_LABELS", "")
         if addresses_str:
             addresses = [a.strip() for a in addresses_str.split(",") if a.strip()]
-            labels = [l.strip() for l in labels_str.split(",")] if labels_str else []
+            labels = [x.strip() for x in labels_str.split(",")] if labels_str else []
             for i, addr in enumerate(addresses):
                 label = labels[i] if i < len(labels) else f"Trader-{i+1}"
                 if addr not in self.wallets:
@@ -440,6 +565,9 @@ class CopyTradingStrategy(Strategy):
         consecutive_429 = 0
         wallet_index = 0
         disabled = False
+        # Poda de contadores por mint cada ~30 min (60 ciclos de 30s).
+        PRUNE_EVERY_POLLS = 60
+        prune_tick = 0
 
         import aiohttp
 
@@ -457,6 +585,13 @@ class CopyTradingStrategy(Strategy):
                 await asyncio.sleep(POLL_INTERVAL)
                 if self._state != StrategyState.RUNNING:
                     continue
+
+                # Poda periodica: sin esto los contadores por mint crecen sin
+                # limite durante semanas de uptime.
+                prune_tick += 1
+                if prune_tick >= PRUNE_EVERY_POLLS:
+                    prune_tick = 0
+                    self._prune_stale_mints()
 
                 addr = wallet_addrs[wallet_index % len(wallet_addrs)]
                 wallet_index += 1
@@ -571,6 +706,12 @@ class CopyTradingStrategy(Strategy):
             )
             for tx in transactions:
                 await self._feed_transaction(tx)
+            # Poda opportunista: cubre el caso en que el RPC poll esta
+            # deshabilitado (demasiados 429) y solo entran webhooks.
+            self._prune_tick += 1
+            if self._prune_tick >= self._PRUNE_EVERY_SIGNALS:
+                self._prune_tick = 0
+                self._prune_stale_mints()
             return {"status": "ok", "processed": str(len(transactions))}
         except Exception as exc:
             logger.error("CopyTrading: error procesando webhook: {}", exc)
@@ -1521,6 +1662,10 @@ class CopyTradingStrategy(Strategy):
                     # ventas falsamente negativo (p.ej. -40% cuando fue +96%).
                     if signal.buy_sol_raw > 0 and signal.trade_token_amount > 0:
                         self._wallet_mint_sol[wt_key] = sol_before + signal.buy_sol_raw
+                        # Compra REAL vista con su SOL: la base de costo vuelve a
+                        # ser válida (hasta que una resincronización on-chain la
+                        # vuelva a marcar como desconocida).
+                        self._wallet_mint_cost_unknown.discard(wt_key)
 
                     # Re-compra del MISMO token mientras ya tenemos posicion abierta:
                     # por defecto NO se invierte de nuevo (una sola compra por token
@@ -1534,32 +1679,23 @@ class CopyTradingStrategy(Strategy):
                             "COPY_TRADE_ALLOW_ACCUMULATE",
                             False,
                         ):
-                            if existing:
-                                existing.sol_invested += signal.amount_sol
-                                if existing.entry_price and existing.entry_price > 0:
-                                    existing.token_amount_ui += signal.amount_sol / existing.entry_price
-                                    existing.token_amount_ui = max(
-                                        existing.token_amount_ui,
-                                        existing.sol_invested / existing.entry_price,
-                                    )
-                            if tracker_pos:
-                                tracker_pos.amount += signal.amount_sol
-                            logger.info(
-                                "CopyTrading: BUY acumulado {} ({}) | +{:.6f} SOL ({}) | total_investido={:.6f}",
-                                signal.trader_label or signal.source, signal.wallet[:8] + "...",
-                                signal.amount_sol,
-                                signal.token_mint[:8] + "...",
-                                existing.sol_invested if existing else tracker_pos.amount,
+                            # El bot NO compra en esta rama (se devuelve antes de
+                            # `buy_token`). Antes sumaba el monto a `sol_invested`,
+                            # `token_amount_ui` y al tracker: contabilizaba capital que
+                            # nunca se invirtió, y ese numero es justo la base del
+                            # PnL y del "capital invertido" de /stats. No se infla
+                            # nada que no haya salido de la wallet.
+                            logger.warning(
+                                "CopyTrading: COPY_TRADE_ALLOW_ACCUMULATE activo pero esta "
+                                "rama NO ejecuta la compra (posicion ya abierta, sin sumar "
+                                "capital fantasma). BUY acumulado de {} +{:.6f} SOL NO "
+                                "copiado | mint={}",
+                                signal.trader_label or signal.source,
+                                signal.wallet[:8] + "...",
+                                signal.amount_sol, signal.token_mint[:8] + "...",
                             )
                             from core.stats import get_trade_stats
                             get_trade_stats().record_buy(signal.wallet, new_position=False)
-                            self._notify(self.notifier.send_buy(
-                                signal.token_mint,
-                                signal.amount_sol,
-                                symbol=signal.token_symbol or signal.token_mint[:6].upper(),
-                                dry_run=self.config.trading.DRY_RUN,
-                                trader=signal.trader_label,
-                            ))
                         else:
                             logger.info(
                                 "CopyTrading: BUY ignorado {} ({}) | +{:.6f} SOL - ya copiado este token (una sola compra) | mint={}",
@@ -1567,6 +1703,7 @@ class CopyTradingStrategy(Strategy):
                                 signal.amount_sol, signal.token_mint[:8] + "...",
                             )
                         return
+
 
                     max_pos = int(
                         getattr(self.config.copy_trading, "MAX_COPY_TRADE_POSITIONS", 0)
@@ -1673,6 +1810,22 @@ class CopyTradingStrategy(Strategy):
                             motivo = "ya vendida por el bot antes"
                         else:
                             motivo = "el bot nunca la compro"
+                        # Aunque el bot no tenga la posicion, el TRADER si vendio:
+                        # su accumulo debe salir de la mesa. Antes se ignoraba sin
+                        # tocarlo y el siguiente ciclo del mismo mint arrastraba el
+                        # conteo de compras viejas (el % de venta se degradaba solo).
+                        sold_tok_unowned = signal.trade_token_amount
+                        if sold_tok_unowned > 0:
+                            self._debit_trader_tokens(
+                                signal.wallet, signal.token_mint, sold_tok_unowned
+                            )
+                        else:
+                            self._debit_trader_tokens(
+                                signal.wallet, signal.token_mint,
+                                self._wallet_mint_tokens.get(
+                                    (signal.wallet, signal.token_mint), 0.0
+                                ),
+                            )
                         logger.info(
                             "CopyTrading: SELL ignorado {} ({}) - posicion no encontrada: {}",
                             signal.source, signal.token_mint[:8] + "...", motivo,
@@ -1753,8 +1906,9 @@ class CopyTradingStrategy(Strategy):
                             real_pct = (signal.trade_token_amount / accumulated) * 100.0
                             real_pct = max(1.0, min(real_pct, 100.0))
                             pct = real_pct
-                            held_after = max(0.0, accumulated - signal.trade_token_amount)
-                            self._wallet_mint_tokens[wm_key] = held_after
+                            held_after = self._debit_trader_tokens(
+                                signal.wallet, signal.token_mint, signal.trade_token_amount
+                            )
                             logger.info(
                                 "CopyTrading: sell pct {:.1f}% por tracking (acumulado {:.4g} tk, vendidos en esta tx {:.4g} tk) para {}",
                                 real_pct, accumulated, signal.trade_token_amount,
@@ -1779,8 +1933,15 @@ class CopyTradingStrategy(Strategy):
                                     )
                                     real_pct = max(1.0, min(real_pct, 100.0))
                                     pct = real_pct
-                                    # Re-sincronizar el tracking con la realidad on-chain
+                                    # Re-sincronizar con la realidad on-chain. Los
+                                    # tokens que el trader aun tiene pueden ser de
+                                    # compras que el bot NUNCA vio (empezamos tarde),
+                                    # asi que su costo es desconocido: se marca la
+                                    # entrada como sin base de costo en vez de
+                                    # inventar un promedio mezclando generaciones.
                                     self._wallet_mint_tokens[wm_key] = held_after
+                                    self._wallet_mint_sol[wm_key] = 0.0
+                                    self._wallet_mint_cost_unknown.add(wm_key)
                                     logger.info(
                                         "CopyTrading: sell pct {:.1f}% on-chain (trader balance post-venta {:.4g} tk + vendidos {:.4g} tk) para {}",
                                         real_pct, held_after, signal.trade_token_amount,
@@ -1800,13 +1961,52 @@ class CopyTradingStrategy(Strategy):
                                     real_pct = min(real_pct, 100.0)
                                     if real_pct > 1.0:
                                         pct = real_pct
-                                    held_after = max(0.0, accumulated - signal.trade_token_amount)
-                                    self._wallet_mint_tokens[wm_key] = held_after
+                                    held_after = self._debit_trader_tokens(
+                                        signal.wallet, signal.token_mint, signal.trade_token_amount
+                                    )
                     elif signal.trade_token_amount <= 0:
+                        # Sin cantidad vendida medible no se puede debitar el
+                        # accumulo del trader con precisión. Se resincroniza con su
+                        # balance on-chain (autoritativo): si el RPC responde y el
+                        # trader ya no tiene el token, el accumulo se cierra aqui y
+                        # no se arrastra al siguiente ciclo.
                         logger.debug(
                             "CopyTrading: sin cantidad de tokens vendidos medible para {}",
                             signal.token_mint[:12] + "...",
                         )
+                        if accumulated > 0:
+                            try:
+                                bal = await self.executor.get_wallet_token_balance(
+                                    signal.wallet, signal.token_mint
+                                )
+                            except Exception as exc:  # noqa: BLE001
+                                bal = -1.0
+                                logger.debug("balance on-chain del trader fallo: {}", exc)
+                            if bal < 0:
+                                # RPC caido: se asume al trader sin posicion y se
+                                # cierra el accumulo. Antes se dejaba intacto para
+                                # siempre y el siguiente ciclo vendia menos parte.
+                                logger.warning(
+                                    "Sin RPC ni cantidad de venta para {}: se cierra el "
+                                    "accumulo del trader ({} tk) para no arrastrarlo al "
+                                    "siguiente ciclo",
+                                    signal.token_mint[:8] + "...", f"{accumulated:.6g}",
+                                )
+                                self._debit_trader_tokens(
+                                    signal.wallet, signal.token_mint, accumulated
+                                )
+                            else:
+                                pct = max(1.0, min(
+                                    (accumulated - bal) / accumulated * 100.0, 100.0
+                                )) if accumulated > 0 else 100.0
+                                held_after = self._debit_trader_tokens(
+                                    signal.wallet, signal.token_mint, accumulated - bal
+                                )
+                                logger.info(
+                                    "CopyTrading: sell pct {:.1f}% por balance on-chain del "
+                                    "trader (acumulado {:.4g} tk, le quedan {:.4g} tk) para {}",
+                                    pct, accumulated, bal, signal.token_mint[:8] + "...",
+                                )
 
                     # --- PnL REAL del TRADER (resultado de la senal) ---
                     # HEADLINE segun decision del usuario: debe coincidir con el
@@ -1861,48 +2061,41 @@ class CopyTradingStrategy(Strategy):
                                     expected_proceeds, cost_of_sold,
                                     f"{sold_tok:.6g}", avg_cost, signal.token_mint[:8] + "...",
                                 )
-                        # Reducir la base de costo en proporcion a lo vendido
-                        self._wallet_mint_sol[wm_key] = max(0.0, w_sol - cost_of_sold)
+                        # La base de costo ya se descontó proporcionalmente en
+                        # _debit_trader_tokens (tokens y SOL a la vez); aquí solo
+                        # queda la foto del dato para el log.
 
-                    # PnL de NUESTRA copia (info secundaria, solo log/notificacion)
+                    # ¿Es el PnL del trader un número FIABLE? Solo si conocemos su
+                    # costo (lo vimos comprar) y la cantidad vendida. Si el
+                    # accumulo se sincronizó con el balance on-chain, el costo es
+                    # de compras que nunca vimos y cualquier % sería inventado: se
+                    # marca como no disponible en vez de fabricar uno (ni de
+                    # disfrazarlo con NUESTRO PnL, que es otra magnitud).
+                    trader_pnl_known = (
+                        avg_cost > 0
+                        and sold_tok > 0
+                        and tokens_before_sell > 0
+                        and wm_key not in self._wallet_mint_cost_unknown
+                    )
+                    if not trader_pnl_known:
+                        logger.info(
+                            "CopyTrading: PnL del trader NO disponible para {} "
+                            "(avg_cost={:.10g} sold_tok={:.6g} costo_desconocido={}); "
+                            "se notificara 'n/d' en vez de un numero inventado",
+                            signal.token_mint[:12] + "...", avg_cost, sold_tok,
+                            wm_key in self._wallet_mint_cost_unknown,
+                        )
+                        pnl_pct = 0.0
+
+                    # PnL de NUESTRA copia (estimado por precio, previo a la venta).
+                    # El valor real lo mide la venta (delta de saldo de la wallet).
                     copy_pnl = None
                     if entry > 0 and current_price > 0:
                         copy_pnl = (current_price - entry) / entry * 100.0
                         logger.info(
-                            "CopyTrading: PnL copia {:.2f}% | entry={:.10g} current={:.10g} {}",
+                            "CopyTrading: PnL estimado de la copia {:.2f}% (entry={:.10g} current={:.10g}) {}",
                             copy_pnl, entry, current_price, signal.token_mint[:8] + "...",
                         )
-
-                    # Fallback solo si no hubo dato del trader (sin costo trackeado):
-                    # precio de mercado vs entry
-                    if pnl_pct == 0.0:
-                        if entry <= 0 and avg_cost > 0:
-                            entry = avg_cost
-                            logger.info(
-                                "PnL: entry_price calculado desde compras del trader = {:.10g} for {}",
-                                entry, signal.token_mint[:12] + "...",
-                            )
-                        if entry > 0 and current_price > 0:
-                            pnl_pct = (current_price - entry) / entry * 100.0
-                            logger.debug(
-                                "PnL (fallback precio): entry={:.10g} current={:.10g} => {:.2f}% for {}",
-                                entry, current_price, pnl_pct, signal.token_mint[:12] + "...",
-                            )
-                        elif current_price > 0 and entry <= 0:
-                            # Precio disponible sin entry: valor de tokens vs invertido
-                            si = _sol_invested()
-                            token_held = 0.0
-                            if position:
-                                token_held = getattr(position, "token_amount_ui", 0.0) or 0.0
-                            if token_held <= 0 and tracker_pos:
-                                token_held = getattr(tracker_pos, "token_amount_ui", 0.0) or 0.0
-                            if token_held > 0 and si > 0:
-                                current_value = token_held * current_price
-                                pnl_pct = (current_value - si) / si * 100
-                                logger.info(
-                                    "PnL estimado (precio sin entry): valor={:.6f} vs invested={:.6f} => {:.2f}%",
-                                    current_value, si, pnl_pct,
-                                )
 
                     # --- Corregir PnL imposible con el PnL POR PRECIO ---
                     # El PnL por costo del trader (cost_of_sold dust o proceeds
@@ -1910,9 +2103,11 @@ class CopyTradingStrategy(Strategy):
                     # entry == cotización (la copia rindió 0%) o -100% cuando el
                     # precio solo cayó 40%. Con entrada y precio actual fiables,
                     # el PnL por precio (entry vs current) es la verdad de
-                    # mercado y lo que realmente rindió la copia.
+                    # mercado. Solo se sustituye si el dato del trader era un
+                    # número creíble: si ya es "n/d", el precio tampoco lo arregla.
                     if (
-                        entry > 0
+                        trader_pnl_known
+                        and entry > 0
                         and current_price > 0
                         and (pnl_pct > MAX_TRUSTED_PNL_PCT or pnl_pct <= -99.0)
                     ):
@@ -1927,12 +2122,10 @@ class CopyTradingStrategy(Strategy):
                     # Clamp PnL: en spot trading la pérdida nunca puede ser peor que -100%
                     pnl_pct = max(-100.0, pnl_pct)
                     # Cualquier PnL irreal (>MAX_TRUSTED) que sobreviva se limita
-                    # a ese valor para no spamear mensajes absurdos; en stats se
-                    # EXCLUYE (record_sell marca excluded=True) y no distorsiona
-                    # la gráfica.
+                    # a ese valor para no spamear mensajes absurdos.
                     if pnl_pct > MAX_TRUSTED_PNL_PCT:
                         logger.warning(
-                            "CopyTrading: PnL {:.2f}% implausible para {} (sell_proceeds={:.6f} sold_tok={:.6g} avg_cost={:.10g}); limitado a {:.0f}% en notificación y EXCLUIDO de stats",
+                            "CopyTrading: PnL {:.2f}% implausible para {} (sell_proceeds={:.6f} sold_tok={:.6g} avg_cost={:.10g}); limitado a {:.0f}% en notificación",
                             pnl_pct, signal.token_mint[:12] + "...",
                             sell_proceeds, sold_tok, avg_cost, MAX_TRUSTED_PNL_PCT,
                         )
@@ -1944,14 +2137,17 @@ class CopyTradingStrategy(Strategy):
                             sell_proceeds, sold_tok, w_sol, accumulated, avg_cost,
                         )
 
-                    # Record sell in stats before cleaning positions
-                    from core.stats import get_trade_stats
+                    # --- Datos para las stats: los NUESTROS, no los del trader ---
+                    # Antes se registraba `pnl_pct` (el del TRADER) junto a
+                    # `sol_invested` (nuestro) y un `sol_received` FABRICADO
+                    # (invertido x (1+pnl)). Ese registro no correspondía a ninguna
+                    # operación real: el % era de otro, el precio de salida era
+                    # entry x (1+pnl) —un precio que nunca existió— y el "PnL
+                    # Neto" de /stats era una identidad algebraica del propio PnL.
                     _entry = entry if entry > 0 else 0.0
                     _buy_time = 0.0
                     _raw_sol_invested = _sol_invested()
                     _sol_portion_invested = _raw_sol_invested * (pct / 100.0)
-                    _sol_received = max(0.0, _sol_portion_invested * (1.0 + pnl_pct / 100.0))
-                    _exit_price = current_price if current_price > 0 else (_entry * (1.0 + pnl_pct / 100.0) if _entry > 0 else 0.0)
                     _wallet_for_stats = signal.wallet
                     if tracker_pos:
                         _buy_time = float(getattr(tracker_pos, "created_at", 0.0) or 0.0)
@@ -1966,14 +2162,18 @@ class CopyTradingStrategy(Strategy):
                     # ni marcar la tx como ejecutada: hacerlo dejaba los tokens
                     # atrapados en la wallet y el bot sin registro para venderlos
                     # (posicion borrada = "no vende" y "no compra" al reintentar).
+                    _sell_result: dict[str, Any] = {}
                     sold = await process_sell_and_notify(
                         signal.token_mint,
                         symbol=signal.token_symbol,
                         reason="COPY_TRADE_SELL",
                         pnl=pnl_pct,
                         pnl_copy=copy_pnl,
+                        pnl_known=trader_pnl_known,
                         sell_pct=pct,
                         trader=signal.trader_label,
+                        account_source=False,
+                        result=_sell_result,
                     )
                     if not sold:
                         self._inc_stat("trades_failed")
@@ -1999,9 +2199,30 @@ class CopyTradingStrategy(Strategy):
                         restore_tk = tokens_before_sell or signal.trade_token_amount
                         if restore_tk > 0:
                             self._wallet_mint_tokens[wm_key] = restore_tk
-                        if cost_of_sold > 0:
-                            self._wallet_mint_sol[wm_key] = w_sol
+                            if cost_of_sold > 0:
+                                self._wallet_mint_sol[wm_key] = w_sol
                         return
+
+                    # --- Resultado REAL de nuestra venta (medido en la venta) ---
+                    # `process_sell_and_notify` mide el delta del saldo SOL de la
+                    # wallet: es lo que el bot obtuvo de verdad, con las fees que
+                    # costaron y el rent devuelto al cerrar la ATA. Es el unico PnL
+                    # defendible para /stats.
+                    _sol_proceeds = float(_sell_result.get("sol_proceeds", 0.0) or 0.0)
+                    _our_pnl_pct = _sell_result.get("copy_pnl_measured")
+                    if _sol_portion_invested > 0 and _our_pnl_pct is None and _sol_proceeds > 0:
+                        # La venta midio el SOL pero no el % (referencia distinta):
+                        # se recalcula con nuestro capital invertido, que es el dato
+                        # que importa.
+                        _our_pnl_pct = (
+                            (_sol_proceeds - _sol_portion_invested) / _sol_portion_invested
+                        ) * 100.0
+                    if _our_pnl_pct is None:
+                        logger.warning(
+                            "CopyTrading: sin PnL medible para {} (proceeds={}); se usara "
+                            "el PnL por precio",
+                            signal.token_mint[:8] + "...", f"{_sol_proceeds:.6f}",
+                        )
 
                     # Clean up or reduce positions
                     if pct >= 99.0:
@@ -2035,26 +2256,54 @@ class CopyTradingStrategy(Strategy):
                     self.executor._save_exec_positions()
                     self.tracker._save_positions()
 
-                    # Record completed trade in stats
+                    # Record completed trade in stats con NUESTROS numeros: el PnL
+                    # medido del delta de saldo y, si no se pudo medir, el PnL por
+                    # precio de nuestra copia. `sol_received` deja de derivarse del
+                    # PnL (identidad algebraica) y pasa a ser el SOL real obtenido.
+                    _stats_pnl = _our_pnl_pct if _our_pnl_pct is not None else copy_pnl
+                    _pnl_unreliable = _stats_pnl is None
+                    if _pnl_unreliable:
+                        logger.warning(
+                            "CopyTrading: sin PnL medible para {} (ni saldo ni precio); "
+                            "el trade queda fuera de las métricas",
+                            signal.token_mint[:8] + "...",
+                        )
+                        _stats_pnl = 0.0
+                    # `sol_received` es el SOL REAL obtenido por la venta. Antes se
+                    # derivaba como `invertido * (1 + pnl/100)`, que es una
+                    # identidad del PnL (no mide nada) y por eso "PnL Neto" no
+                    # cuadraba con la wallet. Si no se pudo medir, se deja 0: es
+                    # preferible un 0 declarado a un numero inventado.
+                    _stats_sol_received = _sol_proceeds
+                    _exit_price = (
+                        current_price
+                        if current_price > 0
+                        else (_entry * (1.0 + float(_stats_pnl) / 100.0) if _entry > 0 else 0.0)
+                    )
+                    from core.stats import get_trade_stats
                     get_trade_stats().record_sell(
                         mint=signal.token_mint,
                         symbol=signal.token_symbol or signal.token_mint[:6].upper(),
                         wallet=_wallet_for_stats,
                         entry_price=_entry,
                         exit_price=_exit_price,
-                        pnl_pct=pnl_pct,
+                        pnl_pct=_stats_pnl,
                         sol_invested=_sol_portion_invested,
-                        sol_received=_sol_received,
+                        sol_received=_stats_sol_received,
                         buy_time=_buy_time,
                         sell_time=time.time(),
                         sell_reason="COPY_TRADE_SELL",
                         sell_pct=pct,
+                        pnl_unreliable=_pnl_unreliable,
                     )
 
                     logger.success(
-                        "CopyTrading: SELL {} ({}) | {} | PnL: {:.2f}% | sell_pct: {:.0f}%",
+                        "CopyTrading: SELL {} ({}) | {} | trader {} | mi copia {} | sell_pct: {:.0f}%",
                         signal.trader_label or signal.source, signal.wallet[:8] + "...",
-                        signal.token_mint[:8] + "...", pnl_pct, pct,
+                        signal.token_mint[:8] + "...",
+                        f"{pnl_pct:+.2f}%" if trader_pnl_known else "n/d",
+                        f"{_our_pnl_pct:+.2f}%" if _our_pnl_pct is not None else "n/d",
+                        pct,
                     )
                     # Venta EXITOSA: recien ahora marcar como ejecutada (persistente)
                     # para que los redeliveries/poll tras un restart no la repitan.

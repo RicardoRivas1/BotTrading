@@ -21,6 +21,20 @@ PUMP_FUN_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwr
 # Cache for resolved program addresses (some tokens use pump_amm)
 _PROGRAM_CACHE: dict[str, Pubkey] = {}
 
+# Un unico cliente RPC reutilizado. Antes se creaba un AsyncClient POR LLAMADA
+# (y nunca se cerraba): el monitor del tracker pide precio a esta funcion en
+# cada posicion y en cada ciclo, asi que se acumulaban handshakes TCP+TLS
+# contra Helius, con el riesgo añadido de disparar sus rate limits y de hacer
+# que el propio monitor se ralentizara.
+_CLIENTS: dict[str, AsyncClient] = {}
+
+
+def _get_client(rpc_url: str) -> AsyncClient:
+    client = _CLIENTS.get(rpc_url)
+    if client is None:
+        client = _CLIENTS[rpc_url] = AsyncClient(rpc_url)
+    return client
+
 
 async def get_bonding_curve_price(
     rpc_url: str,
@@ -35,7 +49,7 @@ async def get_bonding_curve_price(
     can't be parsed.
     """
     try:
-        client = AsyncClient(rpc_url)
+        client = _get_client(rpc_url)
         mint_pubkey = Pubkey.from_string(token_mint)
     except Exception as exc:
         logger.debug("Invalid mint pubkey {}: {}", token_mint, exc)

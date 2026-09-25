@@ -32,6 +32,17 @@ from core.stats import MAX_PLAUSIBLE_PNL_PCT
 # Intervalo del bucle de monitoreo de posiciones activas (segundos).
 CHECK_INTERVAL_SEC = 2.0
 
+# Tope de posiciones cuyo precio se consulta a la vez. Acota la concurrencia
+# para no saturar los proveedores (ni el rate limit de Helius) cuando hay
+# muchas posiciones abiertas, a la vez que evita que el ciclo se elongate.
+MAX_CONCURRENT_PRICE_CHECKS = int(os.getenv("MAX_CONCURRENT_PRICE_CHECKS", "6"))
+
+# Espera antes de volver a pedir precio a una posición cuyos proveedores
+# fallaron. Sin esto, cada posición muerta gastaba cuatro consultas por ciclo
+# (2s) para siempre: el consumo de red se disparaba y el monitor competía con
+# el handler del webhook por el mismo event loop.
+PRICE_RETRY_BACKOFF_SEC = float(os.getenv("PRICE_RETRY_BACKOFF_SEC", "30"))
+
 # Tiempo máximo que una posición puede permanecer activa antes de forzar la
 # salida (TIME_EXPIRED), independientemente de su PnL. Configurable via .env.
 MAX_HOLD_TIME_SEC = int(os.getenv("MAX_HOLD_TIME_SEC", "180"))
@@ -128,6 +139,9 @@ class TrackerPosition:
     # Instante en que la posición pasó a estar CONFIRMADA como muerta (streak
     # >= CONFIRMED_RUG_STREAK). Tras IMPLAUSIBLE_MAX_AGE_SEC se fuerza el cierre.
     implausible_confirm_time: float = 0.0
+    # Instante hasta el que no se vuelve a pedir precio a la red tras un fallo
+    # de los proveedores (evita el martilleo de 4 consultas cada 2s).
+    price_retry_at: float = 0.0
 
 
 class PositionTracker:
@@ -141,9 +155,27 @@ class PositionTracker:
         self.executor = executor
         self.notifier = notifier
         self.config = config
-        # Memoría global de posiciones activas (independiente del executor).
+        # Memoria global de posiciones activas (independiente del executor).
         self.positions: dict[str, TrackerPosition] = {}
+        # Callbacks de cierre: la estrategia de copy trading los usa para
+        # descontar el accumulado del trader que originó la posición. Sin ellos,
+        # cada cierre por TP/SL/trailing dejaba al bot creyendo que el trader
+        # seguía con sus tokens, y el siguiente ciclo del mismo mint vendía solo
+        # una fracción (100% -> 50% -> 33%...) hasta descontrolarse del todo.
+        self._close_hooks: list[Any] = []
         self._load_positions()
+
+    def register_close_hook(self, callback: Any) -> None:
+        """Registra un callback `f(mint, source_wallet, sold_pct, reason)`."""
+        if callable(callback) and callback not in self._close_hooks:
+            self._close_hooks.append(callback)
+
+    def _fire_close_hooks(self, pos: Any, sold_pct: float, reason: str) -> None:
+        for hook in list(self._close_hooks):
+            try:
+                hook(pos.mint, getattr(pos, "source_wallet", "") or "", sold_pct, reason)
+            except Exception as exc:  # noqa: BLE001 - un hook nunca rompe el cierre
+                logger.debug("Hook de cierre fallo para {}: {}", pos.mint, exc)
 
     # ------------------------------------------------------------- Público
     def add_position(
@@ -175,10 +207,18 @@ class PositionTracker:
         """Devuelve todas las posiciones abiertas para una wallet dada."""
         return [p for p in self.positions.values() if p.source_wallet == wallet]
 
-    def remove_position(self, mint: str) -> bool:
-        """Elimina la posición; devuelve True si existía."""
-        result = self.positions.pop(mint, None) is not None
+    def remove_position(
+        self, mint: str, *, reason: str = "", sold_pct: float = 100.0
+    ) -> bool:
+        """Elimina la posición; devuelve True si existía.
+
+        `reason` y `sold_pct` solo sirven para avisar a los hooks de cierre.
+        """
+        pos = self.positions.pop(mint, None)
+        result = pos is not None
         if result:
+            if pos is not None:
+                self._fire_close_hooks(pos, sold_pct, reason)
             self._save_positions()
         return result
 
@@ -242,18 +282,35 @@ class PositionTracker:
         Para cada posición obtiene el precio actual, calcula el PnL% y dispara
         la venta cuando se alcanza TAKE_PROFIT_PCT o STOP_LOSS_PCT, removiendo
         la posición del tracker tras ejecutar la salida.
+
+        Las revisiones se lanzan CONCURRENTES (con tope de simultaneidad) en vez
+        de una a una: una sola posición sin cotización encadena cuatro
+        proveedores (Pump.fun, bonding curve, DexScreener, Jupiter) y puede
+        tardar 20-25s. En serie, unas pocas posiciones muertas estiraban el ciclo
+        completo a minutos y el TP/SL de las posiciones sanas se retrasaba tanto
+        que el bot parecía dejar de copiar. Las ventas siguen siendo
+        serializadas por mint (ver `_sell_lock_for` en core/websocket.py).
         """
         logger.info("Monitoreo de posiciones iniciado (cada {:.0f}s)", CHECK_INTERVAL_SEC)
+        sem = asyncio.Semaphore(MAX_CONCURRENT_PRICE_CHECKS)
+
+        async def _check(mint: str) -> None:
+            async with sem:
+                await self._evaluate(mint)
+
         try:
             while True:
                 await asyncio.sleep(CHECK_INTERVAL_SEC)
-                for mint in list(self.positions.keys()):
-                    try:
-                        await self._evaluate(mint)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # noqa: BLE001 - nunca detener el monitor
-                        logger.warning("Error monitoreando {}: {}", mint, exc)
+                mints = list(self.positions.keys())
+                if mints:
+                    results = await asyncio.gather(
+                        *(_check(m) for m in mints), return_exceptions=True
+                    )
+                    for mint, res in zip(mints, results):
+                        if isinstance(res, asyncio.CancelledError):
+                            raise res
+                        if isinstance(res, Exception):
+                            logger.warning("Error monitoreando {}: {}", mint, res)
                 await self._reap_orphan_exec_positions()
         except asyncio.CancelledError:
             logger.info("Monitoreo de posiciones detenido.")
@@ -330,6 +387,24 @@ class PositionTracker:
 
         now = time.time()
 
+        # Backoff: una posición cuyos proveedores fallaron no se vuelve a
+        # interrogar en cada ciclo (2s). Respetar el vencimiento por tiempo
+        # ANTES de la consulta permite cerrarla aunque el precio siga sin
+        # salir, sin depender de la red.
+        if pos.price_retry_at and now < pos.price_retry_at:
+            max_hold = self._effective_hold(pos)
+            if max_hold > 0 and (now - pos.created_at > max_hold):
+                logger.info(
+                    "⏳ TIME EXPIRED (precio sin cotización) para {} ({}) tras {:.0f}s",
+                    mint, pos.symbol, max_hold,
+                )
+                ok = await process_sell_and_notify(
+                    pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=0.0,
+                )
+                if ok:
+                    self.remove_position(mint, reason="TIME_EXPIRED")
+            return
+
         try:
             current_price = await self._refresh_position_price(pos)
         except Exception as exc:  # noqa: BLE001
@@ -337,6 +412,7 @@ class PositionTracker:
             logger.warning("No se pudo obtener precio de {} ({}): {}", mint, pos.symbol, exc)
 
         if current_price is None or current_price <= 0:
+            pos.price_retry_at = time.time() + PRICE_RETRY_BACKOFF_SEC
             # Sin precio conocido: aplicar vencimiento por tiempo tambien a las
             # posiciones de copy trading (si MAX_COPY_TRADE_HOLD_SECONDS > 0).
             # Sin esto, una posicion mirror sin cotizacion queda abierta para
@@ -351,7 +427,7 @@ class PositionTracker:
                     pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=0.0,
                 )
                 if ok:
-                    self.remove_position(mint)
+                    self.remove_position(mint, reason="TIME_EXPIRED")
             return
 
         # --- Asignación dinámica del precio de entrada (BASE) ---
@@ -384,6 +460,7 @@ class PositionTracker:
 
         # Si el precio volvió a un rango creíble, resetear el streak de muerto
         # y el throttle para volver a monitorear con normalidad.
+        pos.price_retry_at = 0.0
         if pnl_pct > -99.0 and pos.implausible_streak:
             pos.implausible_streak = 0
             pos.next_throttle_refresh = 0.0
@@ -414,7 +491,7 @@ class PositionTracker:
                 pos.mint, pos.symbol, reason="TAKE_PROFIT", pnl=pnl_pct
             )
             if ok:
-                self.remove_position(mint)
+                self.remove_position(mint, reason="TAKE_PROFIT")
             return
         # PnL -100% (precio colapsado a dust respecto de la entrada) es casi
         # siempre un dato sucio (cotización sin decimales / quote de dust), no
@@ -444,7 +521,7 @@ class PositionTracker:
                         pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=pnl_pct
                     )
                     if ok:
-                        self.remove_position(mint)
+                        self.remove_position(mint, reason="TIME_EXPIRED")
                     return
                 elif now >= pos.next_throttle_refresh:
                     pos.next_throttle_refresh = time.time() + IMPLAUSIBLE_POLL_INTERVAL_SEC
@@ -467,7 +544,7 @@ class PositionTracker:
                 pos.mint, pos.symbol, reason="STOP_LOSS", pnl=pnl_pct
             )
             if ok:
-                self.remove_position(mint)
+                self.remove_position(mint, reason="STOP_LOSS")
             return
 
         # --- TRAILING STOP: proteger ganancias cuando el precio retrocede ---
@@ -491,7 +568,7 @@ class PositionTracker:
                         pos.mint, pos.symbol, reason="TRAILING_STOP", pnl=pnl_pct,
                     )
                     if ok:
-                        self.remove_position(mint)
+                        self.remove_position(mint, reason="TRAILING_STOP")
                     return
 
         # --- TIME_EXPIRED: sniper y copy trading (configurable) ---
@@ -505,7 +582,7 @@ class PositionTracker:
                 pos.mint, pos.symbol, reason="TIME_EXPIRED", pnl=pnl_pct
             )
             if ok:
-                self.remove_position(mint)
+                self.remove_position(mint, reason="TIME_EXPIRED")
             return
 
         # Progreso: si la posición sigue abierta (no se vendió por TP/SL o

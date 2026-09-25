@@ -8,7 +8,29 @@ import pandas as pd
 import pytest
 
 # Añadir directorio padre al path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _sandbox_state_files(tmp_path_factory):
+    """Ejecuta los tests en un CWD temporal.
+
+    El estado del bot (trade_stats.json, exec_positions.json, tracked_positions,
+    los ficheros de dedup...) se persiste con rutas RELATIVAS al CWD. Sin esto,
+    cada `pytest` machaca el estado real de la cuenta que se está operando y las
+    estadísticas acaban full de basura: se vio 44 ventas con 0 compras y 0
+    posiciones abiertas, imposible en trading real.
+
+    `sys.path` ya es absoluto (ROOT), así que los imports siguen funcionando.
+    """
+    original = os.getcwd()
+    sandbox = tmp_path_factory.mktemp("bot_state")
+    os.chdir(sandbox)
+    try:
+        yield sandbox
+    finally:
+        os.chdir(original)
 
 
 @pytest.fixture

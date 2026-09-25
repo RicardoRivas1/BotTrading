@@ -24,6 +24,12 @@ MAX_PLAUSIBLE_PNL_PCT = 10_000.0
 # trades se registran con excluded=True y NO contaminan la gráfica.
 MAX_TRUSTED_PNL_PCT = 500.0
 
+# Versión del formato de estadísticas. Se sube cuando cambia la CONTA del PnL
+# para que los ficheros antiguos (PnL del trader mezclado con nuestro capital y
+# un `sol_received` fabricado) se descarten en vez de seguir falseando el
+# "PnL Neto" de /stats. Decisión del usuario: empezar de cero.
+STATS_VERSION = 2
+
 
 @dataclass
 class TradeRecord:
@@ -109,6 +115,14 @@ class TradeStats:
             if "positions_opened" not in data:
                 self.path.unlink(missing_ok=True)
                 return
+            # Migracion v2: el PnL registrado era el del TRADER copiado junto a
+            # nuestro capital invertido, y el `sol_received` se derivaba del propio
+            # PnL. Ninguna de esas cifras correspondía a una operación real, así
+            # que el historial se reinicia (y a partir de aquí se registra el PnL
+            # MEDIDO de nuestra copia).
+            if int(data.get("stats_version", 0) or 0) < STATS_VERSION:
+                self.path.unlink(missing_ok=True)
+                return
             self.total_buys = data.get("total_buys", 0)
             self.total_sells = data.get("total_sells", 0)
             self.positions_opened = data.get("positions_opened", 0)
@@ -164,6 +178,7 @@ class TradeStats:
     def _save(self) -> None:
         try:
             data = {
+                "stats_version": STATS_VERSION,
                 "total_buys": self.total_buys,
                 "total_sells": self.total_sells,
                 "positions_opened": self.positions_opened,
@@ -205,6 +220,7 @@ class TradeStats:
         sell_time: float,
         sell_reason: str = "COPY_TRADE_SELL",
         sell_pct: float = 100.0,
+        pnl_unreliable: bool = False,
     ) -> TradeRecord:
         """Record a completed sell trade.
 
@@ -212,10 +228,21 @@ class TradeStats:
         polvo que fabrica +6000%) se registran en el historial con
         `excluded=True` pero NO cuentan en los agregados (promedio, win rate,
         mejor/peor trade, SOL): dejarían una gráfica mentirosa e inflada.
+
+        `pnl_unreliable=True` marca el trade como "sin PnL fiable" cuando no se
+        pudo obtener un PnL real (ni por delta de saldo ni por precio). Se guarda
+        para conservar el historial, pero con `pnl_pct=0`: contarlo como win o
+        loss inventaría un resultado, y su `sol_received` estimado (derivado del
+        propio PnL) no debe entrar en el "PnL Neto".
         """
         raw_pnl = float(pnl_pct)
-        excluded = raw_pnl > MAX_TRUSTED_PNL_PCT
+        excluded = raw_pnl > MAX_TRUSTED_PNL_PCT or pnl_unreliable
         pnl_pct = max(-100.0, min(raw_pnl, MAX_PLAUSIBLE_PNL_PCT))
+        if pnl_unreliable:
+            pnl_pct = 0.0
+            sol_invested = 0.0
+            sol_received = 0.0
+
         trade = TradeRecord(
             mint=mint,
             symbol=symbol,
@@ -336,8 +363,12 @@ class TradeStats:
         open_positions = self.positions_opened - self.positions_closed
         return {
             "total_buys": self.positions_opened,
-            "total_sells": self.total_sells,
+            # Contar solo los trades con PnL confiable: antes se mostraba el total
+            # (incluidos los excluidos) junto a wins/losses de los válidos, y
+            # "Ventas: 10 | Wins 3 | Losses 2" no cuadraba con nada.
+            "total_sells": len(valid),
             "excluded": self.excluded_count,
+            "sells_seen": self.total_sells,
             "open_positions": max(0, open_positions),
             "wins": wins,
             "losses": losses,
@@ -378,7 +409,7 @@ class TradeStats:
             "📊 <b>ESTADISTICAS DEL BOT</b>",
             "",
             f"🔄 Compras: {s['total_buys']} | Ventas: {s['total_sells']} | Abiertas: {s['open_positions']}"
-            + (f" | Excluidos: {s['excluded']}" if s['excluded'] else ""),
+            + (f" | Sin PnL fiable: {s['excluded']}" if s['excluded'] else ""),
             f"✅ Wins: {s['wins']} | ❌ Losses: {s['losses']}",
             f"🎯 Win Rate: <b>{s['win_rate_pct']}%</b>",
             f"💰 PnL Neto: <b>{s['total_pnl_pct']:+.2f}%</b> ({s['net_pnl_sol']:+.4f} SOL) | Promedio: {s['avg_pnl_pct']:+.2f}%",

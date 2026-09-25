@@ -297,6 +297,86 @@ def _estimate_tokens_from_position(pos: Any, executor: Any, mint: str) -> float:
     return 0.0
 
 
+# Un vendedor por token: tracker y copy trading.exit_. Vacía cuando todos los
+# locks están libres (nadie espera) para no crecer sin límite.
+_sell_locks: dict[str, asyncio.Lock] = {}
+
+
+def _sell_lock_for(mint: str) -> asyncio.Lock:
+    """Devuelve el lock de venta de `mint`, podando los que no esten en uso."""
+    lock = _sell_locks.get(mint)
+    if lock is None:
+        if len(_sell_locks) > 500:
+            for key in [k for k, v in _sell_locks.items() if not v.locked()]:
+                _sell_locks.pop(key, None)
+        lock = _sell_locks[mint] = asyncio.Lock()
+    return lock
+
+
+# El PnL medido se obtiene por diferencia de saldo de la WALLET, así que es una
+# magnitud compartida por TODOS los tokens. Si dos ventas de mints distintos se
+# miden a la vez, el SOL que entra en el saldo de una se cuela en el PnL de la
+# otra. Este lock serializa solo la ventana "leer saldo -> vender -> releer saldo"
+# (las cotizaciones del monitor, que es el bucle caliente, no se bloquean) y
+# siempre se toma DESPUÉS del lock por mint, de modo que no hay inversión de
+# orden. Las ventas son eventos raros frente a las consultas de precio, así que
+# la pérdida de paralelismo es irrelevante frente a un PnL inventado.
+_wallet_measure_lock = asyncio.Lock()
+
+
+def _apply_partial_sell_to_bookkeeping(
+    tracker: Any,
+    mint: str,
+    pos: Any,
+    sell_pct: float,
+    *,
+    reason: str = "",
+    account_source: bool = True,
+    persist: bool = True,
+) -> None:
+    """Descuenta la fracción vendida de los contadores de la posición.
+
+    Tras vender el X% el ejecutor seguía afirmando que teníamos el 100% del bag:
+    ese saldo era la base de los reintentos y de los diagnósticos, así que
+    terminaba describiendo tokens que ya no estaban en la wallet.
+
+    Además dispara los hooks de cierre con la fracción vendida. Los TP/SL/
+    trailing/time-expiry del tracker cierran sin pasar por la señal del trader, y
+    sin ese aviso el acumulado del bot seguía creciendo para el mismo mint: el
+    siguiente ciclo comparaba contra un total inventado y vendía cada vez menos
+    (50%, luego 33%, luego 25%...).
+    """
+    frac = max(0.0, min(1.0, sell_pct / 100.0))
+    if frac <= 0.0:
+        return
+    if pos is not None:
+        pos.amount = max(0.0, float(getattr(pos, "amount", 0.0) or 0.0) * (1.0 - frac))
+    exec_positions = getattr(tracker.executor, "positions", None)
+    if isinstance(exec_positions, dict):
+        exec_pos = exec_positions.get(mint)
+        if exec_pos is not None:
+            try:
+                exec_pos.token_amount_ui = max(
+                    0.0, float(getattr(exec_pos, "token_amount_ui", 0.0) or 0.0) * (1.0 - frac)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("No se pudo descontar token_amount_ui de {}: {}", mint, exc)
+    if account_source and pos is not None:
+        fire = getattr(tracker, "_fire_close_hooks", None)
+        if callable(fire):
+            fire(pos, sell_pct, reason)
+    if persist:
+        if isinstance(exec_positions, dict):
+            try:
+                tracker.executor._save_exec_positions()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("No se pudo persistir exec_positions: {}", exc)
+        try:
+            tracker._save_positions()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("No se pudo persistir positions: {}", exc)
+
+
 async def process_sell_and_notify(
     mint: str,
     symbol: str = "N/A",
@@ -305,6 +385,9 @@ async def process_sell_and_notify(
     pnl_copy: Optional[float] = None,
     sell_pct: float = 100.0,
     trader: str = "",
+    pnl_known: bool = True,
+    account_source: bool = True,
+    result: Optional[dict] = None,
 ) -> bool:
     """Vende (real o simulado) y notifica el motivo de la salida TP/SL.
 
@@ -312,6 +395,17 @@ async def process_sell_and_notify(
     En DRY_RUN solo registra la venta simulada. En modo real, el balance de
     tokens se estima desde la posición del tracker (`amount / buy_price`) y la
     cantidad se ajusta por sell_pct. Devuelve True si la salida se ejecutó.
+
+    `account_source=False` lo usa la estrategia de copy trading, que descuenta
+    por su cuenta los tokens del trader en la propia señal de venta: sin esta
+    marca el cierre se descontaría dos veces.
+
+    `pnl_known=False` indica que el PnL recibido no es fiable (falta la base de
+    costo del trader): se notifica "n/d" en vez de un número inventado.
+
+    Si se pasa `result` (dict), se rellena con `sol_proceeds`,
+    `copy_pnl_measured` e `invested_portion`: el PnL real de la copia medido por
+    delta de saldo, que la estrategia de copy trading usa para /stats.
     """
     from core.notifier import TelegramNotifier
     from core.tracker import get_global_tracker
@@ -322,7 +416,6 @@ async def process_sell_and_notify(
         chat_id=cfg.telegram.TELEGRAM_CHAT_ID,
     )
     tracker = get_global_tracker()
-    pos = tracker.get_position(mint)
 
     sell_pct = max(0.0, min(100.0, sell_pct))
 
@@ -343,89 +436,195 @@ async def process_sell_and_notify(
         and reason in ("TAKE_PROFIT", "STOP_LOSS", "TRAILING_STOP", "TIME_EXPIRED")
     )
 
-    # Registrar venta en estadísticas para salidas del tracker (TP/SL/TRAILING_STOP/etc.)
-    if reason != "COPY_TRADE_SELL" and pos and not quiet_dry_run_exit:
-        try:
-            from core.stats import get_trade_stats
-            _entry = getattr(pos, "buy_price", 0.0) or 0.0
-            _sol_inv = getattr(pos, "amount", 0.0) or 0.0
-            _portion_inv = _sol_inv * (sell_pct / 100.0)
-            _pnl_pct = max(-100.0, float(pnl))
-            _sol_rec = max(0.0, _portion_inv * (1.0 + _pnl_pct / 100.0))
-            _exit_price = _entry * (1.0 + _pnl_pct / 100.0) if _entry > 0 else 0.0
-            _wallet = getattr(pos, "source_wallet", "") or "tracker"
-            _buy_time = float(getattr(pos, "created_at", 0.0) or 0.0)
-            get_trade_stats().record_sell(
-                mint=mint,
-                symbol=symbol if symbol != "N/A" else getattr(pos, "symbol", mint[:6].upper()),
-                wallet=_wallet,
-                entry_price=_entry,
-                exit_price=_exit_price,
-                pnl_pct=_pnl_pct,
-                sol_invested=_portion_inv,
-                sol_received=_sol_rec,
-                buy_time=_buy_time,
-                sell_time=time.time(),
-                sell_reason=reason,
-                sell_pct=sell_pct,
-            )
-        except Exception as st_exc:
-            logger.debug("Error registrando venta en stats para {}: {}", mint, st_exc)
+    # Un único vendedor por mint: el tracker (task aparte) y la estrategia de
+    # copy trading (webhook/poll) pueden pedir la salida del MISMO token a la vez.
+    # Sin esta barrera ambos leen el saldo on-chain y lanzan dos ventas sobre los
+    # mismos tokens; la segunda se come el saldo o falla a medias.
+    lock = _sell_lock_for(mint)
+    async with lock:
+        # Releer DENTRO del lock: mientras esperamos, otra vía pudo cerrar o
+        # modificar la posición y el objeto previo quedaría obsoleto.
+        pos = tracker.get_position(mint)
 
-    try:
-        if cfg.trading.DRY_RUN:
-            logger.info(
-                "[DRY_RUN] Venta simulada de {} ({}) por {} (PnL {:.2f}%, pct={:.0f}%)",
-                symbol, mint, reason, pnl, sell_pct,
-            )
-            # If full sell, clean up positions and persist
-            if sell_pct >= 99.0:
-                tracker.executor.positions.pop(mint, None)
+        # Datos de la venta capturados ANTES de tocarla, para registrar en las
+        # stats el capital realmente invertido (en un cierre completo la posición
+        # se borra del mapa y en uno parcial su `amount` ya está descontado).
+        stat_entry = float(getattr(pos, "buy_price", 0.0) or 0.0) if pos else 0.0
+        stat_sol = float(getattr(pos, "amount", 0.0) or 0.0) if pos else 0.0
+        stat_wallet = (getattr(pos, "source_wallet", "") or "tracker") if pos else "tracker"
+        stat_buy_time = float(getattr(pos, "created_at", 0.0) or 0.0) if pos else 0.0
+        stat_symbol = symbol if symbol != "N/A" else (getattr(pos, "symbol", mint[:6].upper()) if pos else mint[:6].upper())
+
+        # Capital realmente invertido en ESTA venta (base del PnL medido). El
+        # executor lleva el dato exacto; el tracker solo tiene su `amount`.
+        exec_pos = getattr(tracker.executor, "positions", {}).get(mint)
+        _invested_total = float(getattr(exec_pos, "sol_invested", 0.0) or 0.0) if exec_pos else 0.0
+        if _invested_total <= 0:
+            _invested_total = stat_sol
+        invested_portion = _invested_total * (sell_pct / 100.0)
+
+        sold = False
+        sol_proceeds = 0.0
+        copy_pnl_measured: Optional[float] = None
+
+        def _finalize_full_sell() -> None:
+            tracker.executor.positions.pop(mint, None)
+            if account_source:
+                # Punto único de cierre: remove_position dispara los hooks que
+                # desactivan la contabilidad del trader copiado.
+                tracker.remove_position(mint, reason=reason, sold_pct=sell_pct)
+            else:
                 tracker.positions.pop(mint, None)
-                tracker.executor._save_exec_positions()
                 tracker._save_positions()
-            elif pos:
-                pos.amount = max(0.0, getattr(pos, "amount", 0.0) * (1.0 - sell_pct / 100.0))
-                tracker._save_positions()
-        else:
-            token_amount = await _resolve_tokens_to_sell(tracker, mint)
-            if token_amount <= 0:
-                logger.warning(f"Sin balance estimado para vender {symbol} ({mint}); omitiendo.")
-                return False
-            # Adjust by sell percentage
-            token_amount = token_amount * (sell_pct / 100.0)
-            if token_amount <= 0:
-                logger.warning(f"sell_pct={sell_pct:.0f}% resulta en 0 tokens para {symbol}; omitiendo.")
-                return False
-            sig = await tracker.executor.sell_token(mint, token_amount)
-            if not sig:
-                # La orden pudo enviarse pero NUNCA confirmarse on-chain
-                # (descartada, revertida o sin confirmacion). Si se diera por
-                # cerrada aqui, la posicion se borraria con los tokens aun en
-                # la wallet: el bot dejaria de venderlos para siempre.
-                logger.error(
-                    "Venta de {} ({}) NO confirmada on-chain: la posicion se mantiene "
-                    "abierta para reintentar",
-                    symbol, mint,
+            tracker.executor._save_exec_positions()
+
+        try:
+            if cfg.trading.DRY_RUN:
+                logger.info(
+                    "[DRY_RUN] Venta simulada de {} ({}) por {} (PnL {:.2f}%, pct={:.0f}%)",
+                    symbol, mint, reason, pnl, sell_pct,
                 )
-                return False
-            logger.success(
-                "Venta de {} ({}) ejecutada por {} ({:.0f}% | PnL {:.2f}% | sig={})",
-                symbol, mint, reason, sell_pct, pnl, sig,
-            )
-            # If full sell, clean up positions and persist
-            if sell_pct >= 99.0:
-                tracker.executor.positions.pop(mint, None)
-                tracker.positions.pop(mint, None)
-                tracker.executor._save_exec_positions()
-                tracker._save_positions()
-            elif pos:
-                pos.amount = max(0.0, getattr(pos, "amount", 0.0) * (1.0 - sell_pct / 100.0))
-                tracker._save_positions()
-    except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
-        logger.error(f"Error vendiendo {symbol} ({reason}): {exc}")
-        await notifier.send_error(f"No se pudo vender {symbol} ({mint}) por {reason}: {exc}")
-        return False
+                sold = True
+                # If full sell, clean up positions and persist
+                if sell_pct >= 99.0:
+                    _finalize_full_sell()
+                else:
+                    _apply_partial_sell_to_bookkeeping(
+                        tracker,
+                        mint,
+                        pos,
+                        sell_pct,
+                        reason=reason,
+                        account_source=account_source,
+                        persist=True,
+                    )
+            else:
+                token_amount = await _resolve_tokens_to_sell(tracker, mint)
+                if token_amount <= 0:
+                    logger.warning(f"Sin balance estimado para vender {symbol} ({mint}); omitiendo.")
+                    return False
+                # Adjust by sell percentage
+                token_amount = token_amount * (sell_pct / 100.0)
+                if token_amount <= 0:
+                    logger.warning(f"sell_pct={sell_pct:.0f}% resulta en 0 tokens para {symbol}; omitiendo.")
+                    return False
+                # Ventana de medición: el delta de saldo de la wallet solo es
+                # atribuible a esta venta si ninguna otra se mueve a la vez.
+                async with _wallet_measure_lock:
+                    sol_before = 0.0
+                    try:
+                        sol_before = await tracker.executor.get_sol_balance()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("No se pudo leer el saldo SOL antes de vender {}: {}", mint, exc)
+                    sig = await tracker.executor.sell_token(mint, token_amount)
+                    if not sig:
+                        # La orden pudo enviarse pero NUNCA confirmarse on-chain
+                        # (descartada, revertida o sin confirmacion). Si se diera por
+                        # cerrada aqui, la posicion se borraria con los tokens aun en
+                        # la wallet: el bot dejaria de venderlos para siempre.
+                        logger.error(
+                            "Venta de {} ({}) NO confirmada on-chain: la posicion se mantiene "
+                            "abierta para reintentar",
+                            symbol, mint,
+                        )
+                        return False
+                    logger.success(
+                        "Venta de {} ({}) ejecutada por {} ({:.0f}% | PnL {:.2f}% | sig={})",
+                        symbol, mint, reason, sell_pct, pnl, sig,
+                    )
+                    if sol_before > 0:
+                        try:
+                            sol_after = await tracker.executor.get_sol_balance()
+                        except Exception as exc:  # noqa: BLE001
+                            sol_after = 0.0
+                            logger.debug("No se pudo leer el saldo SOL tras vender {}: {}", mint, exc)
+                        if sol_after > 0:
+                            sol_proceeds = max(0.0, sol_after - sol_before)
+                            if invested_portion > 0:
+                                copy_pnl_measured = (
+                                    (sol_proceeds - invested_portion) / invested_portion
+                                ) * 100.0
+                                logger.info(
+                                    "PnL REAL de la copia en {}: {:+.2f}% | recibido {:.6f} SOL "
+                                    "vs invertido {:.6f} SOL",
+                                    mint, copy_pnl_measured, sol_proceeds, invested_portion,
+                                )
+                            else:
+                                logger.warning(
+                                    "Venta de {} sin capital de referencia (invertido=0): "
+                                    "no se puede medir el PnL real",
+                                    mint,
+                                )
+                sold = True
+                # If full sell, clean up positions and persist
+                if sell_pct >= 99.0:
+                    _finalize_full_sell()
+                else:
+                    _apply_partial_sell_to_bookkeeping(
+                        tracker,
+                        mint,
+                        pos,
+                        sell_pct,
+                        reason=reason,
+                        account_source=account_source,
+                        persist=True,
+                    )
+        except Exception as exc:  # noqa: BLE001 - fallo operativo no bloqueante
+            logger.error(f"Error vendiendo {symbol} ({reason}): {exc}")
+            await notifier.send_error(f"No se pudo vender {symbol} ({mint}) por {reason}: {exc}")
+            return False
+
+        # Se entrega a la estrategia de copy trading (que lo pide vía `result`)
+        # para que /stats use el valor medido y no una estimación por precio.
+        if isinstance(result, dict):
+            result["sol_proceeds"] = sol_proceeds
+            result["copy_pnl_measured"] = copy_pnl_measured
+            result["invested_portion"] = invested_portion
+
+        # Registrar en estadísticas para salidas del tracker (TP/SL/TRAILING_STOP/
+        # etc.) SOLO si la venta ocurrió de verdad. Antes se registraba antes de
+        # intentar la venta, así que cada venta fallida o no confirmada metía un
+        # trade fantasma en /stats.
+        if sold and reason != "COPY_TRADE_SELL" and pos and not quiet_dry_run_exit:
+            try:
+                from core.stats import get_trade_stats
+                # Base del PnL: el capital real invertido (el executor lo sabe
+                # exacto; el `amount` del tracker es una aproximación).
+                _portion_inv = invested_portion if invested_portion > 0 else (
+                    stat_sol * (sell_pct / 100.0)
+                )
+                # Preferimos el PnL MEDIDO por delta de saldo. Si no se pudo
+                # medir, el PnL por precio es una estimación: se marca como no
+                # fiable en vez de contarlo como resultado (era el origen de las
+                # gráficas con PnL inventado).
+                _pnl_unreliable = copy_pnl_measured is None
+                _pnl_pct = (
+                    max(-100.0, float(copy_pnl_measured))
+                    if not _pnl_unreliable
+                    else max(-100.0, float(pnl))
+                )
+                # `sol_received` deja de ser `_portion_inv * (1 + pnl)`, que es
+                # una identidad algebraica del PnL (es decir, no mediía nada):
+                # ahora es el SOL realmente obtenido por la venta.
+                _sol_rec = sol_proceeds if sol_proceeds > 0 else 0.0
+                _exit_price = stat_entry * (1.0 + _pnl_pct / 100.0) if stat_entry > 0 else 0.0
+                get_trade_stats().record_sell(
+                    mint=mint,
+                    symbol=stat_symbol,
+                    wallet=stat_wallet,
+                    entry_price=stat_entry,
+                    exit_price=_exit_price,
+                    pnl_pct=_pnl_pct,
+                    sol_invested=_portion_inv,
+                    sol_received=_sol_rec,
+                    buy_time=stat_buy_time,
+                    sell_time=time.time(),
+                    sell_reason=reason,
+                    sell_pct=sell_pct,
+                    pnl_unreliable=_pnl_unreliable,
+                )
+            except Exception as st_exc:
+                logger.debug("Error registrando venta en stats para {}: {}", mint, st_exc)
 
     if quiet_dry_run_exit:
         logger.info(
@@ -445,13 +644,20 @@ async def process_sell_and_notify(
     elif reason == "TRAILING_STOP":
         await notifier.send_trailing_stop(mint, pnl)
     else:
-        copy_txt = ""
-        if pnl_copy is not None:
-            copy_txt = f" | Copia {pnl_copy:+.2f}%"
+        # El PnL de la copia se muestra MEDIDO (delta real de saldo) cuando se
+        # pudo calcular; si no, se marca como no disponible en vez de enseñar una
+        # estimación por precio como si fuera el resultado.
+        if copy_pnl_measured is not None:
+            copy_txt = f" | Mi copia {copy_pnl_measured:+.2f}% (medido)"
+        elif pnl_copy is not None:
+            copy_txt = f" | Mi copia {pnl_copy:+.2f}% (estimado)"
+        else:
+            copy_txt = " | Mi copia n/d"
+        pnl_txt = f"PnL trader {pnl:+.2f}%" if pnl_known else "PnL trader n/d"
         trader_txt = f" | Trader: {trader}" if trader else ""
         await notifier.send_status(
             f"Venta de {symbol} ({mint}) por {reason} "
-            f"({sell_pct:.0f}% | PnL {pnl:.2f}%){copy_txt}{trader_txt}"
+            f"({sell_pct:.0f}% | {pnl_txt}{copy_txt}{trader_txt}"
         )
     return True
 

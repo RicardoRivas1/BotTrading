@@ -410,6 +410,113 @@ class TestCheckPosition:
         assert pos.entry_price == 0.0010  # se re-fija con el primer precio real
 
 
+class TestBackoffDePrecio:
+    """Un precio que no llega NO puede martillear la API cada 2 segundos.
+
+    El síntoma era un bot que "se queda pegado": el monitor secuencial esperaba
+    a cada proveedor caído y, con muchas posiciones, el ciclo entero se iba en
+    timeouts. Con el backoff, la posición se reintenta cada
+    PRICE_RETRY_BACKOFF_SEC y el ciclo no se bloquea.
+    """
+
+    async def test_precio_ausente_arma_el_reintento(
+        self, tracker: PositionTracker, patch_sell: AsyncMock
+    ) -> None:
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+        tracker.executor.get_token_price = AsyncMock(return_value=0.0)
+
+        await tracker._evaluate("MINT123ABC")
+
+        assert tracker.get_position("MINT123ABC").price_retry_at > 0.0
+        assert tracker.executor.get_token_price.await_count == 1
+
+    async def test_durante_el_backoff_no_se_vuelve_a_consultar(
+        self, tracker: PositionTracker, patch_sell: AsyncMock
+    ) -> None:
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+        tracker.executor.get_token_price = AsyncMock(return_value=0.0)
+
+        await tracker._evaluate("MINT123ABC")
+        await tracker._evaluate("MINT123ABC")
+        await tracker._evaluate("MINT123ABC")
+
+        # Una sola consulta para tres ciclos: el proveedor caido no se reintenta.
+        assert tracker.executor.get_token_price.await_count == 1
+        # Y la posicion sigue viva (no se cierra por falta de precio).
+        assert tracker.get_position("MINT123ABC") is not None
+
+    async def test_un_precio_valido_reabre_el_ciclo(
+        self, tracker: PositionTracker, patch_sell: AsyncMock
+    ) -> None:
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+        tracker.executor.get_token_price = AsyncMock(side_effect=[0.0, 0.0015])
+
+        await tracker._evaluate("MINT123ABC")
+        tracker.get_position("MINT123ABC").price_retry_at = 0.0
+        await tracker._evaluate("MINT123ABC")
+
+        assert tracker.executor.get_token_price.await_count == 2
+        assert tracker.get_position("MINT123ABC").latest_pnl_pct == pytest.approx(50.0)
+
+
+class TestHookDeCierre:
+    """remove_position avisa a los hooks con el % realmente vendido."""
+
+    def test_hook_recibe_mint_wallet_porcentaje_y_motivo(
+        self, tracker: PositionTracker
+    ) -> None:
+        calls: list[tuple[str, str, float, str]] = []
+        tracker.register_close_hook(
+            lambda mint, wallet, pct, reason: calls.append((mint, wallet, pct, reason))
+        )
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+
+        assert tracker.remove_position("MINT123ABC", reason="TAKE_PROFIT") is True
+
+        assert calls == [("MINT123ABC", "", 100.0, "TAKE_PROFIT")]
+
+    def test_hook_recibe_el_porcentaje_parcial(
+        self, tracker: PositionTracker
+    ) -> None:
+        seen: list[float] = []
+        tracker.register_close_hook(
+            lambda mint, wallet, pct, reason: seen.append(pct)
+        )
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+
+        tracker.remove_position("MINT123ABC", reason="TRAILING_STOP", sold_pct=25.0)
+
+        assert seen == [25.0]
+
+    def test_un_hook_roto_no_impide_cierre_ni_otros_hooks(
+        self, tracker: PositionTracker
+    ) -> None:
+        visto: list[str] = []
+
+        def _roto(mint: str, wallet: str, pct: float, reason: str) -> None:
+            raise RuntimeError("hook roto")
+
+        tracker.register_close_hook(_roto)
+        tracker.register_close_hook(lambda mint, wallet, pct, reason: visto.append(mint))
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+
+        assert tracker.remove_position("MINT123ABC") is True
+        assert tracker.get_position("MINT123ABC") is None
+        assert visto == ["MINT123ABC"]
+
+    def test_el_registro_marca_como_ya_registrado(
+        self, tracker: PositionTracker
+    ) -> None:
+        cb = MagicMock()
+        tracker.register_close_hook(cb)
+        tracker.register_close_hook(cb)
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+
+        tracker.remove_position("MINT123ABC")
+
+        cb.assert_called_once()
+
+
 class TestGlobalTracker:
     """Instancia compartida del tracker (singleton global)."""
 
