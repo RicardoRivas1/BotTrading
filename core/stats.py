@@ -13,9 +13,16 @@ from typing import Optional
 
 # Tope de PnL plausible para una venta real (100x). Un PnL superior casi
 # siempre es una cotización dust o un costo de entrada mal calculado
-# (p.ej. +1659118% por cost_of_sold de polvo), y su sola presencia confunde
-# los mensajes y distorsiona las stats (promedio, mejor trade).
+# (p.ej. +1659118% por cost_of_sold de polvo). Se usa solo como cota de
+# almacenamiento (seguridad); a partir de MAX_TRUSTED_PNL_PCT el trade se
+# EXCLUYE de las stats (no cuenta en promedio/wins/mejor/SOL).
 MAX_PLAUSIBLE_PNL_PCT = 10_000.0
+
+# PnL máximo que se TRATA como resultado real. Por encima de esto (5x) el
+# bot casi siempre está midiendo polvo/costo mal atribuido (p.ej. +6072%
+# con entry == precio de salida = "ganancia" puramente fabricada). Esos
+# trades se registran con excluded=True y NO contaminan la gráfica.
+MAX_TRUSTED_PNL_PCT = 500.0
 
 
 @dataclass
@@ -35,6 +42,7 @@ class TradeRecord:
     hold_seconds: float = 0.0
     sell_reason: str = "COPY_TRADE_SELL"
     sell_pct: float = 100.0  # percentage of position sold
+    excluded: bool = False  # True si el PnL es implausible: NO cuenta en las stats
 
     def __post_init__(self) -> None:
         if self.hold_seconds == 0.0:
@@ -109,7 +117,47 @@ class TradeStats:
                 self.trades.append(TradeRecord(**t))
             for w_data in data.get("wallets", {}).values():
                 ws = WalletStats(**w_data)
-                self.wallets[ws.wallet] = ws
+                self.wallets.setdefault(ws.wallet, ws)
+
+            # Migracion: los PnL absurdos de la era pre-migracion (>MAX_TRUSTED
+            # grabados tal cual, p.ej. +6072% con entry==exit) se MARCA como
+            # excluded en vez de borrarse: el historial se conserva pero NO
+            # contaminan promedio / mejor trade / net SOL de la grafica.
+            need_rebuild = False
+            old_buys = {addr: ws.buys for addr, ws in self.wallets.items()}
+            for t in self.trades:
+                if not t.excluded and t.pnl_pct > MAX_TRUSTED_PNL_PCT:
+                    t.excluded = True
+                    need_rebuild = True
+            if need_rebuild:
+                # Recalcular los agregados por wallet desde los trades validos
+                # (con la contabilidad vieja los PnL falsos entraban adentro).
+                self.wallets = {}
+                for t in self.trades:
+                    if t.excluded:
+                        continue
+                    ws = self._get_wallet(t.wallet)
+                    ws.sells += 1
+                    ws.total_pnl_pct += t.pnl_pct
+                    ws.total_sol_invested += t.sol_invested
+                    ws.total_sol_received += t.sol_received
+                    if t.pnl_pct >= 0:
+                        ws.wins += 1
+                    else:
+                        ws.losses += 1
+                    if t.pnl_pct > ws.best_trade_pct:
+                        ws.best_trade_pct = t.pnl_pct
+                    if t.pnl_pct < ws.worst_trade_pct:
+                        ws.worst_trade_pct = t.pnl_pct
+                    n = ws.sells
+                    ws.avg_hold_seconds = (
+                        ws.avg_hold_seconds * (n - 1) + t.hold_seconds
+                    ) / n if n > 0 else t.hold_seconds
+                # El contador de compras (record_buy) no queda en la lista de
+                # trades: se preserva de los agregados viejos.
+                for addr, n in old_buys.items():
+                    self.wallets.setdefault(addr, WalletStats(wallet=addr)).buys = n
+                self._save()
         except Exception:
             pass
 
@@ -158,8 +206,16 @@ class TradeStats:
         sell_reason: str = "COPY_TRADE_SELL",
         sell_pct: float = 100.0,
     ) -> TradeRecord:
-        """Record a completed sell trade."""
-        pnl_pct = max(-100.0, min(float(pnl_pct), MAX_PLAUSIBLE_PNL_PCT))
+        """Record a completed sell trade.
+
+        Los trades con PnL implausible (>`MAX_TRUSTED_PNL_PCT`, p.ej. costo de
+        polvo que fabrica +6000%) se registran en el historial con
+        `excluded=True` pero NO cuentan en los agregados (promedio, win rate,
+        mejor/peor trade, SOL): dejarían una gráfica mentirosa e inflada.
+        """
+        raw_pnl = float(pnl_pct)
+        excluded = raw_pnl > MAX_TRUSTED_PNL_PCT
+        pnl_pct = max(-100.0, min(raw_pnl, MAX_PLAUSIBLE_PNL_PCT))
         trade = TradeRecord(
             mint=mint,
             symbol=symbol,
@@ -173,11 +229,17 @@ class TradeStats:
             sell_time=sell_time,
             sell_reason=sell_reason,
             sell_pct=sell_pct,
+            excluded=excluded,
         )
         self.trades.append(trade)
         self.total_sells += 1
         if sell_pct >= 99.0:
             self.positions_closed += 1
+
+        # PnL no confiable: queda en el historial pero fuera de las métricas.
+        if excluded:
+            self._save()
+            return trade
 
         ws = self._get_wallet(wallet)
         ws.sells += 1
@@ -208,21 +270,30 @@ class TradeStats:
 
     # ---- Summary methods ----
 
+    def _valid_trades(self) -> list[TradeRecord]:
+        """Trades con PnL confiable (los excluidos NO cuentan en las stats)."""
+        return [t for t in self.trades if not t.excluded]
+
+    @property
+    def excluded_count(self) -> int:
+        return sum(1 for t in self.trades if t.excluded)
+
     @property
     def win_rate(self) -> float:
-        return (self.total_sells - self._losses) / self.total_sells * 100 if self.total_sells > 0 else 0.0
+        valid = self._valid_trades()
+        return (len(valid) - self._losses) / len(valid) * 100 if valid else 0.0
 
     @property
     def _losses(self) -> int:
-        return sum(1 for t in self.trades if t.pnl_pct < 0)
+        return sum(1 for t in self._valid_trades() if t.pnl_pct < 0)
 
     @property
     def total_sol_invested(self) -> float:
-        return sum(t.sol_invested for t in self.trades)
+        return sum(t.sol_invested for t in self._valid_trades())
 
     @property
     def total_sol_received(self) -> float:
-        return sum(t.sol_received for t in self.trades)
+        return sum(t.sol_received for t in self._valid_trades())
 
     @property
     def net_pnl_sol(self) -> float:
@@ -230,11 +301,12 @@ class TradeStats:
 
     @property
     def sum_pnl_pct(self) -> float:
-        return sum(t.pnl_pct for t in self.trades)
+        return sum(t.pnl_pct for t in self._valid_trades())
 
     @property
     def avg_pnl_pct(self) -> float:
-        return (self.sum_pnl_pct / len(self.trades)) if self.trades else 0.0
+        valid = self._valid_trades()
+        return (self.sum_pnl_pct / len(valid)) if valid else 0.0
 
     @property
     def net_pnl_pct(self) -> float:
@@ -248,32 +320,36 @@ class TradeStats:
 
     @property
     def best_trade(self) -> Optional[TradeRecord]:
-        return max(self.trades, key=lambda t: t.pnl_pct) if self.trades else None
+        valid = self._valid_trades()
+        return max(valid, key=lambda t: t.pnl_pct) if valid else None
 
     @property
     def worst_trade(self) -> Optional[TradeRecord]:
-        return min(self.trades, key=lambda t: t.pnl_pct) if self.trades else None
+        valid = self._valid_trades()
+        return min(valid, key=lambda t: t.pnl_pct) if valid else None
 
     def summary(self) -> dict:
-        """Return a dict summary of all stats."""
-        wins = sum(1 for t in self.trades if t.pnl_pct >= 0)
-        losses = sum(1 for t in self.trades if t.pnl_pct < 0)
+        """Return a dict summary of all stats (solo trades con PnL confiable)."""
+        valid = self._valid_trades()
+        wins = sum(1 for t in valid if t.pnl_pct >= 0)
+        losses = sum(1 for t in valid if t.pnl_pct < 0)
         open_positions = self.positions_opened - self.positions_closed
         return {
             "total_buys": self.positions_opened,
             "total_sells": self.total_sells,
+            "excluded": self.excluded_count,
             "open_positions": max(0, open_positions),
             "wins": wins,
             "losses": losses,
-            "win_rate_pct": round(wins / self.total_sells * 100, 1) if self.total_sells > 0 else 0.0,
+            "win_rate_pct": round(wins / len(valid) * 100, 1) if valid else 0.0,
             "total_pnl_pct": round(self.net_pnl_pct, 2),
             "avg_pnl_pct": round(self.avg_pnl_pct, 2),
             "net_pnl_sol": round(self.net_pnl_sol, 4),
             "best_trade_pct": round(self.best_trade.pnl_pct, 2) if self.best_trade else 0.0,
             "worst_trade_pct": round(self.worst_trade.pnl_pct, 2) if self.worst_trade else 0.0,
             "avg_hold_seconds": round(
-                sum(t.hold_seconds for t in self.trades) / len(self.trades), 0
-            ) if self.trades else 0.0,
+                sum(t.hold_seconds for t in valid) / len(valid), 0
+            ) if valid else 0.0,
             "wallets": {w: {
                 "buys": ws.buys,
                 "sells": ws.sells,
@@ -301,7 +377,8 @@ class TradeStats:
         lines = [
             "📊 <b>ESTADISTICAS DEL BOT</b>",
             "",
-            f"🔄 Compras: {s['total_buys']} | Ventas: {s['total_sells']} | Abiertas: {s['open_positions']}",
+            f"🔄 Compras: {s['total_buys']} | Ventas: {s['total_sells']} | Abiertas: {s['open_positions']}"
+            + (f" | Excluidos: {s['excluded']}" if s['excluded'] else ""),
             f"✅ Wins: {s['wins']} | ❌ Losses: {s['losses']}",
             f"🎯 Win Rate: <b>{s['win_rate_pct']}%</b>",
             f"💰 PnL Neto: <b>{s['total_pnl_pct']:+.2f}%</b> ({s['net_pnl_sol']:+.4f} SOL) | Promedio: {s['avg_pnl_pct']:+.2f}%",

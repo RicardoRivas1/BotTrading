@@ -1,11 +1,12 @@
 """Tests del tope de PnL plausible en las estadísticas.
 
-Un PnL disparatado (+1659118%, +110541%...) por cotización dust o costo mal
-calculado ya no debe colarse a las stats: se limita a MAX_PLAUSIBLE_PNL_PCT
-para no inflar promedio ni mejor trade.
+Un PnL disparatado (+1659118%, +6072%...) por cotización dust o costo mal
+calculado ya no debe colarse a las stats: se registra con `excluded=True`
+(historial conservado, clamp de seguridad) y queda FUERA de promedio, win
+rate, mejor/peor trade y net SOL para no inflar la gráfica.
 """
 
-from core.stats import MAX_PLAUSIBLE_PNL_PCT, TradeStats
+from core.stats import MAX_PLAUSIBLE_PNL_PCT, MAX_TRUSTED_PNL_PCT, TradeStats
 
 
 def _record(stats: TradeStats, pnl_pct: float, sol_inv: float = 0.05) -> None:
@@ -24,17 +25,37 @@ def _record(stats: TradeStats, pnl_pct: float, sol_inv: float = 0.05) -> None:
     )
 
 
-def test_pnl_absurdo_se_limita(tmp_path):
+def test_pnl_absurdo_se_excluye(tmp_path):
     stats = TradeStats(path=str(tmp_path / "stats.json"))
     _record(stats, 1_659_118.72)
     _record(stats, 110_541.12)
 
     s = stats.summary()
+    # Quedan en el historial (clamped por seguridad) pero marcados excluidos
     assert stats.trades[0].pnl_pct == MAX_PLAUSIBLE_PNL_PCT
-    assert stats.trades[1].pnl_pct == MAX_PLAUSIBLE_PNL_PCT
-    # Ni promedio ni mejor trade se disparan
-    assert s["best_trade_pct"] == MAX_PLAUSIBLE_PNL_PCT
-    assert s["avg_pnl_pct"] == MAX_PLAUSIBLE_PNL_PCT
+    assert stats.trades[0].excluded is True
+    assert stats.trades[1].excluded is True
+    assert stats.excluded_count == 2
+    # No contaminan promedio ni mejor trade
+    assert s["best_trade_pct"] == 0.0
+    assert s["avg_pnl_pct"] == 0.0
+    assert s["wins"] == 0 and s["losses"] == 0
+
+
+def test_pnl_sobre_max_trusted_tambien_queda_fuera(tmp_path):
+    stats = TradeStats(path=str(tmp_path / "stats.json"))
+    _record(stats, 2_000.0)  # +2000% = 20x, absurdo aunque < MAX_PLAUSIBLE
+    _record(stats, 60.0)     # trade normal
+
+    s = stats.summary()
+    assert stats.trades[0].excluded is True
+    assert stats.trades[1].excluded is False
+    assert stats.excluded_count == 1
+    valid = [t for t in stats.trades if not t.excluded]
+    assert len(valid) == 1 and valid[0].pnl_pct == 60.0
+    assert s["best_trade_pct"] == 60.0
+    assert s["avg_pnl_pct"] == 60.0
+    assert s["net_pnl_sol"] == 0.03  # 0.05 * 1.60 - 0.05
 
 
 def test_pnl_perdida_no_baja_de_mas_100(tmp_path):

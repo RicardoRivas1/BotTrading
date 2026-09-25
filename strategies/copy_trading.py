@@ -24,7 +24,7 @@ import aiohttp
 from loguru import logger
 
 from core.engine.strategy import Strategy, StrategyState
-from core.stats import MAX_PLAUSIBLE_PNL_PCT
+from core.stats import MAX_TRUSTED_PNL_PCT
 
 # Token SOL nativo
 SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -1856,18 +1856,39 @@ class CopyTradingStrategy(Strategy):
                                     current_value, si, pnl_pct,
                                 )
 
+                    # --- Corregir PnL imposible con el PnL POR PRECIO ---
+                    # El PnL por costo del trader (cost_of_sold dust o proceeds
+                    # sub-capturados) fabrica valores que no existen: +6072% con
+                    # entry == cotización (la copia rindió 0%) o -100% cuando el
+                    # precio solo cayó 40%. Con entrada y precio actual fiables,
+                    # el PnL por precio (entry vs current) es la verdad de
+                    # mercado y lo que realmente rindió la copia.
+                    if (
+                        entry > 0
+                        and current_price > 0
+                        and (pnl_pct > MAX_TRUSTED_PNL_PCT or pnl_pct <= -99.0)
+                    ):
+                        market_pnl = (current_price - entry) / entry * 100.0
+                        logger.warning(
+                            "CopyTrading: PnL {:.2f}% imposible para {}; usando PnL por precio {:.2f}% (entry={:.10g} current={:.10g})",
+                            pnl_pct, signal.token_mint[:12] + "...",
+                            market_pnl, entry, current_price,
+                        )
+                        pnl_pct = market_pnl
+
                     # Clamp PnL: en spot trading la pérdida nunca puede ser peor que -100%
                     pnl_pct = max(-100.0, pnl_pct)
-                    # Un PnL disparatadamente alto (>100x) casi siempre es costo de
-                    # polvo (cost_of_sold dust) o sell_proceeds mal atribuido. Se
-                    # limita para no confundir mensajes ni distorsionar las stats.
-                    if pnl_pct > MAX_PLAUSIBLE_PNL_PCT:
+                    # Cualquier PnL irreal (>MAX_TRUSTED) que sobreviva se limita
+                    # a ese valor para no spamear mensajes absurdos; en stats se
+                    # EXCLUYE (record_sell marca excluded=True) y no distorsiona
+                    # la gráfica.
+                    if pnl_pct > MAX_TRUSTED_PNL_PCT:
                         logger.warning(
-                            "CopyTrading: PnL {:.2f}% implausible para {} (sell_proceeds={:.6f} sold_tok={:.6g} avg_cost={:.10g}); limitado a {:.0f}% en stats/notificación",
+                            "CopyTrading: PnL {:.2f}% implausible para {} (sell_proceeds={:.6f} sold_tok={:.6g} avg_cost={:.10g}); limitado a {:.0f}% en notificación y EXCLUIDO de stats",
                             pnl_pct, signal.token_mint[:12] + "...",
-                            sell_proceeds, sold_tok, avg_cost, MAX_PLAUSIBLE_PNL_PCT,
+                            sell_proceeds, sold_tok, avg_cost, MAX_TRUSTED_PNL_PCT,
                         )
-                        pnl_pct = MAX_PLAUSIBLE_PNL_PCT
+                        pnl_pct = MAX_TRUSTED_PNL_PCT
                     if abs(pnl_pct) >= 99.9:
                         logger.warning(
                             "CopyTrading: PnL {:.2f}% cerca del limite para {} (sell_proceeds={} sold_tok={} w_sol={} accumulated={} avg_cost={})",
