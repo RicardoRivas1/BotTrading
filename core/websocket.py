@@ -212,6 +212,91 @@ async def process_buy_and_notify(
     )
 
 
+async def _resolve_tokens_to_sell(tracker: Any, mint: str) -> float:
+    """Tokens que la wallet del bot tiene REALMENTE de `mint` (unidades humanas).
+
+    La fuente de verdad es el SALDO ON-CHAIN de la wallet. Antes se calculaba
+    como `tracker.amount / tracker.buy_price`, lo que rompia en dos casos
+    reales y dejaba al bot sin vender:
+
+    - `buy_price == 0` (la entrada quedo PENDIENTE, tipico en compras
+      PumpPortal) => 0 tokens => "Sin balance estimado" => venta omitida.
+    - La posicion solo existia en `executor.positions` (no en el tracker, p.ej.
+      tras un reinicio o un reap) => `pos is None` => venta omitida aunque los
+      tokens estuvieran en la wallet.
+
+    Orden de fuentes: on-chain > posicion del executor > posicion del tracker.
+    Si la posicion del tracker tiene un saldo creible (es la unica que conoce
+    el saldo para mints ya migrados fuera del ATA) y coincide con el
+    on-chain, se usa ese. Ante cualquier duda, el saldo real manda.
+    """
+    executor = getattr(tracker, "executor", None)
+    pos = tracker.get_position(mint) if hasattr(tracker, "get_position") else None
+
+    chain = 0.0
+    chain_error = False
+    getter = getattr(executor, "get_token_balance_ui", None)
+    if getter is not None:
+        try:
+            raw = await getter(mint)
+        except Exception as exc:  # noqa: BLE001 - la venta no puede morir por esto
+            raw = -1.0
+            logger.debug("Balance on-chain de {} no disponible: {}", mint, exc)
+        if raw is not None and float(raw) >= 0:
+            chain = float(raw)
+        else:
+            chain_error = True
+
+    tracker_amount = 0.0
+    if pos is not None:
+        est = _estimate_tokens_from_position(pos, executor, mint)
+        if est > 0:
+            tracker_amount = est
+
+    if not chain_error and chain > 0:
+        if tracker_amount > 0:
+            # El tracker solo conhece el saldo mientras el token sigue en el
+            # ATA. Si migró a una cuenta SPL alterna, el on-chain (todas las
+            # cuentas del dueño) es el unico que lo ve: gana el on-chain.
+            logger.debug(
+                "Saldo a vender de {}: on-chain {:.6g} (tracker estimaba {:.6g})",
+                mint, chain, tracker_amount,
+            )
+        return chain
+
+    if tracker_amount > 0:
+        logger.warning(
+            "Saldo on-chain de {} no disponible (error RPC={}); se vende sobre la "
+            "estimacion {:.6g} tokens de la posicion",
+            mint, chain_error, tracker_amount,
+        )
+        return tracker_amount
+
+    logger.warning("Sin saldo de {} en la wallet (on-chain={}, posicion={})", mint, chain, tracker_amount)
+    return 0.0
+
+
+def _estimate_tokens_from_position(pos: Any, executor: Any, mint: str) -> float:
+    """Tokens estimados desde la posición del tracker (`amount / buy_price`).
+
+    Es una APROXIMACIÓN: solo es válida si `buy_price` (SOL por token) se
+    registró. Con `buy_price == 0` no hay división posible y devuelve 0 para
+    que el llamador use el saldo on-chain.
+    """
+    buy_price = float(getattr(pos, "buy_price", 0.0) or 0.0)
+    if buy_price <= 0:
+        return 0.0
+    sol_amount = float(getattr(pos, "amount", 0.0) or 0.0)
+    if sol_amount > 0:
+        return sol_amount / buy_price
+    # `amount` ya agotado por ventas parciales previas: estimar sobre la
+    # cantidad de tokens que registró el executor, si la hay.
+    exec_pos = getattr(executor, "positions", {}).get(mint) if executor is not None else None
+    if exec_pos is not None:
+        return float(getattr(exec_pos, "token_amount_ui", 0.0) or 0.0)
+    return 0.0
+
+
 async def process_sell_and_notify(
     mint: str,
     symbol: str = "N/A",
@@ -303,7 +388,7 @@ async def process_sell_and_notify(
                 pos.amount = max(0.0, getattr(pos, "amount", 0.0) * (1.0 - sell_pct / 100.0))
                 tracker._save_positions()
         else:
-            token_amount = (pos.amount / pos.buy_price) if pos and pos.buy_price else 0.0
+            token_amount = await _resolve_tokens_to_sell(tracker, mint)
             if token_amount <= 0:
                 logger.warning(f"Sin balance estimado para vender {symbol} ({mint}); omitiendo.")
                 return False
@@ -312,10 +397,21 @@ async def process_sell_and_notify(
             if token_amount <= 0:
                 logger.warning(f"sell_pct={sell_pct:.0f}% resulta en 0 tokens para {symbol}; omitiendo.")
                 return False
-            await tracker.executor.sell_token(mint, token_amount)
+            sig = await tracker.executor.sell_token(mint, token_amount)
+            if not sig:
+                # La orden pudo enviarse pero NUNCA confirmarse on-chain
+                # (descartada, revertida o sin confirmacion). Si se diera por
+                # cerrada aqui, la posicion se borraria con los tokens aun en
+                # la wallet: el bot dejaria de venderlos para siempre.
+                logger.error(
+                    "Venta de {} ({}) NO confirmada on-chain: la posicion se mantiene "
+                    "abierta para reintentar",
+                    symbol, mint,
+                )
+                return False
             logger.success(
-                "Venta de {} ({}) ejecutada por {} ({:.0f}% | PnL {:.2f}%)",
-                symbol, mint, reason, sell_pct, pnl,
+                "Venta de {} ({}) ejecutada por {} ({:.0f}% | PnL {:.2f}% | sig={})",
+                symbol, mint, reason, sell_pct, pnl, sig,
             )
             # If full sell, clean up positions and persist
             if sell_pct >= 99.0:

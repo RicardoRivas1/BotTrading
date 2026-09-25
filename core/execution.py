@@ -508,7 +508,9 @@ class JupiterExecutor:
             if simulate:
                 token_qty_ui = 0.0
             else:
-                token_qty_ui = await self._get_token_balance_ui(token_mint)
+                # -1.0 = error de RPC (no "no tengo el token"): tratarlo como 0
+                # para no registrar una cantidad negativa en la posicion.
+                token_qty_ui = max(0.0, await self._get_token_balance_ui(token_mint))
         else:
             out_amount = float(
                 (quote or {}).get("outAmount", (quote or {}).get("routePlan", [{}])[0].get("outAmount", 0)) or 0
@@ -624,19 +626,32 @@ class JupiterExecutor:
             signed_tx, require_confirmation=True
         )
 
-    async def _get_token_balance_ui(self, token_mint: str) -> float:
+    async def get_token_balance_ui(self, token_mint: str) -> float:
         """Saldo real (en unidades humanas) de un token en la wallet vía RPC.
 
         Necesario tras una compra directa por Pump.fun, donde no hay quote de
-        Jupiter para estimar la cantidad recibida.
+        Jupiter para estimar la cantidad recibida, y para vender SIEMPRE sobre
+        el saldo on-chain (única fuente fiel): estimar la cantidad a partir de
+        `amount / buy_price` falla cuando el precio de entrada quedó sin
+        registrar y hacía que el bot se saltase la venta entera.
         """
-        ata = get_associated_token_address(
-            self.keypair.pubkey(), Pubkey.from_string(token_mint)
-        )
-        resp = await self._rpc_client.get_token_account_balance(ata)
-        if not resp.value or resp.value.ui_amount is None:
+        try:
+            ata = get_associated_token_address(
+                self.keypair.pubkey(), Pubkey.from_string(token_mint)
+            )
+            resp = await self._rpc_client.get_token_account_balance(ata)
+        except Exception as exc:
+            logger.debug(
+                "get_token_balance_ui fallo para {}: {}",
+                token_mint[:8] + "...", exc,
+            )
+            return -1.0
+        if resp is None or resp.value is None or resp.value.ui_amount is None:
             return 0.0
         return float(resp.value.ui_amount)
+
+    # Alias historico interno (mismo comportamiento).
+    _get_token_balance_ui = get_token_balance_ui
 
     async def get_sol_balance(self) -> float:
         """Balance actual de SOL (en unidades humanas) de la wallet del bot.
@@ -1160,10 +1175,37 @@ class JupiterExecutor:
             return
 
         try:
-            await self.sell_token(
-                token_mint, position.token_amount_ui,
+            amount = float(position.token_amount_ui or 0.0)
+            if amount <= 0:
+                # La cantidad registrada quedo vacia (no se pudo estimar al
+                # comprar): el SALDO ON-CHAIN es la unica fuente fiel. Vender
+                # 0 tokens hacia que Jupiter no encontrase ruta y la posicion
+                # se quedara abierta para siempre ("no vende").
+                amount = await self.get_token_balance_ui(token_mint)
+                if amount > 0:
+                    position.token_amount_ui = amount
+                    logger.info(
+                        "Cantidad a vender recuperada on-chain para {}: {:.6g} tokens",
+                        token_mint, amount,
+                    )
+            if amount <= 0:
+                logger.error(
+                    "Sin saldo de {} para cerrar por {}: la posicion se mantiene abierta",
+                    token_mint, reason,
+                )
+                return
+            sig = await self.sell_token(
+                token_mint, amount,
                 slippage_bps=slippage_bps,
             )
+            if not sig:
+                # Enviada pero NO confirmada (descartada/revertida): NO borrar
+                # la posicion ni declararla cerrada.
+                logger.error(
+                    "Cierre de {} por {} no confirmado on-chain; la posicion sigue abierta",
+                    token_mint, reason,
+                )
+                return
         except Exception as exc:
             logger.error("Error vendiendo {} ({}): {}", token_mint, reason, exc)
             return

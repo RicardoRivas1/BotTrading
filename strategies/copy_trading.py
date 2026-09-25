@@ -377,6 +377,34 @@ class CopyTradingStrategy(Strategy):
 
         return 0.0
 
+    def _pick_wallet_position(
+        self, wallet: str, signature: str, why: str
+    ) -> Optional[Any]:
+        """Elige qué posición del trader cerrar cuando la tx NO identifica el mint.
+
+        Con varias posiciones abiertas no hay dato fiable (la ruta de la venta
+        no trae balances de token). Elegir `posiciones[-1]` depende del orden del
+        dict, que tras recargar el tracker es arbitrario: vender el token
+        EQUIVOCADO es peor que no vender. Se toma la posición MÁS RECIENTE del
+        trader (última entrada), que es la hipótesis habitual, y se avisa para
+        que quede trazado en el log.
+        """
+        wallet_positions = self.tracker.get_positions_by_wallet(wallet)
+        if not wallet_positions:
+            return None
+        pos = max(
+            wallet_positions,
+            key=lambda p: float(getattr(p, "created_at", 0.0) or 0.0),
+        )
+        if len(wallet_positions) > 1:
+            logger.warning(
+                "CopyTrading: {} sin mint identificable y {} posiciones del trader; "
+                "asumiendo la MAS RECIENTE ({}) para {}. Si se vendio otra, el "
+                "tracking del token es incorrecto.",
+                why, len(wallet_positions), pos.symbol, signature[:16] + "...",
+            )
+        return pos
+
     async def start(self) -> None:
         """Inicia la estrategia de copy trading y el polling de RPC."""
         self._set_state(StrategyState.RUNNING)
@@ -1127,7 +1155,13 @@ class CopyTradingStrategy(Strategy):
         elif tokens_sent and sol_spent == 0 and sol_received == 0:
             tokens_sent.sort(key=lambda t: t["amount"], reverse=True)
             candidate_mint = tokens_sent[0]["mint"]
-            sell_pct = self._calc_sell_pct(candidate_mint, tokens_sent[0]["amount"], tracked.address)
+            # Usar SIEMPRE la direccion canonica del trader (fee payer o wallet
+            # localizada en los transfers). `_wallet_mint_tokens` se indexa con
+            # `trader` al executar; calcular el % con otra clave devolvia 0 y
+            # hacia que la venta se descartara por `sell_pct < 5` (no vendia).
+            sell_pct = self._calc_sell_pct(
+                candidate_mint, tokens_sent[0]["amount"], trader or tracked.address
+            )
             # Si ya tenemos posicion del mint, es venta aunque el % sea pequeno.
             have_pos = bool(
                 self.executor.positions.get(candidate_mint)
@@ -1172,9 +1206,12 @@ class CopyTradingStrategy(Strategy):
                     signature[:16] + "...", tracked.label,
                 )
                 return None
-            wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
-            if wallet_positions and sol_received > max(sol_spent, 0.001):
-                pos = wallet_positions[-1]
+            pos = (
+                self._pick_wallet_position(tracked.address, signature, "SELL por SOL neto")
+                if sol_received > max(sol_spent, 0.001)
+                else None
+            )
+            if pos:
                 token_mint = pos.mint
                 action = "sell"
                 amount_sol = sol_received
@@ -1234,9 +1271,10 @@ class CopyTradingStrategy(Strategy):
                         amount_sol = sol_received
                     elif tracked.address:
                         # Axiom sells: no token data, match by wallet position
-                        wallet_positions = self.tracker.get_positions_by_wallet(tracked.address)
-                        if wallet_positions:
-                            pos = wallet_positions[-1]
+                        pos = self._pick_wallet_position(
+                            tracked.address, signature, "SELL por SOL recibido sin mint"
+                        )
+                        if pos:
                             token_mint = pos.mint
                             action = "sell"
                             amount_sol = sol_received
@@ -1410,11 +1448,16 @@ class CopyTradingStrategy(Strategy):
                     # vendio (o compro-y-vendio rapidisimo) y esta compra es un
                     # evento viejo que llego tarde. Abrir posicion ahi = "compra
                     # de mas" + un bag que ya se vendio y nunca se cierra.
+                    # Solo aplica si AMBOS blockTime son conocidos (> 0): con
+                    # blockTime ausente (0) la comparacion "0 <= 0" descartaba
+                    # de raiz el re-entry legitimo del trader tras la venta.
                     sell_block = self._last_sell_block.get(
                         (signal.wallet, signal.token_mint)
                     )
-                    if sell_block is not None and (
-                        signal.block_time <= sell_block
+                    if (
+                        sell_block
+                        and signal.block_time
+                        and signal.block_time <= sell_block
                     ):
                         logger.info(
                             "CopyTrading: BUY ESTANCADO ignorado {} ({}) | mint={} | buy_block={} <= ultima venta vista {}",
@@ -1528,7 +1571,12 @@ class CopyTradingStrategy(Strategy):
                     max_pos = int(
                         getattr(self.config.copy_trading, "MAX_COPY_TRADE_POSITIONS", 0)
                     )
-                    if max_pos > 0 and len(self.executor.positions) >= max_pos:
+                    # Contar los mints reales abiertos en CUALQUIERa de los dos
+                    # registros: si un buy se quedo solo en el tracker (o solo en
+                    # el executor) y no lo contabamos, el bot abria mas
+                    # posiciones de las permitidas.
+                    open_mints = set(self.executor.positions) | set(self.tracker.positions)
+                    if max_pos > 0 and len(open_mints) >= max_pos:
                         logger.info(
                             "CopyTrading: BUY ignorado {} - max posiciones ({})",
                             signal.source, signal.token_mint[:8] + "...",
@@ -1912,7 +1960,13 @@ class CopyTradingStrategy(Strategy):
                     if not _wallet_for_stats:
                         _wallet_for_stats = signal.source
 
-                    await process_sell_and_notify(
+                    # Ejecuta la venta. `process_sell_and_notify` devuelve False
+                    # si NO se vendio de verdad (sin saldo, orden sin confirmar,
+                    # error de RPC). En ese caso NO se puede limpiar la posicion
+                    # ni marcar la tx como ejecutada: hacerlo dejaba los tokens
+                    # atrapados en la wallet y el bot sin registro para venderlos
+                    # (posicion borrada = "no vende" y "no compra" al reintentar).
+                    sold = await process_sell_and_notify(
                         signal.token_mint,
                         symbol=signal.token_symbol,
                         reason="COPY_TRADE_SELL",
@@ -1921,6 +1975,33 @@ class CopyTradingStrategy(Strategy):
                         sell_pct=pct,
                         trader=signal.trader_label,
                     )
+                    if not sold:
+                        self._inc_stat("trades_failed")
+                        logger.error(
+                            "CopyTrading: SELL NO ejecutada {} ({}) | mint={} | sell_pct={:.0f}%. "
+                            "La posicion sigue ABIERTA y la tx se reintentara en el proximo "
+                            "redelivery/poll.",
+                            signal.trader_label or signal.source,
+                            signal.wallet[:8] + "...",
+                            signal.token_mint[:8] + "...", pct,
+                        )
+                        self._diag_log(
+                            "sell_not_executed",
+                            signal.tx_signature,
+                            f"sell_pct={pct:.1f} sin ejecucion real; posicion conservada",
+                            {},
+                        )
+                        if signal.tx_signature:
+                            self._recent_signals.pop(signal.tx_signature, None)
+                        # Revertir el descuento de tokens del trader para que el
+                        # proximo intento calcule el % sobre el acumulado REAL.
+                        wm_key = (signal.wallet, signal.token_mint)
+                        restore_tk = tokens_before_sell or signal.trade_token_amount
+                        if restore_tk > 0:
+                            self._wallet_mint_tokens[wm_key] = restore_tk
+                        if cost_of_sold > 0:
+                            self._wallet_mint_sol[wm_key] = w_sol
+                        return
 
                     # Clean up or reduce positions
                     if pct >= 99.0:
@@ -1942,10 +2023,15 @@ class CopyTradingStrategy(Strategy):
                             )
                         )
                     else:
+                        # Venta PARCIAL: `process_sell_and_notify` ya descuenta
+                        # `tracker_pos.amount` por la parte vendida y lo persiste.
+                        # Descontarlo aqui otra vez lo reducia DOS veces (0.01 ->
+                        # 0.0075 -> 0.005 tras vender el 25%) y la posicion
+                        # restante pasaba a costar la mitad: PnL inflado en cada
+                        # venta parcial posterior. Aqui solo se ajusta el costo
+                        # del executor, que el helper no toca.
                         if position:
                             position.sol_invested = max(0.0, getattr(position, "sol_invested", 0.0) - _sol_portion_invested)
-                        if tracker_pos:
-                            tracker_pos.amount = max(0.0, getattr(tracker_pos, "amount", 0.0) - _sol_portion_invested)
                     self.executor._save_exec_positions()
                     self.tracker._save_positions()
 

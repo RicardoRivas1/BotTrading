@@ -662,6 +662,131 @@ class TestProcessBuySinLiquidez:
         s.notifier.send_buy.assert_not_awaited()
 
 
+class TestResolucionSaldoVenta:
+    """La cantidad a vender sale del SALDO REAL, no de una posición incompleta.
+
+    Regresión del bug "no vende": con `buy_price == 0` (entrada pendiente) o
+    con la posición solo en el executor, la estimación `amount / buy_price`
+    daba 0 tokens y la venta se omitía entera.
+    """
+
+    def _tracker(self, pos: object | None, chain_balance: float) -> MagicMock:
+        tracker = MagicMock()
+        tracker.get_position.return_value = pos
+        tracker.positions = {}
+        tracker._save_positions = MagicMock()
+        tracker.executor.positions = {}
+        tracker.executor._save_exec_positions = MagicMock()
+        tracker.executor.get_token_balance_ui = AsyncMock(return_value=chain_balance)
+        tracker.executor.sell_token = AsyncMock(return_value="sig_ok")
+        return tracker
+
+    def _setup(self, monkeypatch: pytest.MonkeyPatch, tracker: MagicMock) -> MagicMock:
+        monkeypatch.setattr(
+            "config.load_config",
+            lambda: SimpleNamespace(
+                trading=SimpleNamespace(DRY_RUN=False),
+                telegram=SimpleNamespace(TELEGRAM_TOKEN="t", TELEGRAM_CHAT_ID="c"),
+            ),
+        )
+        notifier = _make_notifier()
+        monkeypatch.setattr("core.notifier.TelegramNotifier", lambda **kw: notifier)
+        monkeypatch.setattr("core.tracker.get_global_tracker", lambda: tracker)
+        return notifier
+
+    async def test_entrada_pendiente_usa_saldo_onchain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """buy_price == 0: antes la venta se omitía; ahora usa el saldo real."""
+        tracker = self._tracker(
+            SimpleNamespace(amount=0.01, buy_price=0.0, symbol="MET", source_wallet="", created_at=0.0),
+            chain_balance=1234.0,
+        )
+        self._setup(monkeypatch, tracker)
+
+        ok = await ws_module.process_sell_and_notify("MINT123ABC", "MET", "COPY_TRADE_SELL", 10.0)
+
+        assert ok is True
+        tracker.executor.sell_token.assert_awaited_once_with("MINT123ABC", 1234.0)
+
+    async def test_solo_en_executor_tambien_vende(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Posición solo en executor.positions (p. ej. tras reinicio): se vende."""
+        tracker = self._tracker(None, chain_balance=500.0)
+        tracker.executor.positions = {
+            "MINT123ABC": SimpleNamespace(token_amount_ui=500.0, entry_price=2e-5, sol_invested=0.01)
+        }
+        self._setup(monkeypatch, tracker)
+
+        ok = await ws_module.process_sell_and_notify("MINT123ABC", "MET", "COPY_TRADE_SELL", 10.0)
+
+        assert ok is True
+        tracker.executor.sell_token.assert_awaited_once_with("MINT123ABC", 500.0)
+
+    async def test_rpc_fallido_usa_estimacion_de_la_posicion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Si el RPC no responde, se vende con lo estimado (no se pierde la salida)."""
+        tracker = self._tracker(
+            SimpleNamespace(amount=0.05, buy_price=0.001, symbol="MET", source_wallet="", created_at=0.0),
+            chain_balance=-1.0,
+        )
+        self._setup(monkeypatch, tracker)
+
+        ok = await ws_module.process_sell_and_notify("MINT123ABC", "MET", "COPY_TRADE_SELL", 10.0)
+
+        assert ok is True
+        tracker.executor.sell_token.assert_awaited_once_with("MINT123ABC", 50.0)
+
+    async def test_sin_saldo_onde_sea_no_cierra_posicion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ni on-chain ni posición: la venta se omite y se devuelve False."""
+        tracker = self._tracker(None, chain_balance=0.0)
+        self._setup(monkeypatch, tracker)
+
+        ok = await ws_module.process_sell_and_notify("MINT123ABC", "MET", "COPY_TRADE_SELL", 10.0)
+
+        assert ok is False
+        tracker.executor.sell_token.assert_not_awaited()
+
+    async def test_venta_no_confirmada_no_cierra_posicion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Orden enviada pero sin confirmar: la posición NO se da por cerrada."""
+        pos = SimpleNamespace(
+            amount=0.05, buy_price=0.001, symbol="MET", source_wallet="", created_at=0.0
+        )
+        tracker = self._tracker(pos, chain_balance=50.0)
+        tracker.executor.sell_token = AsyncMock(return_value=None)
+        tracker.executor.positions = MagicMock()
+        tracker.positions = MagicMock()
+        self._setup(monkeypatch, tracker)
+
+        ok = await ws_module.process_sell_and_notify("MINT123ABC", "MET", "COPY_TRADE_SELL", 10.0)
+
+        assert ok is False
+        tracker.executor.positions.pop.assert_not_called()
+        tracker.positions.pop.assert_not_called()
+
+    async def test_sell_pct_parcial_escala_el_saldo_real(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tracker = self._tracker(
+            SimpleNamespace(amount=0.05, buy_price=0.001, symbol="MET", source_wallet="", created_at=0.0),
+            chain_balance=1000.0,
+        )
+        self._setup(monkeypatch, tracker)
+
+        ok = await ws_module.process_sell_and_notify(
+            "MINT123ABC", "MET", "COPY_TRADE_SELL", 10.0, sell_pct=25.0
+        )
+
+        assert ok is True
+        tracker.executor.sell_token.assert_awaited_once_with("MINT123ABC", 250.0)
+
+
 class TestTrailingStopNotification:
     """process_sell_and_notify con reason=TRAILING_STOP notifica correctamente."""
 
