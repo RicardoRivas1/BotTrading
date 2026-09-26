@@ -49,6 +49,10 @@ class TradeRecord:
     sell_reason: str = "COPY_TRADE_SELL"
     sell_pct: float = 100.0  # percentage of position sold
     excluded: bool = False  # True si el PnL es implausible: NO cuenta en las stats
+    # True si el PnL es una ESTIMACIÓN, no una medición del delta de saldo real
+    # (DRY_RUN, o copia con precio pero sin venta que medir). Se muestra aparte
+    # para no presentarlo como un resultado real.
+    estimated: bool = False
 
     def __post_init__(self) -> None:
         if self.hold_seconds == 0.0:
@@ -221,6 +225,7 @@ class TradeStats:
         sell_reason: str = "COPY_TRADE_SELL",
         sell_pct: float = 100.0,
         pnl_unreliable: bool = False,
+        estimated: bool = False,
     ) -> TradeRecord:
         """Record a completed sell trade.
 
@@ -234,6 +239,12 @@ class TradeStats:
         para conservar el historial, pero con `pnl_pct=0`: contarlo como win o
         loss inventaría un resultado, y su `sol_received` estimado (derivado del
         propio PnL) no debe entrar en el "PnL Neto".
+
+        `estimated=True` (DRY_RUN, o copia con precio pero sin venta real que
+        medir) marca el PnL como estimación. En ese caso `sol_received` se deriva
+        del propio PnL, así que su "PnL Neto" no es una medición independiente: se
+        conserva por utilidad, pero /stats lo etiqueta como estimación para que
+        no se lea como un resultado real.
         """
         raw_pnl = float(pnl_pct)
         excluded = raw_pnl > MAX_TRUSTED_PNL_PCT or pnl_unreliable
@@ -257,6 +268,7 @@ class TradeStats:
             sell_reason=sell_reason,
             sell_pct=sell_pct,
             excluded=excluded,
+            estimated=estimated,
         )
         self.trades.append(trade)
         self.total_sells += 1
@@ -368,6 +380,7 @@ class TradeStats:
             # "Ventas: 10 | Wins 3 | Losses 2" no cuadraba con nada.
             "total_sells": len(valid),
             "excluded": self.excluded_count,
+            "simulated": sum(1 for t in valid if t.estimated),
             "sells_seen": self.total_sells,
             "open_positions": max(0, open_positions),
             "wins": wins,
@@ -405,9 +418,18 @@ class TradeStats:
         s = self.summary()
         if open_positions is not None:
             s["open_positions"] = max(0, int(open_positions))
+        # En DRY_RUN no hay venta real que medir, asi que los trades se estiman
+        # con el resultado del trader. Sin este aviso, /stats presentaria
+        # simulaciones como si fueran operaciones reales.
+        sim_note = (
+            [f"⚠️ <i>{s['simulated']} de {s['total_sells']} ventas son ESTIMACIONES "
+             "(sin delta de saldo medido, p.ej. DRY_RUN), no resultados reales</i>"]
+            if s["simulated"] else []
+        )
         lines = [
             "📊 <b>ESTADISTICAS DEL BOT</b>",
             "",
+        ] + sim_note + [
             f"🔄 Compras: {s['total_buys']} | Ventas: {s['total_sells']} | Abiertas: {s['open_positions']}"
             + (f" | Sin PnL fiable: {s['excluded']}" if s['excluded'] else ""),
             f"✅ Wins: {s['wins']} | ❌ Losses: {s['losses']}",

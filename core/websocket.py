@@ -605,8 +605,15 @@ async def process_sell_and_notify(
                 )
                 # `sol_received` deja de ser `_portion_inv * (1 + pnl)`, que es
                 # una identidad algebraica del PnL (es decir, no mediía nada):
-                # ahora es el SOL realmente obtenido por la venta.
-                _sol_rec = sol_proceeds if sol_proceeds > 0 else 0.0
+                # ahora es el SOL realmente obtenido por la venta. Si el PnL es
+                # una estimación (no medido) no existe SOL observado, así que se
+                # deriva del PnL y el trade se marca `estimated`: el "PnL Neto" de
+                # esa venta no es una medición independiente y /stats lo avisa.
+                _pnl_estimated = copy_pnl_measured is None
+                if _pnl_unreliable or sol_proceeds > 0:
+                    _sol_rec = sol_proceeds if sol_proceeds > 0 else 0.0
+                else:
+                    _sol_rec = _portion_inv * (1.0 + _pnl_pct / 100.0)
                 _exit_price = stat_entry * (1.0 + _pnl_pct / 100.0) if stat_entry > 0 else 0.0
                 get_trade_stats().record_sell(
                     mint=mint,
@@ -622,6 +629,7 @@ async def process_sell_and_notify(
                     sell_reason=reason,
                     sell_pct=sell_pct,
                     pnl_unreliable=_pnl_unreliable,
+                    estimated=_pnl_estimated,
                 )
             except Exception as st_exc:
                 logger.debug("Error registrando venta en stats para {}: {}", mint, st_exc)

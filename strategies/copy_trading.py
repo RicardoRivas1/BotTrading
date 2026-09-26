@@ -2022,6 +2022,16 @@ class CopyTradingStrategy(Strategy):
                     pnl_pct = 0.0
                     sell_proceeds = signal.sell_sol_raw if signal.sell_sol_raw > 0 else signal.amount_sol
                     sold_tok = signal.trade_token_amount if signal.trade_token_amount > 0 else 0.0
+                    # Si el trader vendió MÁS tokens de los que le vimos acumular, su
+                    # costo base no es atribuible: lo que excede el acumulado es de
+                    # compras que nunca vimos (típico al empezar a copiar con la
+                    # wallet ya cargada) y recortarlo dispara el % a cifras absurdas
+                    # (+2090% se vio así). Se marca una sola vez y lo usan tanto el
+                    # log como el chequeo de fiabilidad de abajo.
+                    _sold_beyond_tracking = (
+                        tokens_before_sell > 0
+                        and sold_tok > tokens_before_sell * 1.001
+                    )
                     avg_cost = (w_sol / accumulated) if accumulated > 0 and w_sol > 0 else 0.0
                     cost_of_sold = 0.0
                     proceeds_used = 0.0
@@ -2055,12 +2065,24 @@ class CopyTradingStrategy(Strategy):
                                 proceeds_used = observed_proceeds
                             if proceeds_used > 0:
                                 pnl_pct = (proceeds_used - cost_of_sold) / cost_of_sold * 100.0
-                                logger.info(
-                                    "CopyTrading: PnL trader {:.2f}% | proceeds={:.6f} SOL (obs={:.6f} exp={:.6f}) vs costo vendido={:.6f} SOL ({} tk @ {:.10g}) {}",
-                                    pnl_pct, proceeds_used, observed_proceeds,
-                                    expected_proceeds, cost_of_sold,
-                                    f"{sold_tok:.6g}", avg_cost, signal.token_mint[:8] + "...",
-                                )
+                                # El log del PnL SOLO cuando el costo es atribuible:
+                                # imprimir un % recortado (que luego se descarta) era
+                                # lo que dejaba logs con "+2090%" en un DRY_RUN sano.
+                                if not _sold_beyond_tracking:
+                                    logger.info(
+                                        "CopyTrading: PnL trader {:.2f}% | proceeds={:.6f} SOL (obs={:.6f} exp={:.6f}) vs costo vendido={:.6f} SOL ({} tk @ {:.10g}) {}",
+                                        pnl_pct, proceeds_used, observed_proceeds,
+                                        expected_proceeds, cost_of_sold,
+                                        f"{sold_tok:.6g}", avg_cost, signal.token_mint[:8] + "...",
+                                    )
+                                else:
+                                    logger.info(
+                                        "CopyTrading: venta de {} por {:.6f} SOL (costo atribuido "
+                                        "{:.6f} SOL de un accumulo de {:.6g} tk) | el PnL se "
+                                        "descartera: el trader vendio mas de lo que le vimos comprar",
+                                        signal.token_mint[:12] + "...", proceeds_used,
+                                        cost_of_sold, tokens_before_sell,
+                                    )
                         # La base de costo ya se descontó proporcionalmente en
                         # _debit_trader_tokens (tokens y SOL a la vez); aquí solo
                         # queda la foto del dato para el log.
@@ -2071,20 +2093,33 @@ class CopyTradingStrategy(Strategy):
                     # de compras que nunca vimos y cualquier % sería inventado: se
                     # marca como no disponible en vez de fabricar uno (ni de
                     # disfrazarlo con NUESTRO PnL, que es otra magnitud).
+                    #
+                    # También es n/d si `_sold_beyond_tracking` (definido arriba):
+                    # las compras más viejas son suyas y nosotros no las pagamos,
+                    # así que `cost_of_sold` se quedaría corto y el % se dispararía.
                     trader_pnl_known = (
                         avg_cost > 0
                         and sold_tok > 0
                         and tokens_before_sell > 0
                         and wm_key not in self._wallet_mint_cost_unknown
+                        and not _sold_beyond_tracking
                     )
                     if not trader_pnl_known:
-                        logger.info(
-                            "CopyTrading: PnL del trader NO disponible para {} "
-                            "(avg_cost={:.10g} sold_tok={:.6g} costo_desconocido={}); "
-                            "se notificara 'n/d' en vez de un numero inventado",
-                            signal.token_mint[:12] + "...", avg_cost, sold_tok,
-                            wm_key in self._wallet_mint_cost_unknown,
-                        )
+                        if _sold_beyond_tracking:
+                            logger.info(
+                                "CopyTrading: PnL del trader NO disponible para {} "
+                                "(vendio {:.6g} tk pero solo le vimos acumular {:.6g}); "
+                                "se notificara 'n/d' en vez de un numero inventado",
+                                signal.token_mint[:12] + "...", sold_tok, tokens_before_sell,
+                            )
+                        else:
+                            logger.info(
+                                "CopyTrading: PnL del trader NO disponible para {} "
+                                "(avg_cost={:.10g} sold_tok={:.6g} costo_desconocido={}); "
+                                "se notificara 'n/d' en vez de un numero inventado",
+                                signal.token_mint[:12] + "...", avg_cost, sold_tok,
+                                wm_key in self._wallet_mint_cost_unknown,
+                            )
                         pnl_pct = 0.0
 
                     # PnL de NUESTRA copia (estimado por precio, previo a la venta).
@@ -2217,6 +2252,28 @@ class CopyTradingStrategy(Strategy):
                         _our_pnl_pct = (
                             (_sol_proceeds - _sol_portion_invested) / _sol_portion_invested
                         ) * 100.0
+                    # `_our_pnl_pct` solo es una MEDIDA mientras venga del delta de
+                    # saldo de nuestra venta. A partir de aqui cualquier valor que
+                    # se le asigne es una estimacion (DRY_RUN o precio), y asi se
+                    # marca para que /stats no lo presente como un resultado real.
+                    _pnl_from_measurement = _our_pnl_pct is not None
+                    if _our_pnl_pct is None and self.executor.dry_run:
+                        # En DRY_RUN no hay venta real, asi que no hay delta de
+                        # saldo que medir: el PnL de la copia es
+                        # incALCULABLE por la via honesta. La unica referencia
+                        # disponible es el resultado del propio trader sobre el
+                        # mismo token, asi que se usa como estimacion DE NUESTRA
+                        # copia (no como medida). Sirve para validar el pipeline
+                        # en simulacion sin inventar un resultado; en modo real
+                        # esto nunca se usa.
+                        if trader_pnl_known:
+                            _our_pnl_pct = pnl_pct
+                            logger.info(
+                                "CopyTrading: DRY_RUN sin venta real; se estima el PnL de la "
+                                "copia con el del trader ({:+.2f}%) para poder validar el "
+                                "ciclo completo (no es una medida)",
+                                pnl_pct,
+                            )
                     if _our_pnl_pct is None:
                         logger.warning(
                             "CopyTrading: sin PnL medible para {} (proceeds={}); se usara "
@@ -2257,10 +2314,10 @@ class CopyTradingStrategy(Strategy):
                     self.tracker._save_positions()
 
                     # Record completed trade in stats con NUESTROS numeros: el PnL
-                    # medido del delta de saldo y, si no se pudo medir, el PnL por
-                    # precio de nuestra copia. `sol_received` deja de derivarse del
-                    # PnL (identidad algebraica) y pasa a ser el SOL real obtenido.
+                    # medido del delta de saldo y, si no se pudo medir, una
+                    # estimacion (PnL por precio, o en DRY_RUN el del trader).
                     _stats_pnl = _our_pnl_pct if _our_pnl_pct is not None else copy_pnl
+                    _pnl_estimated = not _pnl_from_measurement
                     _pnl_unreliable = _stats_pnl is None
                     if _pnl_unreliable:
                         logger.warning(
@@ -2272,9 +2329,20 @@ class CopyTradingStrategy(Strategy):
                     # `sol_received` es el SOL REAL obtenido por la venta. Antes se
                     # derivaba como `invertido * (1 + pnl/100)`, que es una
                     # identidad del PnL (no mide nada) y por eso "PnL Neto" no
-                    # cuadraba con la wallet. Si no se pudo medir, se deja 0: es
-                    # preferible un 0 declarado a un numero inventado.
-                    _stats_sol_received = _sol_proceeds
+                    # cuadraba con la wallet. Cuando la venta se midio de verdad se
+                    # usa el delta real; cuando el PnL es solo una ESTIMACION no hay
+                    # ningun SOL observado, asi que se deriva del PnL y el trade
+                    # queda marcado como estimado (`estimated=True`): es preferible
+                    # un dato declarado como estimado a un 0 que rompe el PnL Neto.
+                    if _pnl_unreliable:
+                        _stats_sol_received = _sol_proceeds
+                    elif _pnl_from_measurement:
+                        _stats_sol_received = _sol_proceeds
+                    else:
+                        _stats_sol_received = _sol_portion_invested * (
+                            1.0 + float(_stats_pnl) / 100.0
+                        )
+
                     _exit_price = (
                         current_price
                         if current_price > 0
@@ -2295,6 +2363,7 @@ class CopyTradingStrategy(Strategy):
                         sell_reason="COPY_TRADE_SELL",
                         sell_pct=pct,
                         pnl_unreliable=_pnl_unreliable,
+                        estimated=_pnl_estimated,
                     )
 
                     logger.success(

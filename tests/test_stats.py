@@ -112,6 +112,26 @@ class TestHistorialSeReinicia:
         assert len(stats.trades) == 1
         assert stats.total_sells == 1
 
+    def test_historial_v2_sin_el_campo_nuevo_sigue_cargando(self, tmp_path):
+        """Un `trade_stats.json` v2 ya escrito (sin `estimated`) debe cargar.
+
+        El campo se añadió después de la migración v2, así que los ficheros que
+        el bot dejó en DRY_RUN no lo tienen. Deben seguir abriendose (con
+        `estimated=False`) en vez de reventar el arranque.
+        """
+        path = tmp_path / "stats.json"
+        _legacy(path, stats_version=STATS_VERSION, trades=1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        for trade in data["trades"]:
+            trade.pop("estimated", None)
+            trade.pop("pnl_unreliable", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        stats = TradeStats(path=str(path))
+
+        assert len(stats.trades) == 1
+        assert stats.trades[0].estimated is False
+
     def test_tras_reiniciar_lo_nuevo_ya_no_se_borra(self, tmp_path):
         path = tmp_path / "stats.json"
         _legacy(path, stats_version=1, trades=3)
@@ -163,6 +183,43 @@ class TestContadoresDeVentas:
         assert s["wins"] == 1 and s["losses"] == 0
         assert s["total_sells"] == 1
         assert s["net_pnl_sol"] == pytest.approx(0.01)  # solo el trade válido
+
+    def test_trade_estimado_cuenta_pero_se_avisa(self, tmp_path):
+        """Una estimación cuenta, pero /stats debe decir que lo es.
+
+        En DRY_RUN no hay venta real que medir, así que el PnL se estima. Si se
+        cuenta en silencio, /stats presenta simulaciones como resultados reales.
+        """
+        stats = TradeStats(path=str(tmp_path / "stats.json"))
+        stats.record_sell(
+            mint="MINT_ESTIMADO",
+            symbol="EST",
+            wallet="wallet1",
+            entry_price=1e-6,
+            exit_price=1.5e-6,
+            pnl_pct=50.0,
+            sol_invested=0.01,
+            sol_received=0.015,
+            buy_time=1.0,
+            sell_time=2.0,
+            estimated=True,
+        )
+        _record(stats, 20.0)
+
+        s = stats.summary()
+        assert s["total_sells"] == 2      # la estimación cuenta para el ciclo
+        assert s["simulated"] == 1        # pero queda marcada
+        assert stats.trades[0].estimated is True
+        assert stats.trades[1].estimated is False
+
+        out = stats.format_summary()
+        assert "ESTIMACIONES" in out
+        assert "1 de 2" in out
+
+    def test_sin_estimaciones_no_hay_aviso(self, tmp_path):
+        stats = TradeStats(path=str(tmp_path / "stats.json"))
+        _record(stats, 20.0)
+        assert "ESTIMACIONES" not in stats.format_summary()
 
 
 def _legacy(path, *, stats_version: int, trades: int) -> None:

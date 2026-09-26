@@ -49,6 +49,7 @@ def _strategy(tmp_path: Path) -> tuple[CopyTradingStrategy, MagicMock, MagicMock
     """Estrategia con executor/tracker simulados y dedup en disco aislado."""
     executor = MagicMock()
     executor.positions = {}
+    executor.dry_run = False
     executor.buy_amount_sol = 0.01
     executor.get_token_price = AsyncMock(return_value=0.0)
     executor.get_wallet_token_balance = AsyncMock(return_value=0.0)
@@ -483,6 +484,119 @@ class TestPnlHonesto:
         assert kwargs["pnl_pct"] == 50.0  # el de la copia, no el del trader
         assert kwargs["sol_invested"] == pytest.approx(0.01)
         assert kwargs["sol_received"] == pytest.approx(0.015)  # SOL real
+        assert kwargs["estimated"] is False  # medido de verdad
+
+    async def test_venta_por_encima_del_acumulado_no_inventa_pnl(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """El trader vendió más tokens de los que le vimos comprar.
+
+        Es el caso normal al empezar a copiar con la wallet ya cargada: nuestro
+        acumulado cubre una fracción de lo que el trader tiene, así que
+        `costo vendido` se recorta y el % se dispara (se vio +2090%). Sin base
+        para el costo, la respuesta honesta es 'n/d'.
+        """
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        strategy.executor.positions[MINT] = SimpleNamespace(
+            mint=MINT, token_amount_ui=1000.0, entry_price=1e-6, sol_invested=0.01
+        )
+        strategy.tracker.positions[MINT] = SimpleNamespace(
+            mint=MINT, symbol="TEST", buy_price=1e-6, amount=0.01, source_wallet=TRADER
+        )
+        # Solo le vimos comprar 1000 tk por 0.01 SOL, pero el trader vendio 2.8e7
+        # (el resto venía de antes de que el bot empezara a copiar).
+        strategy._wallet_mint_tokens[(TRADER, MINT)] = 1000.0
+        strategy._wallet_mint_sol[(TRADER, MINT)] = 0.01
+
+        seen: dict[str, object] = {}
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: MagicMock())
+
+        signal = _sell_signal()
+        signal.trade_token_amount = 28_100_000.0
+        signal.sell_sol_raw = 2.06134
+        await strategy._execute_copy_trade(signal)
+
+        assert seen.get("pnl_known") is False
+        assert seen.get("pnl") == 0.0
+
+    async def test_dry_run_estima_el_pnl_de_la_copia_con_el_del_trader(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """En DRY_RUN no hay venta real que medir: se estima y se marca como tal.
+
+        Sin esto cada venta simulada acababa como 'n/d' y el trade quedaba
+        fuera de las métricas, dejando /stats vacío en simulación.
+        """
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        strategy.executor.dry_run = True
+        strategy.executor.positions[MINT] = SimpleNamespace(
+            mint=MINT, token_amount_ui=1000.0, entry_price=1e-6, sol_invested=0.01
+        )
+        strategy.tracker.positions[MINT] = SimpleNamespace(
+            mint=MINT, symbol="TEST", buy_price=1e-6, amount=0.01, source_wallet=TRADER
+        )
+        strategy._wallet_mint_tokens[(TRADER, MINT)] = 1000.0
+        strategy._wallet_mint_sol[(TRADER, MINT)] = 0.01
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        stats_mock = MagicMock()
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: stats_mock)
+
+        signal = _sell_signal()
+        signal.sell_sol_raw = 0.012
+        await strategy._execute_copy_trade(signal)
+
+        stats_mock.record_sell.assert_called_once()
+        kwargs = stats_mock.record_sell.call_args.kwargs
+        # +20% del trader, usado como estimación de nuestra copia.
+        assert kwargs["pnl_pct"] == pytest.approx(20.0)
+        assert kwargs["estimated"] is True
+        assert kwargs["pnl_unreliable"] is False
+        # Sin SOL observado hay que derivarlo del PnL, pero declarado estimado.
+        assert kwargs["sol_received"] == pytest.approx(0.012)
+
+    async def test_pnl_por_precio_se_marca_como_estimado(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Con precio pero sin delta de saldo, el PnL es una estimación.
+
+        Antes se contaba como fiable con `sol_received=0`, lo que rompía el
+        'PnL Neto' (sumaba 0 de cobros sobre capital invertido).
+        """
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        strategy.executor.get_token_price = AsyncMock(return_value=1.5e-6)
+        strategy.executor.positions[MINT] = SimpleNamespace(
+            mint=MINT, token_amount_ui=1000.0, entry_price=1e-6, sol_invested=0.01
+        )
+        strategy.tracker.positions[MINT] = SimpleNamespace(
+            mint=MINT, symbol="TEST", buy_price=1e-6, amount=0.01, source_wallet=TRADER
+        )
+        strategy._wallet_mint_tokens[(TRADER, MINT)] = 1000.0
+        strategy._wallet_mint_sol[(TRADER, MINT)] = 0.01
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        stats_mock = MagicMock()
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: stats_mock)
+
+        await strategy._execute_copy_trade(_sell_signal())
+
+        kwargs = stats_mock.record_sell.call_args.kwargs
+        assert kwargs["pnl_pct"] == pytest.approx(50.0)  # por precio
+        assert kwargs["estimated"] is True
+        assert kwargs["pnl_unreliable"] is False
+        assert kwargs["sol_received"] == pytest.approx(0.015)
 
 
 class TestAcumulacionSinCapitalFantasma:
