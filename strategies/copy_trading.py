@@ -2122,35 +2122,73 @@ class CopyTradingStrategy(Strategy):
                             )
                         pnl_pct = 0.0
 
-                    # PnL de NUESTRA copia (estimado por precio, previo a la venta).
+                    # Referencia de precio de SALIDA para estimar el PnL de la
+                    # copia. `current_price` de las fuentes publicas es una
+                    # COTIZACION y en estos micro-caps el pool esta casi vacio:
+                    # devuelve un precio de polvo (se vio -99.99% de la copia
+                    # mientras el trader cerraba en +21% sobre el MISMO token en
+                    # el MISMO segundo). La referencia mas fiable es la que el
+                    # propio trader acaba de negociar: SOL realmente ejecutado
+                    # (proceeds) entre tokens vendidos, que es un cierre de
+                    # mercado, no una foto de liquidez. `current_price` solo se
+                    # usa si no hay referencia del trader.
+                    _exit_ref = 0.0
+                    if proceeds_used > 0 and sold_tok > 0:
+                        _exit_ref = proceeds_used / sold_tok
+                        if current_price > 0 and _exit_ref > current_price * 100.0:
+                            logger.warning(
+                                "CopyTrading: precio de mercado {} mucho por debajo del "
+                                "cierre real del trader ({} vs {}, {:.0f}x) para {}; se "
+                                "estima la copia con el cierre real",
+                                f"{current_price:.6g}", f"{_exit_ref:.6g}",
+                                f"{entry:.6g}", _exit_ref / current_price,
+                                signal.token_mint[:8] + "...",
+                            )
+                    if _exit_ref <= 0:
+                        _exit_ref = current_price
+
+                    # PnL de NUESTRA copia (estimado, previo a la venta).
                     # El valor real lo mide la venta (delta de saldo de la wallet).
                     copy_pnl = None
-                    if entry > 0 and current_price > 0:
-                        copy_pnl = (current_price - entry) / entry * 100.0
-                        logger.info(
-                            "CopyTrading: PnL estimado de la copia {:.2f}% (entry={:.10g} current={:.10g}) {}",
-                            copy_pnl, entry, current_price, signal.token_mint[:8] + "...",
-                        )
+                    if entry > 0 and _exit_ref > 0:
+                        copy_pnl = (_exit_ref - entry) / entry * 100.0
+                        # Si discrepa de forma absurda del resultado conocido del
+                        # trader sobre el mismo token, uno de los dos datos esta
+                        # roto: es mejor no mostrar ninguno que enseñar un -99.99%
+                        # inventado. Se descarta la ESTIMACION, no la del trader.
+                        if trader_pnl_known and abs(copy_pnl - pnl_pct) > 200.0:
+                            logger.warning(
+                                "CopyTrading: PnL estimado de la copia {:.2f}% "
+                                "incompatible con el del trader {:.2f}% para {}; se "
+                                "descarta la estimacion por precio",
+                                copy_pnl, pnl_pct, signal.token_mint[:8] + "...",
+                            )
+                            copy_pnl = None
+                        else:
+                            logger.info(
+                                "CopyTrading: PnL estimado de la copia {:.2f}% (entry={:.10g} exit_ref={:.10g}) {}",
+                                copy_pnl, entry, _exit_ref, signal.token_mint[:8] + "...",
+                            )
 
                     # --- Corregir PnL imposible con el PnL POR PRECIO ---
                     # El PnL por costo del trader (cost_of_sold dust o proceeds
                     # sub-capturados) fabrica valores que no existen: +6072% con
                     # entry == cotización (la copia rindió 0%) o -100% cuando el
-                    # precio solo cayó 40%. Con entrada y precio actual fiables,
-                    # el PnL por precio (entry vs current) es la verdad de
+                    # precio solo cayó 40%. Con entrada y referencia de salida
+                    # fiables, el PnL por precio (entry vs salida) es la verdad de
                     # mercado. Solo se sustituye si el dato del trader era un
                     # número creíble: si ya es "n/d", el precio tampoco lo arregla.
                     if (
                         trader_pnl_known
                         and entry > 0
-                        and current_price > 0
+                        and _exit_ref > 0
                         and (pnl_pct > MAX_TRUSTED_PNL_PCT or pnl_pct <= -99.0)
                     ):
-                        market_pnl = (current_price - entry) / entry * 100.0
+                        market_pnl = (_exit_ref - entry) / entry * 100.0
                         logger.warning(
-                            "CopyTrading: PnL {:.2f}% imposible para {}; usando PnL por precio {:.2f}% (entry={:.10g} current={:.10g})",
+                            "CopyTrading: PnL {:.2f}% imposible para {}; usando PnL por precio {:.2f}% (entry={:.10g} exit_ref={:.10g})",
                             pnl_pct, signal.token_mint[:12] + "...",
-                            market_pnl, entry, current_price,
+                            market_pnl, entry, _exit_ref,
                         )
                         pnl_pct = market_pnl
 
@@ -2191,6 +2229,15 @@ class CopyTradingStrategy(Strategy):
                     if not _wallet_for_stats:
                         _wallet_for_stats = signal.source
 
+                    # Lo que se MUESTRA como "Mi copia (estimado)". Sin venta real
+                    # (DRY_RUN) no habra `copy_pnl_measured` que lo pise, asi que la
+                    # unica estimacion defendible es el resultado del trader sobre el
+                    # mismo token: se prefiere al precio, que en estos micro-caps
+                    # cotiza a polvo y daba -99.99% con el trader en +21%.
+                    _copy_estimate = copy_pnl
+                    if _copy_estimate is None and self.executor.dry_run and trader_pnl_known:
+                        _copy_estimate = pnl_pct
+
                     # Ejecuta la venta. `process_sell_and_notify` devuelve False
                     # si NO se vendio de verdad (sin saldo, orden sin confirmar,
                     # error de RPC). En ese caso NO se puede limpiar la posicion
@@ -2203,7 +2250,7 @@ class CopyTradingStrategy(Strategy):
                         symbol=signal.token_symbol,
                         reason="COPY_TRADE_SELL",
                         pnl=pnl_pct,
-                        pnl_copy=copy_pnl,
+                        pnl_copy=_copy_estimate,
                         pnl_known=trader_pnl_known,
                         sell_pct=pct,
                         trader=signal.trader_label,
@@ -2344,8 +2391,8 @@ class CopyTradingStrategy(Strategy):
                         )
 
                     _exit_price = (
-                        current_price
-                        if current_price > 0
+                        _exit_ref
+                        if _exit_ref > 0
                         else (_entry * (1.0 + float(_stats_pnl) / 100.0) if _entry > 0 else 0.0)
                     )
                     from core.stats import get_trade_stats

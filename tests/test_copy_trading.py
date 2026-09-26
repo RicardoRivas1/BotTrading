@@ -525,6 +525,83 @@ class TestPnlHonesto:
         assert seen.get("pnl_known") is False
         assert seen.get("pnl") == 0.0
 
+    async def test_precio_de_polvo_no_fabrica_un_m99_99(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """La cotizacion publica de un micro-cap puede estar 10.000x bajo el real.
+
+        En estos tokens el pool esta casi vacio y `get_token_price` devuelve un
+        precio de polvo: la copia daba -99.99% mientras el trader cerraba en
+        +21% sobre el MISMO token en el MISMO segundo. La referencia de salida
+        correcta es el SOL que el trader acaba de negociar de verdad.
+        """
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        # Precio de mercado publicado: polvo (1e-9) frente al precio real (1e-5).
+        strategy.executor.get_token_price = AsyncMock(return_value=1e-9)
+        strategy.executor.positions[MINT] = SimpleNamespace(
+            mint=MINT, token_amount_ui=1000.0, entry_price=1e-5, sol_invested=0.01
+        )
+        strategy.tracker.positions[MINT] = SimpleNamespace(
+            mint=MINT, symbol="TEST", buy_price=1e-5, amount=0.01, source_wallet=TRADER
+        )
+        strategy._wallet_mint_tokens[(TRADER, MINT)] = 1000.0
+        strategy._wallet_mint_sol[(TRADER, MINT)] = 0.01
+
+        seen: dict[str, object] = {}
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: MagicMock())
+
+        signal = _sell_signal()
+        signal.sell_sol_raw = 0.0121  # el trader cerro en +21%
+        await strategy._execute_copy_trade(signal)
+
+        assert seen.get("pnl") == pytest.approx(21.0, abs=0.5)
+        # La estimacion de la copia se apoya en el cierre real, no en la cotizacion
+        # de polvo: queda cerca del resultado del trader, nunca en -99.99%.
+        est = float(seen["pnl_copy"])
+        assert est == pytest.approx(21.0, abs=5.0)
+
+    async def test_estimacion_incompatible_con_el_trader_se_descarta(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Si precio y cierre del trader se contradicen de forma absurda, no se muestra.
+
+        Mejor `n/d` que un -99.99% (o un +120000%) inventado en la notificacion.
+        """
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        # El precio "actual" coincide con nuestra entrada, así que por precio la
+        # copia rindió 0%... pero el trader negoció 1.21e-5, mil veces por encima.
+        strategy.executor.get_token_price = AsyncMock(return_value=1e-11)
+        strategy.executor.positions[MINT] = SimpleNamespace(
+            mint=MINT, token_amount_ui=1000.0, entry_price=1e-11, sol_invested=0.01
+        )
+        strategy.tracker.positions[MINT] = SimpleNamespace(
+            mint=MINT, symbol="TEST", buy_price=1e-11, amount=0.01, source_wallet=TRADER
+        )
+        strategy._wallet_mint_tokens[(TRADER, MINT)] = 1000.0
+        strategy._wallet_mint_sol[(TRADER, MINT)] = 0.01
+
+        seen: dict[str, object] = {}
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: MagicMock())
+
+        signal = _sell_signal()
+        signal.sell_sol_raw = 0.0121
+        await strategy._execute_copy_trade(signal)
+
+        assert seen.get("pnl_known") is True
+        assert seen.get("pnl_copy") is None  # la notificacion dira "Mi copia n/d"
+
     async def test_dry_run_estima_el_pnl_de_la_copia_con_el_del_trader(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
