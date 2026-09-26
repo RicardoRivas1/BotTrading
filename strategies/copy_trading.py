@@ -33,6 +33,17 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 # (evita clasificar fees o tiny transfers como compras)
 MIN_BUY_SOL = 0.005
 
+# Suelo de plausibilidad de un PnL ESTIMADO por precio. Una fuente que dice "el
+# token vale ~0" es indistinguible de una cotizacion rota (en los micro-caps el
+# pool vacio cotiza a polvo), asi que no se presenta como resultado: sale n/d.
+# El PnL MEDIDO de una venta real no pasa por aqui y si puede ser -100%.
+MIN_ESTIMATED_PNL_PCT = -99.0
+
+# Discrepancia maxima (en puntos porcentuales) entre el PnL estimado por precio y
+# el resultado conocido del trader sobre el mismo token. Por encima, uno de los
+# dos datos esta roto y la estimacion se descarta.
+MAX_ESTIMATE_VS_TRADER_GAP_PCT = 200.0
+
 # Tipos de transaccion que nos interesan
 COPY_TRADE_TYPES = {"SWAP", "TRANSFER"}
 
@@ -2133,8 +2144,16 @@ class CopyTradingStrategy(Strategy):
                     # mercado, no una foto de liquidez. `current_price` solo se
                     # usa si no hay referencia del trader.
                     _exit_ref = 0.0
-                    if proceeds_used > 0 and sold_tok > 0:
-                        _exit_ref = proceeds_used / sold_tok
+                    # El precio de cierre del trader NO necesita conocer el costo:
+                    # es SOL recibido / tokens vendidos, ambos de la propia tx. Se
+                    # usa `proceeds_used` cuando esta (ya saneado contra el
+                    # sub-capturado) y se cae a `sell_proceeds` observado cuando el
+                    # costo es desconocido: sin esto, un `n/d` del trader dejaba
+                    # sin referencia y el precio de polvo pasaba directamente a la
+                    # notificacion como -100.00%.
+                    _ref_proceeds = proceeds_used if proceeds_used > 0 else sell_proceeds
+                    if _ref_proceeds > 0 and sold_tok > 0:
+                        _exit_ref = _ref_proceeds / sold_tok
                         if current_price > 0 and _exit_ref > current_price * 100.0:
                             logger.warning(
                                 "CopyTrading: precio de mercado {} mucho por debajo del "
@@ -2152,11 +2171,27 @@ class CopyTradingStrategy(Strategy):
                     copy_pnl = None
                     if entry > 0 and _exit_ref > 0:
                         copy_pnl = (_exit_ref - entry) / entry * 100.0
+                        # Plausibilidad: un -100% "de mercado" en estos tokens es
+                        # casi siempre la cotizacion de un pool vacio, no una
+                        # perdida real. Sin esto se notificaba -100.00% (estimado)
+                        # con el trader en n/d, sin nada con que contrastarlo.
+                        if copy_pnl <= MIN_ESTIMATED_PNL_PCT:
+                            logger.warning(
+                                "CopyTrading: PnL estimado de la copia {:.2f}% para {} "
+                                "no es plausible como precio de mercado (entry={:.10g} "
+                                "exit_ref={:.10g}); se descarta y se mostrara n/d",
+                                copy_pnl, signal.token_mint[:8] + "...",
+                                entry, _exit_ref,
+                            )
+                            copy_pnl = None
                         # Si discrepa de forma absurda del resultado conocido del
                         # trader sobre el mismo token, uno de los dos datos esta
                         # roto: es mejor no mostrar ninguno que enseñar un -99.99%
                         # inventado. Se descarta la ESTIMACION, no la del trader.
-                        if trader_pnl_known and abs(copy_pnl - pnl_pct) > 200.0:
+                        elif (
+                            trader_pnl_known
+                            and abs(copy_pnl - pnl_pct) > MAX_ESTIMATE_VS_TRADER_GAP_PCT
+                        ):
                             logger.warning(
                                 "CopyTrading: PnL estimado de la copia {:.2f}% "
                                 "incompatible con el del trader {:.2f}% para {}; se "
@@ -2185,12 +2220,26 @@ class CopyTradingStrategy(Strategy):
                         and (pnl_pct > MAX_TRUSTED_PNL_PCT or pnl_pct <= -99.0)
                     ):
                         market_pnl = (_exit_ref - entry) / entry * 100.0
-                        logger.warning(
-                            "CopyTrading: PnL {:.2f}% imposible para {}; usando PnL por precio {:.2f}% (entry={:.10g} exit_ref={:.10g})",
-                            pnl_pct, signal.token_mint[:12] + "...",
-                            market_pnl, entry, _exit_ref,
-                        )
-                        pnl_pct = market_pnl
+                        # Si el precio de mercado tampoco es plausible, no se
+                        # "corrige" el PnL del trader con un valor que viene de la
+                        # misma fuente rota: se deja como n/d, que es la verdad.
+                        if market_pnl <= MIN_ESTIMATED_PNL_PCT:
+                            logger.warning(
+                                "CopyTrading: PnL {:.2f}% imposible para {} y el precio "
+                                "de mercado tampoco es creible ({:.2f}%); se notificara "
+                                "'n/d' en vez de un numero inventado",
+                                pnl_pct, signal.token_mint[:12] + "...",
+                                market_pnl,
+                            )
+                            pnl_pct = 0.0
+                            trader_pnl_known = False
+                        else:
+                            logger.warning(
+                                "CopyTrading: PnL {:.2f}% imposible para {}; usando PnL por precio {:.2f}% (entry={:.10g} exit_ref={:.10g})",
+                                pnl_pct, signal.token_mint[:12] + "...",
+                                market_pnl, entry, _exit_ref,
+                            )
+                            pnl_pct = market_pnl
 
                     # Clamp PnL: en spot trading la pérdida nunca puede ser peor que -100%
                     pnl_pct = max(-100.0, pnl_pct)
