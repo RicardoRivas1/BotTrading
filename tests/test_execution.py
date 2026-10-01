@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import aiohttp
 import base58
 import pytest
+from solana.exceptions import SolanaRpcException
 from solders.keypair import Keypair
 from solders.signature import Signature
 
@@ -736,6 +737,102 @@ class TestBuyPumpfun:
         pos = executor.positions[MINT_PUMP]
         assert pos.entry_price == pytest.approx(0.00005)
         assert pos.token_amount_ui == pytest.approx(1000.0)
+
+
+class TestRpcCaidoAlEnviar:
+    """Sin cuota de Helius, enviar la tx no puede fallar con un error de Python.
+
+    En produccion Telegram recibia literally:
+      <class 'httpx2.HTTPStatusError'> raised in "SendRawTransaction" ...
+    que no dice que el problema es el RPC ni que la operacion es reintentable.
+    """
+
+    @staticmethod
+    def _signed_tx():
+        class _FakeSignedTx:
+            def __bytes__(self) -> bytes:
+                return b"\x01" * 64
+
+        return _FakeSignedTx()
+
+    @staticmethod
+    def _rechazo() -> SolanaRpcException:
+        # SolanaExceptionBase.__init__(exc, func, *args) y SolanaRpcException
+        # lee args[1] al armar el mensaje: hacen falta 4 posicionales.
+        return SolanaRpcException(
+            ValueError("transaction simulation failed"),
+            "SendRawTransaction",
+            "send_transaction",
+            "insufficient lamports for fee",
+        )
+
+    async def test_rechazo_del_nodo_no_se_reintenta_en_otro_rpc(
+        self, executor: JupiterExecutor
+    ) -> None:
+        """SolanaRpcException = el nodo respondió y rechazó: otro RPC tampoco."""
+
+        class _Rejects:
+            async def send_raw_transaction(self, raw, opts=None):
+                raise TestRpcCaidoAlEnviar._rechazo()
+
+        class _Fallback:
+            async def send_raw_transaction(self, raw, opts=None):
+                raise AssertionError("no debe reintentarse: el nodo ya respondió")
+
+        executor._rpc_client = _Rejects()  # type: ignore[assignment]
+        executor._fallback_rpc_client = _Fallback()  # type: ignore[assignment]
+
+        with pytest.raises(SwapExecutionError, match="No se pudo ENVIAR"):
+            await executor._submit_signed_transaction(self._signed_tx())
+
+    async def test_fallo_de_transporte_cae_al_rpc_de_respaldo(
+        self, executor: JupiterExecutor
+    ) -> None:
+        """Un 429/timeout NO evaluó la tx: reenviar por otro nodo es seguro."""
+        enviados: list[str] = []
+
+        class _Caido:
+            async def send_raw_transaction(self, raw, opts=None):
+                raise RuntimeError("429 max usage reached")
+
+        class _Vivo:
+            async def send_raw_transaction(self, raw, opts=None):
+                enviados.append("fallback")
+                return SimpleNamespace(value=Signature.default())
+
+            async def confirm_transaction(self, txid, commitment=None):
+                return SimpleNamespace(value=[SimpleNamespace(err=None)])
+
+        executor._rpc_client = _Caido()  # type: ignore[assignment]
+        executor._fallback_rpc_client = _Vivo()  # type: ignore[assignment]
+
+        txid = await executor._submit_signed_transaction(self._signed_tx())
+
+        assert txid == Signature.default()
+        assert enviados == ["fallback"]
+
+    async def test_si_todo_falla_el_error_dice_que_es_el_rpc(
+        self, executor: JupiterExecutor
+    ) -> None:
+        class _Caido:
+            async def send_raw_transaction(self, raw, opts=None):
+                raise RuntimeError("429 max usage reached")
+
+        executor._rpc_client = _Caido()  # type: ignore[assignment]
+        executor._fallback_rpc_client = _Caido()  # type: ignore[assignment]
+
+        with pytest.raises(SwapExecutionError) as exc:
+            await executor._submit_signed_transaction(self._signed_tx())
+
+        # El mensaje tiene que ser accionable, no una clase de excepcion.
+        mensaje = str(exc.value)
+        assert "No se pudo ENVIAR" in mensaje
+        assert "Helius" in mensaje
+        assert "httpx" not in mensaje
+
+    def test_un_rechazo_del_nodo_no_es_fallo_de_transporte(self) -> None:
+        assert not JupiterExecutor._is_transport_failure(self._rechazo())
+        assert JupiterExecutor._is_transport_failure(RuntimeError("429"))
 
 
 class TestRuteoPumpfunSegunElParser:

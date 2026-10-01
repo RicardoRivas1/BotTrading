@@ -19,6 +19,7 @@ import base58
 import httpx
 from bip_utils import Bip39SeedGenerator
 from loguru import logger
+from solana.exceptions import SolanaRpcException
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.core import TokenAccountOpts
 from solana.rpc.models import TxOpts
@@ -227,6 +228,9 @@ class JupiterExecutor:
         # Cliente RPC persistente: se reutiliza en todas las llamadas en vez
         # de crear un nuevo AsyncClient (y su pool HTTP) por cada petición.
         self._rpc_client: AsyncClient = AsyncClient(rpc_url)
+        # Respaldo para enviar/confirmar cuando el RPC principal esta caido
+        # (Helius sin cuota -> HTTP 429). Se crea bajo demanda.
+        self._fallback_rpc_client: Optional[AsyncClient] = None
 
         self.positions: dict[str, Position] = {}
         self._load_exec_positions()
@@ -429,6 +433,57 @@ class JupiterExecutor:
                 await asyncio.sleep(delay)
         return False, None
 
+    @staticmethod
+    def _is_transport_failure(exc: Exception) -> bool:
+        """True si el fallo es de TRANSPORTE (nodo caido / 429 / timeout).
+
+        `SolanaRpcException` significa que el nodo respondió y rechazó la
+        operación: reintentarla en otro RPC no sirve (daría el mismo error).
+        Cualquier otra cosa (HTTPStatusError 429/5xx, timeout, error de red) sí
+        significa que la petición ni siquiera se evaluó, y ahí el reintento en
+        otro nodo es seguro.
+        """
+        return not isinstance(exc, SolanaRpcException)
+
+    def _fallback_client(self) -> Optional[AsyncClient]:
+        """Cliente RPC de respaldo (público, solo lectura+envío), o None."""
+        if not FALLBACK_RPC_URL or FALLBACK_RPC_URL == self.rpc_url:
+            return None
+        if self._fallback_rpc_client is None:
+            self._fallback_rpc_client = AsyncClient(FALLBACK_RPC_URL)
+        return self._fallback_rpc_client
+
+    async def _rpc_con_respaldo(self, metodo: str, *args, **kwargs):
+        """Ejecuta `metodo` en el RPC principal y, si el fallo es de transporte,
+        reintenta en el RPC de respaldo.
+
+        Solo se reintenta lo que NO se evaluó. La operación es idempotente: la
+        transacción va firmada con los mismos bytes, así que un doble envío es
+        la misma firma y Solana la deduplica.
+        """
+        clientes = [self._rpc_client]
+        fallback = self._fallback_client()
+        if fallback is not None:
+            clientes.append(fallback)
+
+        ultimo_error: Optional[Exception] = None
+        for i, client in enumerate(clientes):
+            try:
+                return await getattr(client, metodo)(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - se reintenta segun el tipo
+                ultimo_error = exc
+                if not self._is_transport_failure(exc):
+                    raise
+                if i + 1 < len(clientes):
+                    logger.warning(
+                        "RPC principal fallo al enviar ({}): {}. Reintentando en el RPC de respaldo.",
+                        metodo, exc,
+                    )
+                    continue
+        raise SwapExecutionError(
+            f"El RPC no pudo completar '{metodo}' (Helius sin cuota o caido): {ultimo_error}"
+        ) from ultimo_error
+
     async def _submit_signed_transaction(
         self,
         signed_tx: VersionedTransaction,
@@ -453,17 +508,27 @@ class JupiterExecutor:
         número acotado de veces; si aun así no se resuelve, la venta se considera
         NO ocurida y la posición se conserva para reintentarla.
         """
-        client = self._rpc_client
         opts = TxOpts(skip_preflight=True, skip_confirmation=True)
-        res = await client.send_raw_transaction(
-            bytes(signed_tx), opts=opts  # type: ignore[arg-type]
-        )
+        try:
+            res = await self._rpc_con_respaldo(
+                "send_raw_transaction", bytes(signed_tx), opts=opts
+            )
+        except Exception as exc:  # noqa: BLE001 - se reenvuelve con contexto util
+            # Sin esto Telegram recibia "<class 'httpx2.HTTPStatusError'> raised in
+            # "SendRawTransaction" endpoint request": ni dice que es el RPC ni
+            # que la operacion es reintentable.
+            raise SwapExecutionError(
+                "No se pudo ENVIAR la transaccion: el RPC de Helius no esta disponible "
+                f"(cuota agotada o caido). Detalle: {exc}"
+            ) from exc
         if not res.value:
             raise SwapExecutionError("Respuesta de envío sin firma")
         txid = res.value
 
         try:
-            confirmation = await client.confirm_transaction(txid, commitment="confirmed")
+            confirmation = await self._rpc_con_respaldo(
+                "confirm_transaction", txid, commitment="confirmed"
+            )
         except Exception as exc:  # noqa: BLE001 - timeout/RPC del proveedor
             logger.error(
                 "No se pudo confirmar la transacción {} (timeout/RPC): {}", txid, exc
