@@ -120,12 +120,19 @@ class TradingSettings(BaseSettings):
         description="Priority fee en micro-lamports por unidad de cómputo",
     )
     JUPITER_QUOTE_URL: str = Field(
-        default="https://lite-api.jup.ag/v6/quote",
-        description="Endpoint principal de cotización de la Jupiter Swap API v6",
+        default="https://api.jup.ag/swap/v1/quote",
+        description=(
+            "Endpoint principal de cotizacion de Jupiter. `lite-api.jup.ag/v6/quote` "
+            "devuelve 404 desde la retirada de ese host: usarlo como principal hacia "
+            "que TODAS las cotizaciones fallaran y el fallback nunca se activaba."
+        ),
     )
     JUPITER_FALLBACK_URL: str = Field(
-        default="https://api.jup.ag/swap/v1/quote",
-        description="Endpoint secundario (fallback) de Jupiter ante fallos de DNS/red",
+        default="https://api.jup.ag/swap/v2/quote",
+        description=(
+            "Endpoint secundario (fallback) de Jupiter ante fallos de red o HTTP. "
+            "Se prueba en el mismo cotizador, no en otro proceso."
+        ),
     )
 
     # --- Tiempos de actualización ---
@@ -396,6 +403,65 @@ class BotSettings(BaseSettings):
     )
 
 
+class ArbSettings(BaseSettings):
+    """Escaner de arbitraje en SECO (no ejecuta operaciones).
+
+    Mide si existe edge real de round-trip (SOL -> token -> SOL) descontando
+    todos los costes, y sobre todo mide la LATENCIA del ciclo: la ventana de
+    un arbitraje rentable dura ~200ms, asi que saber cuanto tarda nuestra
+    propia lectura es lo que decide si esto es viable o no.
+    """
+
+    model_config = BASE_SETTINGS
+
+    ARB_SCAN_ENABLED: bool = Field(default=False, description="Activar el escaner")
+    ARB_TRADE_SIZE_SOL: float = Field(
+        default=0.01,
+        gt=0,
+        ge=0.001,
+        description="Tamaño del ciclo a cotizar (SOL). El edge depende del tamaño.",
+    )
+    ARB_MIN_EDGE_PCT: float = Field(
+        default=0.30,
+        description=(
+            "Beneficio neto mínimo (%%) para contar una oportunidad. Debe superar "
+            "el doble fee de Jupiter mas slippage, si no es ruido de redondeo."
+        ),
+    )
+    ARB_SWAP_FEE_PCT: float = Field(
+        default=0.25,
+        ge=0,
+        description="Fee de Jupiter por swap (%%). Se cobran DOS por ciclo.",
+    )
+    ARB_ATA_RENT_SOL: float = Field(
+        default=0.00203928,
+        ge=0,
+        description="Rent de la ATA si el ciclo abre y cierra cuenta de tokens.",
+    )
+    ARB_MAX_TOKENS: int = Field(
+        default=8,
+        ge=1,
+        le=50,
+        description="Cuantos tokens escanear por pasada.",
+    )
+    ARB_MAX_LATENCY_MS: float = Field(
+        default=200.0,
+        gt=0,
+        description=(
+            "Ventana de arbitraje tipica. Si el ciclo completo tarda mas que esto, "
+            "el edge ya no existe cuando lo veamos: se reporta como NO VIABLE."
+        ),
+    )
+    ARB_MINTS: str = Field(
+        default="",
+        description=(
+            "Mints a escanear, separados por comas. Vacio = usar los tokens que el "
+            "copy trading ya tiene abiertos (los unicos con liquidez demostrada "
+            "para esta wallet). Ej: 'So111...,EPjFWdd...' "
+        ),
+    )
+
+
 class AppConfig:
     """Contenedor de configuración agrupado.
 
@@ -409,6 +475,7 @@ class AppConfig:
         self.telegram = TelegramSettings()
         self.copy_trading = CopyTradingSettings()
         self.bot = BotSettings()
+        self.arb = ArbSettings()
 
 
 def load_config() -> AppConfig:

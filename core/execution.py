@@ -316,9 +316,18 @@ class JupiterExecutor:
             try:
                 try:
                     quote = await self._request_quote(session, JUPITER_QUOTE_URL, params)
-                except (aiohttp.ClientConnectorError, OSError, asyncio.TimeoutError) as exc:
+                except (
+                    aiohttp.ClientConnectorError,
+                    OSError,
+                    asyncio.TimeoutError,
+                    SwapExecutionError,
+                ) as exc:
+                    # El fallback cubria SOLO fallos de transporte (DNS, timeout).
+                    # Un 404/5xx del endpoint principal lanzaba SwapExecutionError y
+                    # se escapaba aqui, asi que nunca se probaba el secundario: con
+                    # el host principal retirado, TODAS las cotizaciones fallaban.
                     logger.warning(
-                        "Jupiter principal {} falló por red ({}); reintentando con fallback {}",
+                        "Jupiter principal {} fallo ({}); reintentando con fallback {}",
                         JUPITER_QUOTE_URL, exc, JUPITER_FALLBACK_URL,
                     )
                     quote = await self._request_quote(session, JUPITER_FALLBACK_URL, params)

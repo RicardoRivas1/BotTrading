@@ -176,6 +176,10 @@ class TradingBot:
                 config=self.config,
             ))
 
+    # Último informe del escaner de arbitraje (/arb), para poder consultarlo
+        # sin volver a pagar las cotizaciones.
+        self._last_arb_report: dict | None = None
+
     async def run(self) -> None:
         """Inicia el bot con todas las estrategias."""
         logger.info("=== TradingBot Framework Modular ===")
@@ -229,8 +233,24 @@ class TradingBot:
             monitor_task.cancel()
             await asyncio.gather(heartbeat_task, cmd_task, monitor_task, return_exceptions=True)
 
+    def _arb_candidate_mints(self) -> list[str]:
+        """Mints a escanear: los de ARB_MINTS o, si esta vacio, los abiertos.
+
+        Se prefieren los que el copy trading ya tiene abiertos porque son los
+        unicos con liquidez demostrada para esta wallet: escanear mints
+        desconocidos solo genera ruido de "sin ruta".
+        """
+        explicit = [
+            m.strip()
+            for m in str(getattr(self.config.arb, "ARB_MINTS", "") or "").split(",")
+            if m.strip()
+        ]
+        if explicit:
+            return explicit[: self.config.arb.ARB_MAX_TOKENS]
+        return list(self.tracker.positions)[: self.config.arb.ARB_MAX_TOKENS]
+
     async def _telegram_command_loop(self) -> None:
-        """Polls Telegram for /stats and /wallets commands.
+        """Polls Telegram for /stats, /wallets and /arb commands.
 
         Si el chat configurado no existe o `TELEGRAM_CHAT_ID` está vacío, el
         listener entra en modo descubrimiento: adopta el primer chat privado
@@ -238,6 +258,11 @@ class TradingBot:
         """
         import aiohttp
 
+        from core.arb_scanner import (
+            ArbScanner,
+            costs_from_config,
+            report_to_dict,
+        )
         from core.stats import get_trade_stats
 
         cfg = self.config
@@ -246,7 +271,7 @@ class TradingBot:
 
         token = cfg.telegram.TELEGRAM_TOKEN
         offset = 0
-        logger.info("Telegram command listener iniciado (/stats, /wallets)")
+        logger.info("Telegram command listener iniciado (/stats, /wallets, /arb)")
 
         while True:
             try:
@@ -296,7 +321,34 @@ class TradingBot:
                                     f"WR {ws['win_rate']}% | PnL {ws['pnl_pct']:+.2f}% ({ws['net_pnl_sol']:+.4f} SOL)"
                                 )
                             await self.notifier.send("\n".join(lines))
-
+                    elif text == "/arb":
+                        mints = self._arb_candidate_mints()
+                        if not mints:
+                            await self.notifier.send_status(
+                                "Sin mints que escanear. Abre posiciones de copy "
+                                "trading o define ARB_MINTS en la config."
+                            )
+                        else:
+                            await self.notifier.send_status(
+                                f"Escaneando {len(mints)} token(s) en seco..."
+                            )
+                            costs = costs_from_config(
+                                cfg.arb, slippage_bps=cfg.trading.SLIPPAGE_BPS
+                            )
+                            scanner = ArbScanner(
+                                self.executor, costs,
+                                min_edge_pct=cfg.arb.ARB_MIN_EDGE_PCT,
+                            )
+                            try:
+                                report = await scanner.scan(mints)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.error(f"/arb fallo: {exc}")
+                                await self.notifier.send_error(f"/arb fallo: {exc}")
+                            else:
+                                self._last_arb_report = report_to_dict(report)
+                                await self.notifier.send(
+                                    report.format(cfg.arb.ARB_MAX_LATENCY_MS)
+                                )
             except asyncio.CancelledError:
                 break
             except Exception:

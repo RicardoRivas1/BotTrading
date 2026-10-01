@@ -369,6 +369,48 @@ class TestUtilities:
         )
         assert quote["simulated"] is True
 
+    async def test_get_quote_fallback_ante_un_404_del_principal(
+        self, executor: JupiterExecutor
+    ) -> None:
+        """Un 404 del endpoint principal DEBE probar el secundario.
+
+        El fallback solo capturaba fallos de transporte (DNS/timeout). Cuando
+        `lite-api.jup.ag` devolvio 404 tras su retirada, el SwapExecutionError
+        se escapaba sin probar el secundario y TODAS las cotizaciones
+        fallaban, aunque el fallback configurado funcionase.
+        """
+        fake_quote = {"outAmount": "42"}
+        executor._request_quote = AsyncMock(
+            side_effect=[SwapExecutionError("404 Route not found"), fake_quote]
+        )
+        quote = await executor._get_quote(
+            session=MagicMock(), input_mint="A", output_mint="B", amount_lamports=1_000
+        )
+        assert quote == fake_quote
+        assert executor._request_quote.await_count == 2
+        # Y debe haber intentado el secundario de verdad.
+        assert execution_mod.JUPITER_FALLBACK_URL in str(
+            executor._request_quote.await_args_list[1]
+        )
+
+    async def test_get_quote_el_404_del_primario_no_se_toma_por_sin_liquidez(
+        self, executor: JupiterExecutor
+    ) -> None:
+        """Si ambos endpoints fallan, no debe reportarlo como token sin ruta."""
+        executor._request_quote = AsyncMock(
+            side_effect=[
+                SwapExecutionError("404 Route not found"),
+                SwapExecutionError("404 Route not found"),
+            ]
+        )
+        with pytest.raises(SwapExecutionError):
+            await executor._get_quote(
+                session=MagicMock(),
+                input_mint="A",
+                output_mint="B",
+                amount_lamports=1_000,
+            )
+
     async def test_get_quote_sin_simulacion_todos_fallan_lanza(
         self, executor: JupiterExecutor
     ) -> None:
