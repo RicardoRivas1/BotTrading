@@ -14,11 +14,20 @@ from __future__ import annotations
 
 import os
 
+import certifi
 from dotenv import load_dotenv
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 load_dotenv()
+
+# En Windows, `ssl.create_default_context()` carga el almacen de certificados
+# del sistema (unas 59 raices) en vez del bundle de certifi. Si ese almacen
+# tiene una raiz vencida, OpenSSL la elige para armar la cadena y TODO request
+# HTTPS falla con "certificate has expired" aunque la cadena real este vigente
+# (aiohttp usa create_default_context por defecto; requests usa certifi y
+# funciona). Forzamos el bundle de certifi, que es el unico actualizado.
+os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 
 # --- MODO DE EJECUCIÓN ---
 # False = REAL (firma y envía swaps a la red) | True = SIMULACIÓN.

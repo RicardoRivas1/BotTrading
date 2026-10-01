@@ -39,6 +39,11 @@ JUPITER_SWAP = "https://lite-api.jup.ag/v6/swap"
 # API de PumpPortal para trades directos en la bonding curve de Pump.fun.
 PUMPPORTAL_TRADE_URL = "https://pumpportal.fun/api/trade-local"
 
+# RPC publico de solo lectura, usado como RESPALDO cuando el RPC principal
+# (Helius) se queda sin cuota y responde 429 "max usage reached". Sin esto,
+# todo `get_balance` falla y el bot cree que la wallet esta vacia.
+FALLBACK_RPC_URL = "https://api.mainnet-beta.solana.com"
+
 # Prioridad mínima objetivo para las compras: pagar ~0.0001 SOL extra por swap
 # (200_000 CU x 500_000 micro-lamports/CU = 1e5 lamports = 0.0001 SOL) para
 # reducir los descartes por prioridad baja en los picos de congestión.
@@ -48,6 +53,11 @@ COMPUTE_UNIT_PRICE_MICRO_LAMPORTS = 500_000
 # Slippage de compra en la bonding curve de Pump.fun (porcentaje).
 BUY_SLIPPAGE_MIN_PCT = 15.0
 BUY_SLIPPAGE_MAX_PCT = 20.0
+
+# Reserva que debe quedar libre en la wallet ademas del monto de la compra:
+# priorityFee (0.001 SOL) + alquiler de la cuenta ATA del token (~0.002 SOL) +
+# fees base de la transaccion. Si no queda, la tx no se puede construir/firmar.
+_PUMPPORTAL_FEE_BUFFER_SOL = 0.0035
 
 _USER_AGENT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -627,6 +637,15 @@ class JupiterExecutor:
             amount_sol = float(raw_amount.replace("SOL", "").strip())
         else:
             amount_sol = float(raw_amount)
+        # Un monto no positivo es un bug aguas arriba (tipicamente el tope por
+        # porcentaje de capital calculado sobre un balance que fallo al leerse).
+        # PumpPortal responde 400 y el error sube como "Copy trade fallido"
+        # sin explicar la causa real, asi que se corta aqui con un mensaje claro.
+        if amount_sol <= 0:
+            raise SwapExecutionError(
+                f"Monto de compra invalido: {amount_sol} SOL (debe ser > 0). "
+                f"Mint: {mint}, Wallet: {wallet_pubkey_str}"
+            )
         logger.info(
             "Comprando {} SOL de {} por PumpPortal (bonding curve, slippage 15%)",
             amount_sol, mint,
@@ -635,13 +654,19 @@ class JupiterExecutor:
         try:
             balance_resp = await self._rpc_client.get_balance(Pubkey.from_string(wallet_pubkey_str))
             wallet_sol = balance_resp.value / 1_000_000_000 if balance_resp.value else 0.0
-            logger.debug("Wallet SOL balance: {:.6f} SOL (necesario: ~{:.6f})", wallet_sol, amount_sol + 0.001)
-            if wallet_sol < amount_sol + 0.001:
-                raise SwapExecutionError(
-                    f"Balance SOL insuficiente: {wallet_sol:.6f} SOL (requiere ~{amount_sol + 0.001:.6f} SOL)"
-                )
         except Exception as exc:
             logger.warning("No se pudo verificar balance SOL pre-vuelo: {}", exc)
+        else:
+            logger.debug("Wallet SOL balance: {:.6f} SOL (necesario: ~{:.6f})", wallet_sol, amount_sol + 0.001)
+            # El `raise` va FUERA del `try`: antes estaba dentro y lo recogia su
+            # propio `except Exception`, que solo lo logueaba y segoia comprando
+            # con una wallet sin saldo (PumpPortal 400 / tx sin firmar).
+            if wallet_sol < amount_sol + _PUMPPORTAL_FEE_BUFFER_SOL:
+                raise SwapExecutionError(
+                    f"Balance SOL insuficiente: {wallet_sol:.6f} SOL "
+                    f"(requiere ~{amount_sol + _PUMPPORTAL_FEE_BUFFER_SOL:.6f} SOL). "
+                    f"Mint: {mint}, Wallet: {wallet_pubkey_str}"
+                )
 
         payload = {
             "publicKey": wallet_pubkey_str,
@@ -705,14 +730,49 @@ class JupiterExecutor:
         """Balance actual de SOL (en unidades humanas) de la wallet del bot.
 
         Usado para el tope de capital por trade de copy trading.
+
+        Si el RPC principal falla (Helius sin cuota -> 429 "max usage
+        reached", timeout, ...) reintenta contra el RPC publico de solo lectura.
+        Antes no habia respaldo y ademas el error se traducía a 0.0, con lo
+        cual el tope por porcentaje se comia el 100% del monto y PumpPortal
+        recibia `amount: 0.0` (HTTP 400 -> "Copy trade fallido" en Telegram).
+
+        Devuelve -1.0 si no se pudo leer de ninguna fuente, para que el llamador
+        distinga "error de RPC" de "wallet vacia" (igual que
+        `get_wallet_token_balance`).
         """
         try:
             resp = await self._rpc_client.get_balance(self.keypair.pubkey())
-            if resp.value is None:
-                return 0.0
-            return resp.value / 1_000_000_000
-        except Exception:
-            return 0.0
+            value = getattr(resp, "value", None)
+            if value is not None:
+                return float(value) / 1_000_000_000
+            logger.warning("get_sol_balance: el RPC no devolvio valor de balance")
+        except Exception as exc:
+            logger.warning("get_sol_balance fallo en el RPC principal: {}", exc)
+
+        if FALLBACK_RPC_URL and FALLBACK_RPC_URL != self.rpc_url:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    r = await client.post(
+                        FALLBACK_RPC_URL,
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "getBalance",
+                            "params": [self.wallet_pubkey],
+                        },
+                    )
+                    lamports = (r.json().get("result") or {}).get("value")
+                if lamports is not None:
+                    logger.info(
+                        "get_sol_balance: RPC principal caido, usando RPC publico de respaldo."
+                    )
+                    return float(lamports) / 1_000_000_000
+                logger.warning("get_sol_balance: el RPC de respaldo no devolvio balance ({})", r.status_code)
+            except Exception as exc:
+                logger.warning("get_sol_balance fallo tambien en el RPC de respaldo: {}", exc)
+
+        return -1.0
 
     async def get_wallet_token_balance(self, wallet_pubkey: str, token_mint: str) -> float:
         """Saldo real (unidades humanas) del token en TODAS las cuentas SPL de

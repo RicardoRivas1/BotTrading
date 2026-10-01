@@ -25,13 +25,62 @@ class TelegramNotifier:
         self.token = token
         self.chat_id = chat_id
         self.enabled = bool(token and chat_id)
+        self.chat_id_invalid = False
+
+    @property
+    def needs_chat_discovery(self) -> bool:
+        """True si aún no hay un chat válido de destino.
+
+        Ocurre cuando `TELEGRAM_CHAT_ID` está vacío o cuando Telegram
+        rechazó escribir en él ("chat not found"). En ese estado el bot
+        puede adoptar automáticamente el primer chat privado que le escriba.
+        """
+        return not self.enabled or self.chat_id_invalid
+
+    def set_chat_id(self, chat_id: str) -> None:
+        """Fija el chat de destino y reactiva el notificador."""
+        self.chat_id = str(chat_id)
+        self.enabled = bool(self.token and self.chat_id)
+        self.chat_id_invalid = False
+
+    async def verify_chat(self) -> bool:
+        """Comprueba con `getChat` que el chat configurado es accesible.
+
+        Marca `chat_id_invalid` si Telegram no lo reconoce, para que el
+        listener de comandos entre en modo descubrimiento sin esperar al
+        primer trade.
+        """
+        if not self.enabled:
+            return False
+
+        url = f"https://api.telegram.org/bot{self.token}/getChat"
+        try:
+            status, body = await self._post_text(url, {"chat_id": self.chat_id})
+        except aiohttp.ClientError as exc:
+            logger.error("Fallo de red verificando el chat de Telegram: {}", exc)
+            return False
+
+        if status == 200:
+            self.chat_id_invalid = False
+            logger.info("Telegram verificado: chat {} accesible.", self.chat_id)
+            return True
+
+        self.chat_id_invalid = True
+        logger.warning(
+            "Telegram no reconoce el chat {} ({}). Escribe cualquier mensaje "
+            "al bot y se reconfigurará solo.",
+            self.chat_id,
+            body,
+        )
+        return False
 
     async def send(self, html: str, parse_mode: str = "HTML") -> bool:
         """Envía un mensaje HTML al chat configurado.
 
         Si Telegram responde HTTP 400 (Bad Request: can't parse entities)
         mientras el mensaje se envía con `parse_mode="HTML"`, se reintenta
-        inmediatamente en texto plano (`parse_mode=None`).
+        inmediatamente en texto plano (`parse_mode=None`). Un 400 por
+        "chat not found" no se reintenta: marca el chat como inválido.
         """
         if not self.enabled:
             logger.debug("Telegram no configurado, mensaje omitido.")
@@ -52,6 +101,15 @@ class TelegramNotifier:
 
         if status == 200:
             return True
+
+        if status == 400 and "chat not found" in body:
+            self.chat_id_invalid = True
+            logger.error(
+                "Telegram no encuentra el chat {}. Escribe cualquier mensaje al "
+                "bot y se reconfigurará solo.",
+                self.chat_id,
+            )
+            return False
 
         # HTTP 400 habitualmente significa HTML inválido (p. ej. entidades sin
         # escapar): se reintenta en texto plano en lugar de descartar el aviso.

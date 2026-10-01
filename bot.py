@@ -15,7 +15,6 @@ import asyncio
 import os
 import sys
 
-from aiohttp import web
 from loguru import logger
 
 from config import AppConfig, load_config
@@ -40,7 +39,17 @@ async def start_health_server(engine: StrategyEngine) -> None:
     - GET /: Health check
     - POST {copy_strategy.webhook_path}: Webhook de Helius para copy trading
     - GET /stats: Estadisticas del engine y todas las estrategias
+
+    El import de aiohttp va aca a proposito: aiohttp cachea en
+    `aiohttp.connector._SSL_CONTEXT_VERIFIED` el contexto SSL verificado que
+    construye con `ssl.create_default_context()`, y en Windows eso carga el
+    almacen de certificados del sistema (no el bundle de certifi que fija
+    config.py). Si aiohttp se importara antes que config, el contexto quedaria
+    cacheado con las raices viejas y todas las llamadas HTTPS fallarian con
+    "certificate has expired".
     """
+    from aiohttp import web
+
     app = web.Application()
 
     async def health_handler(request: web.Request) -> web.Response:
@@ -174,6 +183,12 @@ class TradingBot:
         logger.info("RPC: {}", self.executor.rpc_url)
         logger.info("Estrategias: {}", list(self.engine.strategies.keys()))
 
+        # Comprobar el chat de Telegram antes de nada: si el ID de `.env` no
+        # existe, el listener entra en modo descubrimiento y espera a que le
+        # escriban en lugar de perder todas las alertas.
+        if self.config.telegram.TELEGRAM_TOKEN:
+            await self.notifier.verify_chat()
+
         # Configurar webhook de Helius para copy trading
         await self._setup_helius_webhook()
 
@@ -215,16 +230,21 @@ class TradingBot:
             await asyncio.gather(heartbeat_task, cmd_task, monitor_task, return_exceptions=True)
 
     async def _telegram_command_loop(self) -> None:
-        """Polls Telegram for /stats and /wallets commands."""
+        """Polls Telegram for /stats and /wallets commands.
+
+        Si el chat configurado no existe o `TELEGRAM_CHAT_ID` está vacío, el
+        listener entra en modo descubrimiento: adopta el primer chat privado
+        que escriba al bot y reenvía ahí todas las alertas.
+        """
         import aiohttp
+
         from core.stats import get_trade_stats
 
         cfg = self.config
-        if not cfg.telegram.TELEGRAM_TOKEN or not cfg.telegram.TELEGRAM_CHAT_ID:
+        if not cfg.telegram.TELEGRAM_TOKEN:
             return
 
         token = cfg.telegram.TELEGRAM_TOKEN
-        chat_id = cfg.telegram.TELEGRAM_CHAT_ID
         offset = 0
         logger.info("Telegram command listener iniciado (/stats, /wallets)")
 
@@ -242,10 +262,18 @@ class TradingBot:
                     offset = update["update_id"] + 1
                     msg = update.get("message", {})
                     text = msg.get("text", "").strip().lower()
-                    from_chat = str(msg.get("chat", {}).get("id", ""))
+                    chat = msg.get("chat", {})
+                    from_chat = str(chat.get("id", ""))
 
-                    if from_chat != chat_id:
-                        continue
+                    if from_chat != self.notifier.chat_id:
+                        if chat.get("type") != "private" or not self.notifier.needs_chat_discovery:
+                            continue
+                        self.notifier.set_chat_id(from_chat)
+                        cfg.telegram.TELEGRAM_CHAT_ID = from_chat
+                        logger.success("Telegram: chat {} adoptado como destino de alertas.", from_chat)
+                        await self.notifier.send_status(
+                            "✅ Bot conectado. Este chat recibira todas las alertas."
+                        )
 
                     if text == "/stats":
                         stats = get_trade_stats()
@@ -312,8 +340,9 @@ class TradingBot:
                     "https://dashboard.helius.dev/webhooks"
                 )
         else:
-            logger.warning(
-                "URL publica no detectada. Configura WEBHOOK_BASE_URL en .env"
+            logger.info(
+                "Sin URL publica: se usara RPC polling (sin webhook de Helius). "
+                "Configura WEBHOOK_BASE_URL en .env solo si montas un tunel HTTPS."
             )
 
     async def shutdown(self) -> None:

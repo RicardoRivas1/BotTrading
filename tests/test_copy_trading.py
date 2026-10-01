@@ -791,3 +791,100 @@ class TestAcumulacionSinCapitalFantasma:
         assert exec_pos.sol_invested == pytest.approx(0.01)
         assert exec_pos.token_amount_ui == pytest.approx(1000.0)
         assert tracker_pos.amount == pytest.approx(0.01)
+
+
+class TestTopeDeCapitalNuncaProduceCero:
+    """El tope por % de capital no puede degenerar en un monto 0 SOL.
+
+    Cuando el RPC no devolvia el balance (Helius sin cuota -> 429), el tope se
+    calculaba sobre 0 y se mandaba `amount: 0.0` a PumpPortal: HTTP 400 y
+    "Copy trade fallido" en Telegram, una vez por cada trader que copiaba.
+    """
+
+    @staticmethod
+    def _buy_signal(amount_sol: float = 0.01) -> CopyTradeSignal:
+        return CopyTradeSignal(
+            wallet=TRADER,
+            action="buy",
+            token_mint=MINT,
+            token_symbol="TEST",
+            amount_sol=amount_sol,
+            tx_signature="sig_buy_cap",
+            block_time=3000.0,
+            trade_token_amount=1000.0,
+            buy_sol_raw=amount_sol,
+            trader_label="trader",
+        )
+
+    @staticmethod
+    def _prepare(strategy, executor, monkeypatch, *, balance: float) -> dict:
+        """Arma el buy y captura el monto CON EL QUE SE COMPRA.
+
+        `buy_amount_sol` se restaura en un `finally` justo después de
+        `buy_token`, así que hay que leerlo dentro del propio mock: si no, la
+        aserción vería siempre el valor original y no detectaría un 0.
+        """
+        strategy.config.copy_trading.COPY_TRADE_CAPITAL_PERCENT = 5.0
+        executor.get_sol_balance = AsyncMock(return_value=balance)
+        used: dict = {}
+
+        async def _buy(mint: str):
+            used["amount"] = executor.buy_amount_sol
+            used["mint"] = mint
+            return "sig"
+
+        executor.buy_token = AsyncMock(side_effect=_buy)
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: MagicMock())
+        return used
+
+    async def test_balance_desconocido_no_aplica_el_tope(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        strategy, executor, _tracker = _strategy(tmp_path)
+        used = self._prepare(strategy, executor, monkeypatch, balance=-1.0)
+
+        await strategy._execute_copy_trade(self._buy_signal())
+
+        executor.buy_token.assert_awaited_once()
+        # Sin tope: se compra el monto del trader (ya limitado por
+        # MAX_COPY_TRADE_SOL al parsear la señal). Lo importante es que NO sea 0.
+        assert used["amount"] == pytest.approx(0.01)
+
+    async def test_wallet_vacia_no_aplica_el_tope(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        strategy, executor, _tracker = _strategy(tmp_path)
+        used = self._prepare(strategy, executor, monkeypatch, balance=0.0)
+
+        await strategy._execute_copy_trade(self._buy_signal())
+
+        executor.buy_token.assert_awaited_once()
+        assert used["amount"] == pytest.approx(0.01)
+
+    async def test_balance_valido_si_limita_el_monto(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        strategy, executor, _tracker = _strategy(tmp_path)
+        # 1 SOL de capital -> el tope del 5% es 0.05 SOL: el monto del trader
+        # (0.01) queda por debajo y NO se toca.
+        used = self._prepare(strategy, executor, monkeypatch, balance=1.0)
+
+        await strategy._execute_copy_trade(self._buy_signal())
+
+        executor.buy_token.assert_awaited_once()
+        assert used["amount"] == pytest.approx(0.01)
+
+    async def test_balance_valido_aplica_el_tope_porcentual(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        strategy, executor, _tracker = _strategy(tmp_path)
+        strategy.config.copy_trading.MAX_COPY_TRADE_SOL = 1.0
+        strategy.config.copy_trading.MIN_COPY_TRADE_SOL = 0.0001
+        # 0.5 SOL de capital -> tope 5% = 0.025 SOL, por debajo de los 0.05
+        # que gastó el trader.
+        used = self._prepare(strategy, executor, monkeypatch, balance=0.5)
+
+        await strategy._execute_copy_trade(self._buy_signal(0.05))
+
+        executor.buy_token.assert_awaited_once()
+        assert used["amount"] == pytest.approx(0.025)

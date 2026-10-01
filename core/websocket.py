@@ -426,14 +426,18 @@ async def process_sell_and_notify(
     pnl = max(-100.0, min(raw_pnl, MAX_PLAUSIBLE_PNL_PCT))
 
     # En DRY_RUN las salidas automáticas del tracker (TAKE_PROFIT / STOP_LOSS /
-    # TRAILING_STOP / TIME_EXPIRED) nacen de cotizaciones simuladas, a menudo
-    # oscilantes (+59% y luego -13% para el mismo token) o dust, y no representan
-    # un resultado real. No deben spamear Telegram ni contaminar las stats de
-    # /stats. Las salidas por COPY_TRADE_SELL (el trader vendió de verdad) sí se
-    # notifican y se registran por la estrategia de copy trading.
+    # TRAILING_STOP / TIME_EXPIRED / DEAD_NO_PRICE) nacen de cotizaciones
+    # simuladas, a menudo oscilantes (+59% y luego -13% para el mismo token) o
+    # dust, y no representan un resultado real. No deben spamear Telegram ni
+    # contaminar las stats de /stats. Las salidas por COPY_TRADE_SELL (el trader
+    # vendió de verdad) sí se notifican y se registran por la estrategia de copy
+    # trading.
     quiet_dry_run_exit = (
         bool(cfg.trading.DRY_RUN)
-        and reason in ("TAKE_PROFIT", "STOP_LOSS", "TRAILING_STOP", "TIME_EXPIRED")
+        and reason in (
+            "TAKE_PROFIT", "STOP_LOSS", "TRAILING_STOP",
+            "TIME_EXPIRED", "DEAD_NO_PRICE",
+        )
     )
 
     # Un único vendedor por mint: el tracker (task aparte) y la estrategia de

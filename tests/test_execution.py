@@ -750,6 +750,127 @@ class TestBuyPumpfun:
             await executor.buy_token(MINT_RAYDIUM, dry_run=False)
         executor._buy_via_pumpportal.assert_not_called()
 
+    async def test_monto_cero_se_rechaza_sin_llamar_a_pumpportal(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        """`amount: 0.0` es un bug de calculo, no una operacion.
+
+        Lo produzca el tope por % de capital cuando la lectura del balance falla.
+        PumpPortal respondia 400 y el error subia a Telegram como
+        "Copy trade fallido" sin decir que el monto era 0.
+        """
+        captured: dict = {}
+        _patch_pumpportal(executor, monkeypatch, captured)
+
+        with pytest.raises(SwapExecutionError, match="Monto de compra invalido"):
+            await executor._buy_via_pumpportal(MINT_PUMP, 0.0)
+
+        assert "payload" not in captured
+
+    async def test_balance_insuficiente_aborta_antes_de_pumpportal(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        """El pre-vuelo de saldo debe cortar la compra, no solo avisar.
+
+        El `raise` estaba dentro del `try` y lo recogía su propio
+        `except Exception`, que lo logueaba y seguía comprando con una wallet
+        sin saldo.
+        """
+        captured: dict = {}
+        _patch_pumpportal(executor, monkeypatch, captured)
+
+        async def _no_balance(_pubkey):
+            return SimpleNamespace(value=0)
+
+        executor._rpc_client.get_balance = _no_balance  # type: ignore[attr-defined]
+
+        with pytest.raises(SwapExecutionError, match="Balance SOL insuficiente"):
+            await executor._buy_via_pumpportal(MINT_PUMP, 0.05)
+
+        assert "payload" not in captured
+
+
+class TestBalanceSolResiliente:
+    """`get_sol_balance` no puede mentir: error de RPC != wallet vacía.
+
+    Con Helius sin cuota (429 "max usage reached") toda lectura devolvía 0.0, y
+    el tope por % de capital convertía ese 0 en un cap de 0 SOL.
+    """
+
+    @staticmethod
+    def _patch_fallback(monkeypatch, *, lamports, status: int = 200) -> None:
+        class _Resp:
+            def __init__(self) -> None:
+                self.status_code = status
+
+            def json(self) -> dict:
+                if lamports is None:
+                    return {"jsonrpc": "2.0", "error": {"code": -32000}}
+                return {"jsonrpc": "2.0", "result": {"value": lamports}}
+
+        class _Client:
+            async def __aenter__(self) -> "_Client":
+                return self
+
+            async def __aexit__(self, *exc: object) -> bool:
+                return False
+
+            async def post(self, *a: object, **kw: object) -> _Resp:
+                return _Resp()
+
+        monkeypatch.setattr(
+            execution_mod.httpx, "AsyncClient", lambda *a, **k: _Client()
+        )
+
+    async def test_usa_el_rpc_principal_si_funciona(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        async def _balance(_pubkey):
+            return SimpleNamespace(value=1_500_000_000)
+
+        executor._rpc_client.get_balance = _balance  # type: ignore[attr-defined]
+
+        assert await executor.get_sol_balance() == pytest.approx(1.5)
+
+    async def test_cae_al_rpc_publico_si_el_principal_falla(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        async def _boom(_pubkey):
+            raise RuntimeError("429 max usage reached")
+
+        executor._rpc_client.get_balance = _boom  # type: ignore[attr-defined]
+        self._patch_fallback(monkeypatch, lamports=16_878_272)
+
+        assert await executor.get_sol_balance() == pytest.approx(0.016878272)
+
+    async def test_devuelve_menos_uno_si_fallan_todas_las_fuentes(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        async def _boom(_pubkey):
+            raise RuntimeError("429 max usage reached")
+
+        executor._rpc_client.get_balance = _boom  # type: ignore[attr-defined]
+        self._patch_fallback(monkeypatch, lamports=None, status=429)
+
+        assert await executor.get_sol_balance() == pytest.approx(-1.0)
+
+    async def test_respuesta_sin_resultado_no_es_un_balance_de_cero(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        """El RPC puede devolver `error` en vez de `result` (p. ej. 429)."""
+
+        class _Resp:
+            def __init__(self) -> None:
+                self.value = None
+
+        async def _sin_resultado(_pubkey):
+            return _Resp()
+
+        executor._rpc_client.get_balance = _sin_resultado  # type: ignore[attr-defined]
+        self._patch_fallback(monkeypatch, lamports=None, status=429)
+
+        assert await executor.get_sol_balance() == pytest.approx(-1.0)
+
     async def test_buy_token_reintenta_tras_rate_limit_429(
         self, executor: JupiterExecutor, monkeypatch
     ) -> None:

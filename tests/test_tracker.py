@@ -221,6 +221,106 @@ class TestPrecioReal:
         assert pnl == pytest.approx(100.0)
 
 
+class TestReaperPosicionesMuertas:
+    """Una posición sin cotización se cierra pasado DEAD_POSITION_MAX_AGE_SEC.
+
+    Es la única red de seguridad cuando MAX_COPY_TRADE_HOLD_SECONDS=0
+    ("seguir al trader indefinidamente"), que era la configuración del bot.
+    """
+
+    async def test_primera_sin_precio_solo_marca_el_instante(
+        self, tracker: PositionTracker, patch_sell: AsyncMock
+    ) -> None:
+        tracker_module.get_pumpfun_price = AsyncMock(return_value=None)
+        tracker.executor.get_token_price.side_effect = RuntimeError("sin API")
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+
+        await tracker._evaluate("MINT123ABC")
+
+        pos = tracker.get_position("MINT123ABC")
+        assert pos is not None
+        assert pos.no_price_since > 0.0
+        patch_sell.assert_not_awaited()
+
+    async def test_cierra_al_superar_el_limite_de_horas(
+        self, tracker: PositionTracker, patch_sell: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tracker_module, "DEAD_POSITION_MAX_AGE_SEC", 3 * 3600)
+        tracker_module.get_pumpfun_price = AsyncMock(return_value=None)
+        tracker.executor.get_token_price.side_effect = RuntimeError("sin API")
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+
+        await tracker._evaluate("MINT123ABC")
+        pos = tracker.get_position("MINT123ABC")
+        # Envejece el reloj de "sin precio" más allá del límite.
+        pos.no_price_since = time.time() - (3 * 3600 + 60)
+        pos.price_retry_at = 0.0  # fuerza a reintentar la consulta
+
+        await tracker._evaluate("MINT123ABC")
+
+        patch_sell.assert_awaited_once()
+        assert patch_sell.await_args.kwargs["reason"] == "DEAD_NO_PRICE"
+        assert tracker.get_position("MINT123ABC") is None
+
+    async def test_no_cierra_antes_de_vencer(
+        self, tracker: PositionTracker, patch_sell: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tracker_module, "DEAD_POSITION_MAX_AGE_SEC", 3 * 3600)
+        tracker_module.get_pumpfun_price = AsyncMock(return_value=None)
+        tracker.executor.get_token_price.side_effect = RuntimeError("sin API")
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+
+        await tracker._evaluate("MINT123ABC")
+        pos = tracker.get_position("MINT123ABC")
+        pos.no_price_since = time.time() - (3 * 3600 - 60)  # aún dentro del plazo
+        pos.price_retry_at = 0.0
+
+        await tracker._evaluate("MINT123ABC")
+
+        patch_sell.assert_not_awaited()
+        assert tracker.get_position("MINT123ABC") is not None
+
+    async def test_una_vez_cotizada_deja_de_contar_como_muerta(
+        self, tracker: PositionTracker, patch_sell: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(tracker_module, "DEAD_POSITION_MAX_AGE_SEC", 3 * 3600)
+        tracker_module.get_pumpfun_price = AsyncMock(return_value=None)
+        tracker.executor.get_token_price.side_effect = RuntimeError("sin API")
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+
+        await tracker._evaluate("MINT123ABC")
+        assert tracker.get_position("MINT123ABC").no_price_since > 0.0
+
+        # Vuelve a cotizar: el contador se reinicia. El backoff de 30s debe
+        # expirar antes, que es lo que ocurre en producción.
+        pos = tracker.get_position("MINT123ABC")
+        pos.price_retry_at = 0.0
+        tracker.executor.get_token_price.side_effect = None
+        tracker.executor.get_token_price.return_value = 0.00105
+        await tracker._evaluate("MINT123ABC")
+
+        pos = tracker.get_position("MINT123ABC")
+        assert pos is not None
+        assert pos.no_price_since == 0.0
+
+    async def test_cierra_tambien_durante_el_backoff_sin_reintentar(
+        self, tracker: PositionTracker, patch_sell: AsyncMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Durante el backoff (price_retry_at en el futuro) no se consulta la
+        # red, pero el reaper debe seguir corriendo.
+        monkeypatch.setattr(tracker_module, "DEAD_POSITION_MAX_AGE_SEC", 3 * 3600)
+        tracker.add_position("MINT123ABC", "MET", 0.001, 0.05)
+        pos = tracker.get_position("MINT123ABC")
+        pos.no_price_since = time.time() - (3 * 3600 + 60)
+        pos.price_retry_at = time.time() + 30
+
+        await tracker._evaluate("MINT123ABC")
+
+        patch_sell.assert_awaited_once()
+        assert patch_sell.await_args.kwargs["reason"] == "DEAD_NO_PRICE"
+        tracker.executor.get_token_price.assert_not_awaited()
+
+
 class TestCascadaPrecio:
     """La cotización se obtiene en cascada: Pump.fun primero, luego el executor."""
 

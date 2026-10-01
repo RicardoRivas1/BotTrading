@@ -60,6 +60,16 @@ IMPLAUSIBLE_POLL_INTERVAL_SEC = float(os.getenv("IMPLAUSIBLE_POLL_INTERVAL_SEC",
 # MAX_COPY_TRADE_POSITIONS que de otro modo quedaría bloqueado ~27h.
 IMPLAUSIBLE_MAX_AGE_SEC = float(os.getenv("IMPLAUSIBLE_MAX_AGE_SEC", "300"))
 
+# Horas que una posición puede seguir SIN NINGUNA cotización (ningún par en
+# DexScreener ni Jupiter) antes de darla por muerta y cerrarla. Es
+# independiente de MAX_HOLD_TIME_SEC y de MAX_COPY_TRADE_HOLD_SECONDS: con el
+# hold en 0 (modo "seguir al trader indefinidamente") una posición ilíquida
+# nunca vencería por tiempo y se acumularía para siempre, consultando precio
+# cada 30s y falseando el recuento de posiciones abiertas.
+DEAD_POSITION_MAX_AGE_SEC = float(
+    os.getenv("DEAD_POSITION_MAX_AGE_SEC", str(3 * 3600))
+)
+
 # API directa de Pump.fun para la cotización en SOL por token. Se usan
 # cabeceras de navegador para evitar el bloqueo 403 de Cloudflare.
 PUMPFUN_API = "https://frontend-api.pump.fun/coins/{mint}"
@@ -142,6 +152,11 @@ class TrackerPosition:
     # Instante hasta el que no se vuelve a pedir precio a la red tras un fallo
     # de los proveedores (evita el martilleo de 4 consultas cada 2s).
     price_retry_at: float = 0.0
+    # Instante en que la posición se quedó sin cotización. Se reinicia a 0 en
+    # cuanto vuelve a obtenerse un precio. Sirve para el reaper de posiciones
+    # muertas (DEAD_POSITION_MAX_AGE_SEC), que es la única red de seguridad
+    # cuando el hold por tiempo está desactivado.
+    no_price_since: float = 0.0
 
 
 class PositionTracker:
@@ -240,6 +255,7 @@ class PositionTracker:
                     "created_at": pos.created_at,
                     "source_wallet": pos.source_wallet,
                     "highest_pnl_pct": pos.highest_pnl_pct,
+                    "no_price_since": pos.no_price_since,
                 }
             Path(self.POSITIONS_FILE).write_text(
                 json.dumps(data, indent=2), encoding="utf-8"
@@ -263,6 +279,7 @@ class PositionTracker:
                     created_at=info.get("created_at", 0.0),
                     source_wallet=info.get("source_wallet", ""),
                     highest_pnl_pct=info.get("highest_pnl_pct", 0.0),
+                    no_price_since=info.get("no_price_since", 0.0),
                 )
             if self.positions:
                 logger.info(
@@ -376,6 +393,37 @@ class PositionTracker:
         copy_hold = float(getattr(copy_cfg, "MAX_COPY_TRADE_HOLD_SECONDS", 0.0) or 0.0)
         return max(0.0, copy_hold)
 
+    async def _reap_if_dead(self, pos: Any, now: float) -> bool:
+        """Cierra una posición que lleva demasiado tiempo sin ninguna cotización.
+
+        Es la red de seguridad del reaper: funciona aunque el hold por tiempo
+        esté desactivado (MAX_COPY_TRADE_HOLD_SECONDS=0), que es la configuración
+        habitual de este bot. Marca el instante en `pos.no_price_since` la
+        primera vez que se queda sin precio y, pasado
+        DEAD_POSITION_MAX_AGE_SEC, intenta la salida. Devuelve True si la
+        posición quedó cerrada.
+        """
+        from core.websocket import process_sell_and_notify
+
+        if not pos.no_price_since:
+            pos.no_price_since = now
+            return False
+
+        dead_for = now - pos.no_price_since
+        if dead_for < DEAD_POSITION_MAX_AGE_SEC:
+            return False
+
+        logger.warning(
+            "💀 MUERTA (sin cotización) {} ({}) tras {:.1f}h: closes por DEAD_NO_PRICE",
+            pos.symbol, pos.mint, dead_for / 3600,
+        )
+        ok = await process_sell_and_notify(
+            pos.mint, pos.symbol, reason="DEAD_NO_PRICE", pnl=0.0,
+        )
+        if ok:
+            self.remove_position(pos.mint, reason="DEAD_NO_PRICE")
+        return ok
+
     # ------------------------------------------------------- Evaluación
     async def _evaluate(self, mint: str) -> None:
         """Consulta precio y dispara TP/SL / TIME_EXPIRED para una posición."""
@@ -403,6 +451,8 @@ class PositionTracker:
                 )
                 if ok:
                     self.remove_position(mint, reason="TIME_EXPIRED")
+            else:
+                await self._reap_if_dead(pos, now)
             return
 
         try:
@@ -428,7 +478,12 @@ class PositionTracker:
                 )
                 if ok:
                     self.remove_position(mint, reason="TIME_EXPIRED")
+            else:
+                await self._reap_if_dead(pos, now)
             return
+
+        # Volvió a cotizar: la posición deja de contar como muerta.
+        pos.no_price_since = 0.0
 
         # --- Asignación dinámica del precio de entrada (BASE) ---
         # Si el entry sigue PENDIENTE (None, 0.0 o el sentinel 1.0 del default

@@ -29,6 +29,21 @@ from core.stats import MAX_TRUSTED_PNL_PCT
 # Token SOL nativo
 SOL_MINT = "So11111111111111111111111111111111111111112"
 
+# Fichero con la ultima firma vista por cada wallet (cursor del polling RPC).
+# Sin persistencia, cada reinicio reprocesa el historico reciente.
+POLL_CURSORS_FILE = "poll_cursors.json"
+
+# Ventana de firmas por pagina de getSignaturesForAddress. Antes 100: con la
+# rotacion de 1 wallet cada POLL_INTERVAL (~6 min por vuelta) las wallets de alta
+# actividad (cooker, cupsey, CENTED) superaban 100 firmas entre dos visitas, el
+# cursor caia fuera de la ventana y el bot perdia el bloque central PARA SIEMPRE
+# (31 huecos en una hora, 6 de ellos de CENTED). 1000 es el maximo de Helius.
+POLL_PAGE_LIMIT = 1000
+
+# Paginas hacia atras (con `until`) para recuperar el rango cuando el cursor no
+# aparece en la primera pagina. 4 paginas = hasta 4000 firmas de retroceso.
+MAX_GAP_PAGES = 4
+
 # Monto minimo en SOL que debe gastar el trader para considerar una compra real
 # (evita clasificar fees o tiny transfers como compras)
 MIN_BUY_SOL = 0.005
@@ -548,6 +563,35 @@ class CopyTradingStrategy(Strategy):
         asyncio.create_task(self._rpc_poll_loop())
         asyncio.create_task(self._flush_pending_loop())
 
+    def _load_poll_cursors(self) -> dict[str, str]:
+        """Lee de disco la ultima firma vista por cada wallet.
+
+        Sin esto, cada reinicio parte de un cursor vacio y vuelve a procesar
+        las 100 firmas mas recientes de cada wallet: se reprocesan trades ya
+        vistos (spam de logs, senales SELL duplicadas) y, con DRY_RUN=False,
+        se pueden duplicar compras sobre tokens que el trader ya vendio.
+        """
+        path = Path(POLL_CURSORS_FILE)
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CopyTrading: cursores de polling ilegibles: {}", exc)
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if v}
+
+    def _save_poll_cursors(self, cursors: dict[str, str]) -> None:
+        """Guarda el cursor de polling tras avanzar cada wallet."""
+        try:
+            Path(POLL_CURSORS_FILE).write_text(
+                json.dumps(cursors, indent=2), encoding="utf-8"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("CopyTrading: no se pudieron guardar los cursores: {}", exc)
+
     async def _rpc_poll_loop(self) -> None:
         """Poll wallets via getSignaturesForAddress to detect trades.
 
@@ -570,7 +614,13 @@ class CopyTradingStrategy(Strategy):
             logger.error("CopyTrading: RPC URL invalida. Polling deshabilitado.")
             return
 
-        last_sig = {}
+        last_sig = self._load_poll_cursors()
+        if last_sig:
+            logger.info(
+                "CopyTrading: cursor de polling restaurado para {} wallets "
+                "(no se reprocesa el historico)",
+                len(last_sig),
+            )
         POLL_INTERVAL = 30.0
         MAX_429_BEFORE_DISABLE = 3
         consecutive_429 = 0
@@ -607,64 +657,91 @@ class CopyTradingStrategy(Strategy):
                 addr = wallet_addrs[wallet_index % len(wallet_addrs)]
                 wallet_index += 1
 
+                abort = False
                 try:
-                    payload = {
-                        "jsonrpc": "2.0", "id": 1,
-                        "method": "getSignaturesForAddress",
-                        # limit=100 (no 5): si el trader hace una RAFAGA de txs
-                        # rapidas (compra+venta en segundos, shards, bundlers),
-                        # con limit 5 el cursor `prev` saltaba las primeras de la
-                        # rafaga -> el poll veia SOLO la venta sin su compra y la
-                        # ignoraba ("no detecta / no vende"). Con 100 cubrimos
-                        # cualquier rafaga real de un trader en un ciclo de 30s.
-                        "params": [addr, {"limit": 100}],
-                    }
-                    async with session.post(rpc_url, json=payload) as resp:
-                        if resp.status == 429:
-                            consecutive_429 += 1
-                            if consecutive_429 >= MAX_429_BEFORE_DISABLE:
-                                logger.warning(
-                                    "CopyTrading: {} 429 seguidos. RPC polling DESHABILITADO. "
-                                    "Usando solo webhooks de Helius.",
-                                    consecutive_429,
-                                )
-                                disabled = True
-                                continue
-                            logger.warning(
-                                "CopyTrading: 429 ({}/{}). Reintentando en {}s...",
-                                consecutive_429, MAX_429_BEFORE_DISABLE,
-                                POLL_INTERVAL * 2,
-                            )
-                            await asyncio.sleep(POLL_INTERVAL)
-                            continue
-                        data = await resp.json()
-
-                    consecutive_429 = 0
-
-                    # Helius devuelve http 200 con error JSON cuando la api-key
-                    # es invalida o el plan no cubre el endpoint. Detectarlo y
-                    # avisarlo en vez de quedarse en silencio.
-                    if isinstance(data, dict) and data.get("error"):
-                        logger.warning(
-                            "CopyTrading: RPC poll error para {}: {}",
-                            addr[:8] + "...", data.get("error"),
-                        )
-                        continue
-
-                    sigs = data.get("result", [])
-                    if not sigs:
-                        continue
-
                     prev = last_sig.get(addr, "")
-                    new_sigs = []
-                    for s in sigs:
-                        if s["signature"] == prev:
+                    new_sigs: list[str] = []
+                    gap = False
+                    until = None
+
+                    for _page in range(MAX_GAP_PAGES + 1):
+                        params: dict[str, Any] = {"limit": POLL_PAGE_LIMIT}
+                        if until:
+                            params["until"] = until
+                        payload = {
+                            "jsonrpc": "2.0", "id": 1,
+                            "method": "getSignaturesForAddress",
+                            "params": [addr, params],
+                        }
+                        async with session.post(rpc_url, json=payload) as resp:
+                            if resp.status == 429:
+                                consecutive_429 += 1
+                                if consecutive_429 >= MAX_429_BEFORE_DISABLE:
+                                    logger.warning(
+                                        "CopyTrading: {} 429 seguidos. RPC polling DESHABILITADO. "
+                                        "Usando solo webhooks de Helius.",
+                                        consecutive_429,
+                                    )
+                                    disabled = True
+                                    abort = True
+                                    break
+                                logger.warning(
+                                    "CopyTrading: 429 ({}/{}). Reintentando en {}s...",
+                                    consecutive_429, MAX_429_BEFORE_DISABLE,
+                                    POLL_INTERVAL * 2,
+                                )
+                                await asyncio.sleep(POLL_INTERVAL)
+                                abort = True
+                                break
+                            data = await resp.json()
+
+                        consecutive_429 = 0
+
+                        # Helius devuelve http 200 con error JSON cuando la api-key
+                        # es invalida o el plan no cubre el endpoint.
+                        if isinstance(data, dict) and data.get("error"):
+                            logger.warning(
+                                "CopyTrading: RPC poll error para {}: {}",
+                                addr[:8] + "...", data.get("error"),
+                            )
+                            abort = True
                             break
-                        new_sigs.append(s["signature"])
+
+                        page = data.get("result", [])
+                        if not page:
+                            break
+
+                        hit = False
+                        for s in page:
+                            if s["signature"] == prev:
+                                hit = True
+                                break
+                            new_sigs.append(s["signature"])
+                        if hit or not prev:
+                            break
+                        # El cursor sigue sin aparecer en la pagina: hay firmas
+                        # intermedias que NO se pueden ver en la ventana fija.
+                        # Se sigue hacia atras con `until` en vez de darlas por
+                        # perdidas.
+                        gap = True
+                        if len(page) < POLL_PAGE_LIMIT:
+                            break
+                        until = page[-1]["signature"]
+
+                    if abort:
+                        # Cursor intacto a proposito: la siguiente vuelta reintenta
+                        # el mismo rango en lugar de marcarlo como visto y perderlo.
+                        continue
+
                     if not new_sigs:
                         continue
-
-                    last_sig[addr] = sigs[0]["signature"]
+                    if gap:
+                        logger.warning(
+                            "CopyTrading: hueco real en {} (cursor {} no se ha "
+                            "recuperado en {} paginas; se procesan {} firmas)",
+                            addr[:8] + "...", prev[:12] + "...",
+                            MAX_GAP_PAGES, len(new_sigs),
+                        )
 
                     if not helius_api_key:
                         continue
@@ -683,6 +760,13 @@ class CopyTradingStrategy(Strategy):
                         key=lambda t: (t.get("blockTime") or 0, t.get("timestamp") or 0),
                     ):
                         await self._feed_transaction(tx)
+
+                    # El cursor avanza SOLO aqui, con las transacciones ya en
+                    # mano. Guardarlo antes (al empezar el lote) hacia que un
+                    # 429/500/timeout de Helius marcara esas firmas como vistas
+                    # sin haberlas procesado nunca: se perdian para siempre.
+                    last_sig[addr] = new_sigs[0]
+                    self._save_poll_cursors(last_sig)
 
                 except Exception as exc:
                     logger.warning(
@@ -889,14 +973,19 @@ class CopyTradingStrategy(Strategy):
         if signature and signature in self._executed_signatures:
             return
 
-        logger.info(
+        # Traza por transaccion: va a DEBUG para no inundar la consola (el log
+        # de archivo esta a nivel DEBUG y conserva la linea completa).
+        logger.debug(
             "CopyTrading: tx type={} fee_payer={} sig={}",
             tx_type, fee_payer[:12] + "..." if fee_payer else "?",
             signature[:16] + "..." if signature else "?",
         )
 
         if tx_type not in COPY_TRADE_TYPES:
-            logger.warning(
+            # CREATE / CLOSE_ACCOUNT / UNKNOWN son monedas de la vida diaria del
+            # trader (abrir/cerrar cuentas, ATA,rent, deploys). No son un fallo:
+            # se descartan en silencio y solo se deja rastro en el log de DEBUG.
+            logger.debug(
                 "CopyTrading: tx filtrada por tipo '{}' (esperado {}): sig={}",
                 tx_type, COPY_TRADE_TYPES, signature[:16] + "...",
             )
@@ -1443,7 +1532,14 @@ class CopyTradingStrategy(Strategy):
             amount_sol = sol_received if sol_received > 0 else 0.0
 
         if not action or not token_mint:
-            logger.warning(
+            # Distinguir "no fue un trade" de "fue un trade que no supe
+            # clasificar". Un movimiento de SOL entre cuentas del propio trader
+            # (tokenTransfers vacio) NO es una compra ni una venta: registrarlo
+            # como WARNING llenaba el log de falsos positivos y tapaba los
+            # avisos reales. Si hubo tokens de por medio, sigue siendo WARNING.
+            solo_sol = not tokens_received and not tokens_sent and not token_transfers
+            log = logger.debug if solo_sol else logger.warning
+            log(
                 "CopyTrading: no se pudo determinar mint para {} | "
                 "trader={} | accounts={} | tokenTransfers={} | "
                 "sol_spent={:.6f} | sol_received={:.6f} | "
@@ -1738,20 +1834,47 @@ class CopyTradingStrategy(Strategy):
                     )
                     if trade_cap_pct > 0 and not getattr(self.config.trading, "DRY_RUN", True):
                         capital = await self.executor.get_sol_balance()
-                        cap_sol = capital * (trade_cap_pct / 100.0)
-                        if amount_to_use > cap_sol:
-                            logger.info(
-                                "CopyTrading: BUY cap {} SOL -> {:.6f} ({:.1f}% de {:.4f} SOL capital) {} | {}",
-                                signal.source, cap_sol, trade_cap_pct, capital,
-                                signal.token_mint[:8] + "...", signal.wallet[:8] + "...",
+                        # capital < 0 = el RPC fallo al leer el balance; capital == 0 =
+                            # wallet vacia. En ambos casos NO se aplica el tope: aplicarlo
+                            # daba cap_sol = 0 y se mandaba amount 0.0 a PumpPortal
+                            # (HTTP 400 -> "Copy trade fallido" en Telegram). Sin tope
+                            # aplica el clamp MIN/MAX_COPY_TRADE_SOL de mas arriba.
+
+                        if capital <= 0:
+                            logger.warning(
+                                "CopyTrading: BUY {} sin tope de capital - balance SOL "
+                                "desconocido/vacio ({}) | capital%={}",
+                                signal.source,
+                                "error de RPC" if capital < 0 else "0 SOL",
+                                trade_cap_pct,
                             )
-                            amount_to_use = cap_sol
                         else:
-                            logger.debug(
-                                "CopyTrading: BUY {:.6f} SOL dentro del cap {:.6f} ({:.1f}% de {:.4f} SOL) {}",
-                                amount_to_use, cap_sol, trade_cap_pct, capital,
-                                signal.token_mint[:8] + "...",
-                            )
+                            cap_sol = capital * (trade_cap_pct / 100.0)
+                            if amount_to_use > cap_sol:
+                                logger.info(
+                                    "CopyTrading: BUY cap {} SOL -> {:.6f} ({:.1f}% de {:.4f} SOL capital) {} | {}",
+                                    signal.source, cap_sol, trade_cap_pct, capital,
+                                    signal.token_mint[:8] + "...", signal.wallet[:8] + "...",
+                                )
+                                amount_to_use = cap_sol
+                            else:
+                                logger.debug(
+                                    "CopyTrading: BUY {:.6f} SOL dentro del cap {:.6f} ({:.1f}% de {:.4f} SOL) {}",
+                                    amount_to_use, cap_sol, trade_cap_pct, capital,
+                                    signal.token_mint[:8] + "...",
+                                )
+                    # Red de seguridad: el monto final tiene que ser operable.
+                    # Un 0 o negativo aqui es siempre un bug de calculo, nunca una
+                    # intention de trading, y solo produce 400 de PumpPortal.
+                    if amount_to_use <= 0:
+                        logger.error(
+                            "CopyTrading: BUY {} cancelado - monto calculado invalido ({}) | {}",
+                            signal.source, amount_to_use, signal.token_mint[:8] + "...",
+                        )
+                        if signal.tx_signature:
+                            self._recent_signals.pop(signal.tx_signature, None)
+                            self._executed_signatures.pop(signal.tx_signature, None)
+                        return
                     self.executor.buy_amount_sol = amount_to_use
                     try:
                         sig = await self.executor.buy_token(signal.token_mint)
@@ -2518,6 +2641,11 @@ class CopyTradingStrategy(Strategy):
         if not self.wallets:
             return None
 
+        webhook_url = webhook_url.rstrip("/")
+        if not webhook_url:
+            logger.warning("CopyTrading: sin URL publica, no se configura webhook.")
+            return None
+
         payload = {
             "webhookURL": webhook_url + self.webhook_path,
             "transactionTypes": ["SWAP", "TRANSFER"],
@@ -2536,7 +2664,9 @@ class CopyTradingStrategy(Strategy):
                         for wh in existing:
                             wh_url = wh.get("webhookURL", "")
                             wh_id = wh.get("webhookID")
-                            if wh_url.endswith(self.webhook_path):
+                            if wh_url.startswith(base_origin) and wh_url.endswith(
+                                self.webhook_path
+                            ):
                                 # Update our own webhook
                                 update_url = f"https://api.helius.xyz/v0/webhooks/{wh_id}?api-key={helius_api_key}"
                                 async with session.put(update_url, json=payload) as update_resp:
