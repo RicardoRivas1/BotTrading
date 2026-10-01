@@ -40,7 +40,12 @@ def _config() -> SimpleNamespace:
             COPY_TRADE_ALLOW_ACCUMULATE=False,
             COPY_TRADE_ORDER_BUFFER_SECONDS=0.0,
             COPY_TRADE_CAPITAL_PERCENT=0.0,
+            MIN_COPY_TRADE_HOLD_SECONDS=0,
+            COPY_ESTIMATED_BUY_FEE_SOL=0.001,
+            COPY_ESTIMATED_SELL_FEE_SOL=0.00005,
+            COPY_ESTIMATED_ATA_RENT_SOL=0.00203928,
         ),
+        SLIPPAGE_BPS=500,
         trading=SimpleNamespace(DRY_RUN=False),
     )
 
@@ -681,10 +686,12 @@ class TestPnlHonesto:
     async def test_dry_run_estima_el_pnl_de_la_copia_con_el_del_trader(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """En DRY_RUN no hay venta real que medir: se estima y se marca como tal.
+        """En DRY_RUN se estima, se marca como tal y se descuenta el coste.
 
         Sin esto cada venta simulada acababa como 'n/d' y el trade quedaba
-        fuera de las métricas, dejando /stats vacío en simulación.
+        fuera de las métricas, dejando /stats vacío en simulación. Pero el %
+        del trader NO es nuestro: con 0.01 SOL y ~0.0031 de coste, un +20%
+        suyo se convierte en una perdida para nosotros.
         """
         strategy, _executor, _tracker = _strategy(tmp_path)
         strategy.executor.dry_run = True
@@ -710,12 +717,16 @@ class TestPnlHonesto:
 
         stats_mock.record_sell.assert_called_once()
         kwargs = stats_mock.record_sell.call_args.kwargs
-        # +20% del trader, usado como estimación de nuestra copia.
-        assert kwargs["pnl_pct"] == pytest.approx(20.0)
+        # El trader hizo +20%, pero el ciclo cuesta ~31% de 0.01 SOL mas el
+        # 5% de slippage por lado: nuestra copia sale en perdida.
+        esperado = strategy._estimate_after_costs(20.0, 0.01)
+        assert kwargs["pnl_pct"] == pytest.approx(esperado)
+        assert esperado < 0, "con este capital el coste debe dominar al +20%"
         assert kwargs["estimated"] is True
         assert kwargs["pnl_unreliable"] is False
-        # Sin SOL observado hay que derivarlo del PnL, pero declarado estimado.
-        assert kwargs["sol_received"] == pytest.approx(0.012)
+        # Sin SOL observado hay que derivarlo del PnL (ya neto de costes),
+        # pero declarado estimado.
+        assert kwargs["sol_received"] == pytest.approx(0.01 * (1 + esperado / 100.0))
 
     async def test_pnl_por_precio_se_marca_como_estimado(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -923,3 +934,49 @@ class TestTopeDeCapitalNuncaProduceCero:
 
         executor.buy_token.assert_awaited_once()
         assert executor.buy_token.await_args.kwargs["via_pumpfun"] is None
+
+
+class TestDRYRunHonesto:
+    """El PnL simulado debe descontar los costes reales del ciclo.
+
+    Antes DRY_run reutilizaba el PnL BRUTO del trader: sin fees, sin rent de
+    ATA, sin slippage. Con posiciones de 0.0018 SOL y ~0.002 SOL de coste por
+    ciclo eso daba una simulacion verde que en real era pérdida segura.
+    """
+
+    def test_el_trader_gana_pero_la_copia_pierde(self, tmp_path: Path) -> None:
+        strategy, _ex, _tr = _strategy(tmp_path)
+        # Trader +200%. Nuestra posicion es 0.001829 SOL (la mediana real).
+        net = strategy._estimate_after_costs(200.0, 0.001829)
+        assert net < 0, f"un +200% con 109% de coste debe quedar en perdida, dio {net}"
+
+    def test_cuanto_cuesta_un_ciclo(self, tmp_path: Path) -> None:
+        strategy, _ex, _tr = _strategy(tmp_path)
+        assert strategy._estimated_costs_sol() == pytest.approx(0.00308928)
+
+    def test_una_posicion_grande_sigue_siendo_viable(self, tmp_path: Path) -> None:
+        # Con 1 SOL el mismo +200% sobrevive: el filtro no debe aniquilar
+        # las operaciones cuando el coste es pequeno respecto al capital.
+        strategy, _ex, _tr = _strategy(tmp_path)
+        assert strategy._estimate_after_costs(200.0, 1.0) > 0
+
+    def test_el_slippage_se_cobra_en_ambos_lados(self, tmp_path: Path) -> None:
+        strategy, _ex, _tr = _strategy(tmp_path)
+        # Con 1 SOL el coste es casi despreciable, asi que lo que queda es el
+        # slippage: 5% al entrar y 5% al salir sobre un +100%. El 2x del trader
+        # se convierte en 2 x 0.95 x 0.95 = 1.805, o sea +80.5%, no +100%.
+        fees = strategy._estimated_costs_sol() / 1.0
+        esperado = ((1.0 + 1.0) * (1.0 - fees) * (0.95**2) - 1.0) * 100.0
+        assert strategy._estimate_after_costs(100.0, 1.0) == pytest.approx(esperado)
+        assert esperado < 100.0, "el slippage por los dos lados siempre resta"
+
+    def test_sin_capital_no_se_inventa_nada(self, tmp_path: Path) -> None:
+        strategy, _ex, _tr = _strategy(tmp_path)
+        assert strategy._estimate_after_costs(100.0, 0.0) == 100.0
+
+    def test_ganar_todo_no_basta_si_el_capital_es_dust(self, tmp_path: Path) -> None:
+        # +8232% fue el "mejor trade" historico. Aun asi, con una posicion de
+        # polvo, el coste se lo come. Por eso el filtro de scalpes importa mas
+        # que el porcentaje bruto.
+        strategy, _ex, _tr = _strategy(tmp_path)
+        assert strategy._estimate_after_costs(8232.0, 0.001829) < 0

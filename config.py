@@ -270,6 +270,40 @@ class CopyTradingSettings(BaseSettings):
             "0 = sin limite (comportamiento antiguo)."
         ),
     )
+    MIN_COPY_TRADE_HOLD_SECONDS: int = Field(
+        default=300,
+        ge=0,
+        description=(
+            "Duracion minima (s) que un trader debe mantener una posicion para "
+            "que el bot la copie. Filtra a los snipers/scalpers, que hacen "
+            "scalpes de 1-2s: con ~1-2s de latencia el bot siempre entra a un "
+            "peor precio que el trader y pierde siempre. Recomendado 300 (5min). "
+            "0 = sin filtro."
+        ),
+    )
+    COPY_ESTIMATED_BUY_FEE_SOL: float = Field(
+        default=0.001,
+        ge=0,
+        description=(
+            "Fee de compra (SOL) descontada del PnL ESTIMADO en DRY_RUN. "
+            "Incluye prioridad +rent de la ATA. Si no se descuenta, la "
+            "simulacion muestra ganancias inexistentes."
+        ),
+    )
+    COPY_ESTIMATED_SELL_FEE_SOL: float = Field(
+        default=0.00005,
+        ge=0,
+        description="Fee de venta (SOL) descontada del PnL ESTIMADO en DRY_RUN.",
+    )
+    COPY_ESTIMATED_ATA_RENT_SOL: float = Field(
+        default=0.00203928,
+        ge=0,
+        description=(
+            "Rent de la ATA (SOL) cobrada al crear la cuenta de tokens. Se "
+            "cobra en cada compra y por eso domina el coste en posiciones "
+            "pequenas. Rent cobrada al cerrar la ATA = 0."
+        ),
+    )
     MIN_COPY_TRADE_SOL: float = Field(
         default=0.005,
         ge=0.00001,

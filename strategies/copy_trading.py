@@ -496,6 +496,35 @@ class CopyTradingStrategy(Strategy):
                 return tracked
         return None
 
+    def _estimated_costs_sol(self) -> float:
+        """Coste total en SOL de un ciclo compra->venta (fees + rent ATA)."""
+        cfg = self.config.copy_trading
+        return float(
+            getattr(cfg, "COPY_ESTIMATED_BUY_FEE_SOL", 0.001)
+            + getattr(cfg, "COPY_ESTIMATED_SELL_FEE_SOL", 0.00005)
+            + getattr(cfg, "COPY_ESTIMATED_ATA_RENT_SOL", 0.00203928)
+        )
+
+    def _estimate_after_costs(self, pnl_pct: float, invested_sol: float) -> float:
+        """Aplica fees y slippage a un PnL ESTIMADO de DRY_RUN.
+
+        Sin esto la simulacion es enganosa: reutiliza el PnL BRUTO del trader
+        (que ya incluye su fill, sin nuestro spread) y no cobra ni un lamport.
+        En DRY_RUN no se ejecuta nada, asi que el unico sitio donde se puede
+        descontar el coste es aqui, en el numero que se reporta.
+        """
+        if invested_sol <= 0:
+            return pnl_pct
+        costs = self._estimated_costs_sol()
+        # El coste se expresa como % del capital: se paga con el mismo dinero
+        # que genera el retorno, asi que resta proporcionalmente al multiplicador.
+        fee_drag = min(costs / invested_sol, 0.99)
+        net = (1.0 + pnl_pct / 100.0) * (1.0 - fee_drag)
+        # Slippage: entramos y salimos peor que el trader (SLIPPAGE_BPS por lado).
+        slip = float(getattr(self.config, "SLIPPAGE_BPS", 500)) / 10_000.0
+        net *= (1.0 - slip) ** 2
+        return (net - 1.0) * 100.0
+
     def _calc_sell_pct(self, mint: str, tokens_sent_amount: float, wallet: str) -> float:
         """Calculate what percentage of the trader's position is being sold.
 
@@ -2422,7 +2451,9 @@ class CopyTradingStrategy(Strategy):
                     # cotiza a polvo y daba -99.99% con el trader en +21%.
                     _copy_estimate = copy_pnl
                     if _copy_estimate is None and self.executor.dry_run and trader_pnl_known:
-                        _copy_estimate = pnl_pct
+                        _copy_estimate = self._estimate_after_costs(
+                            pnl_pct, _sol_portion_invested
+                        )
 
                     # Ejecuta la venta. `process_sell_and_notify` devuelve False
                     # si NO se vendio de verdad (sin saldo, orden sin confirmar,
@@ -2496,16 +2527,20 @@ class CopyTradingStrategy(Strategy):
                         # incALCULABLE por la via honesta. La unica referencia
                         # disponible es el resultado del propio trader sobre el
                         # mismo token, asi que se usa como estimacion DE NUESTRA
-                        # copia (no como medida). Sirve para validar el pipeline
-                        # en simulacion sin inventar un resultado; en modo real
-                        # esto nunca se usa.
+                        # copia (no como medida). Pero ese % es BRUTO: es el fill
+                        # del trader, sin nuestro spread, sin fees ni slippage.
+                        # Copiarlo tal cual hace que la simulacion muestre
+                        # ganancias que en real nunca existieron, asi que se le
+                        # descuentan los costes reales del ciclo.
                         if trader_pnl_known:
-                            _our_pnl_pct = pnl_pct
+                            _our_pnl_pct = self._estimate_after_costs(
+                                pnl_pct, _sol_portion_invested
+                            )
                             logger.info(
-                                "CopyTrading: DRY_RUN sin venta real; se estima el PnL de la "
-                                "copia con el del trader ({:+.2f}%) para poder validar el "
-                                "ciclo completo (no es una medida)",
-                                pnl_pct,
+                                "CopyTrading: DRY_RUN sin venta real; PnL del trader "
+                                "({:+.2f}%) ajustado a OURCOST ({:+.2f}%) sobre "
+                                "{:.6g} SOL para validar el ciclo (no es una medida)",
+                                pnl_pct, _our_pnl_pct, _sol_portion_invested,
                             )
                     if _our_pnl_pct is None:
                         logger.warning(
@@ -2552,7 +2587,34 @@ class CopyTradingStrategy(Strategy):
                     _stats_pnl = _our_pnl_pct if _our_pnl_pct is not None else copy_pnl
                     _pnl_estimated = not _pnl_from_measurement
                     _pnl_unreliable = _stats_pnl is None
-                    if _pnl_unreliable:
+                    _is_sniper = False
+                    # Scalper: el trader cerro en menos de MIN_COPY_TRADE_HOLD_SECONDS.
+                    # Con ~1-2s de latencia el bot no puede entrar al mismo precio que
+                    # el, asi que este tipo de trade NO es ganable por construccion y
+                    # contarlo como victoria infla el win rate. Se excluye de las
+                    # metricas (igual que un PnL no fiable) pero se deja el rastro
+                    # en el log, para no fingir que no existe.
+                    _min_hold = int(getattr(
+                        self.config.copy_trading, "MIN_COPY_TRADE_HOLD_SECONDS", 0
+                    ) or 0)
+                    _hold_seconds = (
+                        max(0.0, time.time() - _buy_time) if _buy_time > 0 else 0.0
+                    )
+                    if (
+                        _min_hold > 0
+                        and _buy_time > 0
+                        and _hold_seconds < _min_hold
+                        and self.executor.dry_run
+                    ):
+                        logger.warning(
+                            "CopyTrading: {} fue un SCALPE de {:.1f}s (< {}s). No es "
+                            "ganable copiandolo (el trader ya tiene el fill), asi que "
+                            "quueda EXCLUIDO de las metricas.",
+                            signal.token_mint[:8] + "...", _hold_seconds, _min_hold,
+                        )
+                        _is_sniper = True
+                        _pnl_unreliable = True
+                    if _pnl_unreliable and not _is_sniper:
                         logger.warning(
                             "CopyTrading: sin PnL medible para {} (ni saldo ni precio); "
                             "el trade queda fuera de las métricas",
@@ -2600,12 +2662,13 @@ class CopyTradingStrategy(Strategy):
                     )
 
                     logger.success(
-                        "CopyTrading: SELL {} ({}) | {} | trader {} | mi copia {} | sell_pct: {:.0f}%",
+                        "CopyTrading: SELL {} ({}) | {} | trader {} | mi copia {} | sell_pct: {:.0f}%{}",
                         signal.trader_label or signal.source, signal.wallet[:8] + "...",
                         signal.token_mint[:8] + "...",
                         f"{pnl_pct:+.2f}%" if trader_pnl_known else "n/d",
                         f"{_our_pnl_pct:+.2f}%" if _our_pnl_pct is not None else "n/d",
                         pct,
+                        " | SCALPE excluido" if _is_sniper else "",
                     )
                     # Venta EXITOSA: recien ahora marcar como ejecutada (persistente)
                     # para que los redeliveries/poll tras un restart no la repitan.

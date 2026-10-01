@@ -420,10 +420,13 @@ class TradeStats:
             s["open_positions"] = max(0, int(open_positions))
         # En DRY_RUN no hay venta real que medir, asi que los trades se estiman
         # con el resultado del trader. Sin este aviso, /stats presentaria
-        # simulaciones como si fueran operaciones reales.
+        # simulaciones como si fueran operaciones reales. Ademas se aclara que
+        # el % ya viene DESCONTANDO fees, rent de ATA y slippage: sin ese
+        # descuento la simulacion mostraria ganancias que en real no existen.
         sim_note = (
             [f"⚠️ <i>{s['simulated']} de {s['total_sells']} ventas son ESTIMACIONES "
-             "(sin delta de saldo medido, p.ej. DRY_RUN), no resultados reales</i>"]
+             f"(sin delta de saldo medido, p.ej. DRY_RUN), no resultados reales. "
+             f"El % ya descuenta fees, rent de ATA y slippage.</i>"]
             if s["simulated"] else []
         )
         lines = [
