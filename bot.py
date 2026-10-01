@@ -166,7 +166,7 @@ class TradingBot:
                 config=self.config,
             ))
 
-        # 4. DCA (si hay tokens configurados)
+# 4. DCA (si hay tokens configurados)
         dca_tokens = os.getenv("DCA_TOKENS", "")
         if dca_tokens:
             self.engine.register(DCAStrategy(
@@ -176,7 +176,7 @@ class TradingBot:
                 config=self.config,
             ))
 
-    # Último informe del escaner de arbitraje (/arb), para poder consultarlo
+        # Último informe del escaner de arbitraje (/arb), para poder consultarlo
         # sin volver a pagar las cotizaciones.
         self._last_arb_report: dict | None = None
 
