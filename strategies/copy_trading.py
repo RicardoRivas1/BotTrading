@@ -91,6 +91,10 @@ class CopyTradeSignal:
     sell_sol_raw: float = 0.0  # SOL real recibido en la venta (sin cap MAX_COPY_TRADE_SOL)
     trade_token_amount: float = 0.0  # cantidad real de tokens del mint involucrados
     buy_sol_raw: float = 0.0  # SOL real gastado por el trader en el BUY (sin cap)
+    # El parser lo deduce de los PROGRAMAS on-chain de la tx (PUMP_FUN/PUMP_AMM),
+    # que es la fuente fiable. No usar el sufijo del mint para esto: los mints
+    # nuevos de Pump.fun no terminan en "pump".
+    is_pump_fun: bool = False
 
 
 @dataclass
@@ -1670,9 +1674,11 @@ class CopyTradingStrategy(Strategy):
             sell_pct=sell_pct,
             trader_label=tracked.label,
             sell_sol_raw=sell_sol_raw,
-            trade_token_amount=trade_token_amount,
-            buy_sol_raw=buy_sol_raw,
-        )
+        trade_token_amount=trade_token_amount,
+        buy_sol_raw=buy_sol_raw,
+        is_pump_fun=is_pump_fun,
+    )
+
 
     async def _execute_copy_trade(self, signal: CopyTradeSignal) -> None:
         """Ejecuta un copy trade."""
@@ -1877,7 +1883,15 @@ class CopyTradingStrategy(Strategy):
                         return
                     self.executor.buy_amount_sol = amount_to_use
                     try:
-                        sig = await self.executor.buy_token(signal.token_mint)
+                        sig = await self.executor.buy_token(
+                            signal.token_mint,
+                            # El parser ya vio los programas on-chain de la tx: si
+                            # dice Pump.fun, se compra por PumpPortal aunque el mint
+                            # no termine en "pump". Si no lo dice (False), se deja
+                            # la heuristica del sufijo al executor.
+                            via_pumpfun=True if signal.is_pump_fun else None,
+                        )
+
                     finally:
                         self.executor.buy_amount_sol = original_amount
 

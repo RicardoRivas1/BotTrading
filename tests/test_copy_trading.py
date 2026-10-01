@@ -828,9 +828,10 @@ class TestTopeDeCapitalNuncaProduceCero:
         executor.get_sol_balance = AsyncMock(return_value=balance)
         used: dict = {}
 
-        async def _buy(mint: str):
+        async def _buy(mint: str, **kwargs):
             used["amount"] = executor.buy_amount_sol
             used["mint"] = mint
+            used["kwargs"] = kwargs
             return "sig"
 
         executor.buy_token = AsyncMock(side_effect=_buy)
@@ -888,3 +889,37 @@ class TestTopeDeCapitalNuncaProduceCero:
 
         executor.buy_token.assert_awaited_once()
         assert used["amount"] == pytest.approx(0.025)
+
+    async def test_la_busqueda_de_liquidez_no_mata_las_compras_de_pumpfun(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Un mint de Pump.fun nuevo no termina en "pump" y Jupiter da 404.
+
+        Antes el executor ruteaba solo por sufijo, asi que la compra se
+        descartaba como "sin liquidez" en cada redelivery y el bot nunca
+        entraba, aunque el parser hubiera detectado Pump.fun en la tx.
+        """
+        strategy, executor, _tracker = _strategy(tmp_path)
+        self._prepare(strategy, executor, monkeypatch, balance=-1.0)
+        MINT_NUEVO = "7MDhfoxFtq5SphF6V8hhxV84mubzQwxb516HXxcddD6p"
+        assert not MINT_NUEVO.lower().endswith("pump")
+
+        signal = self._buy_signal()
+        signal.token_mint = MINT_NUEVO
+        signal.is_pump_fun = True
+        await strategy._execute_copy_trade(signal)
+
+        executor.buy_token.assert_awaited_once()
+        assert executor.buy_token.await_args.kwargs["via_pumpfun"] is True
+        assert executor.buy_token.await_args.args[0] == MINT_NUEVO
+
+    async def test_sin_dato_de_pumpfun_se_deja_la_heuristica_del_executor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        strategy, executor, _tracker = _strategy(tmp_path)
+        self._prepare(strategy, executor, monkeypatch, balance=-1.0)
+
+        await strategy._execute_copy_trade(self._buy_signal())
+
+        executor.buy_token.assert_awaited_once()
+        assert executor.buy_token.await_args.kwargs["via_pumpfun"] is None

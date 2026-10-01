@@ -126,34 +126,54 @@ def cargar_keypair_desde_env(rpc_url: str = "") -> Keypair:
 
     logger.info("Escaneando subcuentas de las 24 palabras en la red Solana...")
 
+    # Si el RPC principal no responde (Helius sin cuota -> 429), el escaneo entero
+    # fallaba ruta por ruta y `candidato_seleccionado` quedaba None: se caia al
+    # path por defecto "a ciegas", que puede no ser la subcuenta con fondos.
+    # Con la wallet equivocada el bot opera sobre una wallet vacia.
+    rpc_urls = [rpc_url] + ([FALLBACK_RPC_URL] if FALLBACK_RPC_URL and FALLBACK_RPC_URL != rpc_url else [])
+
     with httpx.Client(timeout=10) as client:
         for path in rutas_candidatas:
-            try:
-                kp = Keypair.from_seed_and_derivation_path(seed, path)
-                pubkey = kp.pubkey()
-                payload = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "getBalance",
-                    "params": [str(pubkey)],
-                }
-                resp = client.post(rpc_url, json=payload)
-                data = resp.json()
-                balance_lamports = data.get("result", {}).get("value", 0) or 0
-                balance_sol = balance_lamports / 1_000_000_000
-
-                logger.info("  Ruta `{}` -> Wallet: {} | Saldo: {} SOL", path, pubkey, balance_sol)
-
-                if balance_sol > max_balance:
-                    max_balance = balance_sol
-                    candidato_seleccionado = kp
-
-                if balance_sol > 0:
+            kp = Keypair.from_seed_and_derivation_path(seed, path)
+            pubkey = kp.pubkey()
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBalance",
+                "params": [str(pubkey)],
+            }
+            balance_sol = None
+            for url in rpc_urls:
+                try:
+                    resp = client.post(url, json=payload)
+                    data = resp.json()
+                    if resp.status_code != 200 or "result" not in data:
+                        raise SwapExecutionError(
+                            f"RPC {url} -> HTTP {resp.status_code}: {str(data)[:120]}"
+                        )
+                    lamports = (data.get("result") or {}).get("value") or 0
+                    balance_sol = lamports / 1_000_000_000
                     break
-            except Exception:
+                except Exception as exc:
+                    logger.debug("Escaneo de subcuentas: fallo en {} -> {}", url, exc)
+            if balance_sol is None:
+                logger.warning("  Ruta `{}` -> Wallet: {} | saldo DESCONOCIDO", path, pubkey)
                 continue
 
+            logger.info("  Ruta `{}` -> Wallet: {} | Saldo: {} SOL", path, pubkey, balance_sol)
+
+            if balance_sol > max_balance:
+                max_balance = balance_sol
+                candidato_seleccionado = kp
+
+            if balance_sol > 0:
+                break
+
     if not candidato_seleccionado:
+        logger.error(
+            "No se pudo leer el saldo de NINGUNA subcuenta (RPC caido). "
+            "Se usa m/44'/501'/0'/0' por defecto: verifica que tenga fondos."
+        )
         candidato_seleccionado = Keypair.from_seed_and_derivation_path(seed, "m/44'/501'/0'/0'")
 
     logger.info(
@@ -496,23 +516,40 @@ class JupiterExecutor:
         return str(mint).lower().endswith("pump")
 
 
-    async def buy_token(self, token_mint: str, dry_run: Optional[bool] = None) -> Signature | str | None:
-        """Compra un token. Ruteo estricto: Pump.fun → PumpPortal, resto → Jupiter.
+    async def buy_token(
+        self,
+        token_mint: str,
+        dry_run: Optional[bool] = None,
+        via_pumpfun: Optional[bool] = None,
+    ) -> Signature | str | None:
+        """Compra un token. Ruteo: Pump.fun → PumpPortal, resto → Jupiter.
 
-        - Si `mint_address` termina en "pump" → compra directa por PumpPortal.
-        - Si NO termina en "pump" → intenta Jupiter. Si Jupiter devuelve 404
-          (sin liquidez), **omite en silencio** (sin error a Telegram).
+        - `via_pumpfun=True` → compra directa por PumpPortal (sin pasar por Jupiter).
+        - `via_pumpfun=False` → Jupiter; si da 404 (sin liquidez), omite en silencio.
+        - `via_pumpfun=None` (por defecto) → se deduce del mint.
+
+        `via_pumpfun` debe preferable venir del parser, que deduce el programa
+        on-chain (PUMP_FUN/PUMP_AMM) de la transacción observada. La heurística
+        del sufijo "pump" es solo un fallback: los mints creados por las
+        versiones nuevas de Pump.fun ya NO terminan en "pump", y con ella sola
+        esas compras iban a Jupiter, daban 404 y se descartaban como "sin
+        liquidez" aunque el trader las hubiera cerrado con exito.
         """
         simulate = self.dry_run if dry_run is None else dry_run
         amount_lamports = int(self.buy_amount_sol * 1_000_000_000)
 
-        # --- Ruteo estricto por sufijo ---
-        if self._is_pump_fun_mint(token_mint):
+        is_pump = self._is_pump_fun_mint(token_mint) if via_pumpfun is None else via_pumpfun
+
+        # --- Ruteo a PumpPortal ---
+        if is_pump:
             if simulate:
                 logger.info("[DRY_RUN] Compra simulada (Pump.fun) de {} | Monto: {} SOL", token_mint, self.buy_amount_sol)
                 await self._register_position(token_mint, None, via_pumpfun=True, simulate=True)
                 return "DRY_RUN"
             logger.info("Token Pump.fun detectado: comprando directo por PumpPortal.", token_mint)
+            # Queda registrado para que la VENTA posterior tambien vaya directa,
+            # sin tener que descubrirlo con un 404 de Jupiter.
+            self.pump_bonding_tokens.add(token_mint)
             sig = await self._buy_via_pumpportal(token_mint)
             await self._register_position(token_mint, None, via_pumpfun=True)
             return sig

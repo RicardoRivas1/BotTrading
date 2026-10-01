@@ -737,6 +737,59 @@ class TestBuyPumpfun:
         assert pos.entry_price == pytest.approx(0.00005)
         assert pos.token_amount_ui == pytest.approx(1000.0)
 
+
+class TestRuteoPumpfunSegunElParser:
+    """El mint YA NO es la fuente de verdad para saber si algo es Pump.fun.
+
+    Los mints creados por las versiones nuevas de Pump.fun no terminan en
+    "pump". Con la heuristica del sufijo, esas compras iban a Jupiter, Jupiter
+    devolvia 404 y el bot las descartaba como "sin liquidez" para siempre,
+    aunque el trader las hubiera cerrado con exito.
+    """
+
+    # Mint real observado en produccion: el parser lo marco is_pump=True.
+    MINT_NUEVO = "7MDhfoxFtq5SphF6V8hhxV84mubzQwxb516HXxcddD6p"
+
+    async def test_el_sufjo_alone_no_sirve_para_detectar_pumpfun(
+        self, executor: JupiterExecutor
+    ) -> None:
+        assert not executor._is_pump_fun_mint(self.MINT_NUEVO)
+
+    async def test_el_parser_manda_a_pumpportal_aunque_no_termine_en_pump(
+        self, executor: JupiterExecutor
+    ) -> None:
+        executor.dry_run = False
+        executor._buy_via_pumpportal = AsyncMock(return_value=Signature.default())
+        executor._get_token_balance_ui = AsyncMock(return_value=1000.0)
+
+        sig = await executor.buy_token(self.MINT_NUEVO, dry_run=False, via_pumpfun=True)
+
+        assert sig == Signature.default()
+        executor._buy_via_pumpportal.assert_awaited_once_with(self.MINT_NUEVO)
+        # La compra queda marcada para que la venta posterior no dependa de un 404.
+        assert self.MINT_NUEVO in executor.pump_bonding_tokens
+
+    async def test_sin_dato_del_parser_se_usa_el_sufijo(
+        self, executor: JupiterExecutor
+    ) -> None:
+        executor.dry_run = False
+        executor._buy_via_pumpportal = AsyncMock(return_value=Signature.default())
+        executor._get_quote = AsyncMock(return_value=None)
+
+        # via_pumpfun=None -> compatibilidad con los llamadores que no lo pasan.
+        assert await executor.buy_token(MINT_PUMP, dry_run=False) is not None
+        executor._buy_via_pumpportal.assert_awaited_once_with(MINT_PUMP)
+
+    async def test_dex_sin_liquidez_se_sigue_omitiendo(
+        self, executor: JupiterExecutor
+    ) -> None:
+        executor.dry_run = False
+        executor._buy_via_pumpportal = AsyncMock()
+        executor._get_quote = AsyncMock(return_value=None)
+
+        assert await executor.buy_token(self.MINT_NUEVO, dry_run=False) is None
+        executor._buy_via_pumpportal.assert_not_called()
+
     async def test_buy_token_real_no_fallback_si_error_no_es_de_ruta(
         self, executor: JupiterExecutor
     ) -> None:
