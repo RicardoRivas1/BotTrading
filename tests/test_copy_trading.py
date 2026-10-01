@@ -936,6 +936,54 @@ class TestTopeDeCapitalNuncaProduceCero:
         assert executor.buy_token.await_args.kwargs["via_pumpfun"] is None
 
 
+class TestScalperSinPnlMedible:
+    """Un trade puede ser scalper Y no tener PnL medible a la vez.
+
+    Antes ese caso dejaba `_stats_pnl` en None y reventaba con
+    "float() argument must be a string or a real number, not 'NoneType'"
+    justo despues de ejecutar la venta: el trade se perdia entero.
+    """
+
+    async def test_scalper_sin_pnl_no_revienta_al_registrar(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        strategy.executor.dry_run = True
+        strategy.executor.positions[MINT] = SimpleNamespace(
+            mint=MINT, token_amount_ui=1000.0, entry_price=1e-6, sol_invested=0.01
+        )
+        strategy.tracker.positions[MINT] = SimpleNamespace(
+            mint=MINT,
+            symbol="TEST",
+            buy_price=1e-6,
+            amount=0.01,
+            source_wallet=TRADER,
+            # Scalper: el trader cerro hace nada (el hold sale de aqui).
+            created_at=time.time(),
+        )
+        # Acumulado sin costo valido: el PnL del trader no existe.
+        strategy._wallet_mint_tokens[(TRADER, MINT)] = 1000.0
+        strategy._wallet_mint_sol[(TRADER, MINT)] = 0.0
+        strategy._wallet_mint_cost_unknown.add((TRADER, MINT))
+        strategy.config.copy_trading.MIN_COPY_TRADE_HOLD_SECONDS = 300
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        stats_mock = MagicMock()
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: stats_mock)
+
+        await strategy._execute_copy_trade(_sell_signal())
+
+        # Lo importante: se registro la stats (no hubo excepcion) y el PnL es
+        # un numero, no None.
+        stats_mock.record_sell.assert_called_once()
+        kwargs = stats_mock.record_sell.call_args.kwargs
+        assert kwargs["pnl_pct"] is not None
+        assert kwargs["pnl_unreliable"] is True
+
+
 class TestDRYRunHonesto:
     """El PnL simulado debe descontar los costes reales del ciclo.
 

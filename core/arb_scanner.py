@@ -43,9 +43,20 @@ class ArbCosts:
     trade_size_sol: float
 
     @property
+    def slippage_pct(self) -> float:
+        """Slippage como PORCENTAJE (no como fraccion).
+
+        500 bps son un 5%, o sea `bps / 100 = 5.0` en unidades de porcentaje.
+        Dividir entre 10_000 daba 0.05 y se sumaba a un valor que ya estaba en
+        porcentaje: el slippage quedaba CONTADO 100 veces mas pequeno. Con eso
+        el ciclo de 0.01 SOL salia "barato" cuando en realidad era carisimo.
+        """
+        return self.slippage_bps / 100.0
+
+    @property
     def fee_cost_sol(self) -> float:
         """Fees de los dos swaps + slippage, como fraccion del ciclo."""
-        return (self.swap_fee_pct * 2.0 + self.slippage_bps * 2.0 / 10_000.0) / 100.0
+        return (self.swap_fee_pct * 2.0 + self.slippage_pct * 2.0) / 100.0
 
     @property
     def fixed_cost_sol(self) -> float:

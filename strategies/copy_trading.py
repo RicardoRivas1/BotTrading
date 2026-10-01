@@ -2614,12 +2614,19 @@ class CopyTradingStrategy(Strategy):
                         )
                         _is_sniper = True
                         _pnl_unreliable = True
-                    if _pnl_unreliable and not _is_sniper:
-                        logger.warning(
-                            "CopyTrading: sin PnL medible para {} (ni saldo ni precio); "
-                            "el trade queda fuera de las métricas",
-                            signal.token_mint[:8] + "...",
-                        )
+                    if _pnl_unreliable:
+                        # Normalizar SIEMPRE, no solo cuando no es scalper. Un
+                        # trade puede ser las dos cosas a la vez (scalper Y sin
+                        # PnL medible) y entonces `_stats_pnl` se quedaba en
+                        # None: mas abajo `float(_stats_pnl)` reventaba con
+                        # "float() argument must be ... not 'NoneType'" y el
+                        # trade se perdia entero, con la venta ya ejecutada.
+                        if not _is_sniper:
+                            logger.warning(
+                                "CopyTrading: sin PnL medible para {} (ni saldo ni precio); "
+                                "el trade queda fuera de las métricas",
+                                signal.token_mint[:8] + "...",
+                            )
                         _stats_pnl = 0.0
                     # `sol_received` es el SOL REAL obtenido por la venta. Antes se
                     # derivaba como `invertido * (1 + pnl/100)`, que es una
