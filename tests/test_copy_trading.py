@@ -984,6 +984,195 @@ class TestScalperSinPnlMedible:
         assert kwargs["pnl_unreliable"] is True
 
 
+class TestNotificacionHonesta:
+    """Lo que sale en Telegram tiene que ser verdad.
+
+    Tres fallos que se leian en los avisos de venta:
+
+    - El ticker de la VENTA era `mint[:6].upper()` (lo que rellena `_parse_trade`,
+      porque en la tx no viaja el ticker), asi que una compra de `$SOLLM` se
+      ceraba como "Venta de 8NZ5FX".
+    - Un PnL por encima de `MAX_TRUSTED_PNL_PCT` se limitaba a 500 y se
+      notificaba como "+500.00%" real, siete veces seguidas para el mismo token.
+    - "Trader: cup2" cuando la posicion la habia abierto cup3: la etiqueta es la
+      de quien VENDIO, y no se decia quien la abrio.
+    """
+
+    def _preparar_venta(self, strategy, symbol: str = "SOLLM") -> dict[str, object]:
+        """Monta una posicion abierta por `TRADER` con PnL del trader creible."""
+        strategy.executor.positions[MINT] = SimpleNamespace(
+            mint=MINT, token_amount_ui=1000.0, entry_price=1e-6, sol_invested=0.01
+        )
+        strategy.tracker.positions[MINT] = SimpleNamespace(
+            mint=MINT, symbol=symbol, buy_price=1e-6, amount=0.01,
+            source_wallet=TRADER,
+        )
+        strategy._wallet_mint_tokens[(TRADER, MINT)] = 1000.0
+        strategy._wallet_mint_sol[(TRADER, MINT)] = 0.01
+        return {}
+
+    async def test_la_venta_usa_el_ticker_real_y_no_el_prefijo_del_mint(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        strategy, executor, _tracker = _strategy(tmp_path)
+        self._preparar_venta(strategy)
+        # `_parse_trade` no conoce el ticker: rellena el prefijo del mint.
+        signal = _sell_signal()
+        signal.token_symbol = MINT[:6].upper()
+        executor.get_token_symbol = AsyncMock(return_value="SOLLM")
+
+        seen: dict[str, object] = {}
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        stats_mock = MagicMock()
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: stats_mock)
+
+        await strategy._execute_copy_trade(signal)
+
+        # El ticker resuelto al comprar (guardado en la posicion del tracker) es
+        # el que sale, no el prefijo del mint.
+        assert seen.get("symbol") == "SOLLM"
+        assert stats_mock.record_sell.call_args.kwargs["symbol"] == "SOLLM"
+
+    async def test_pnl_por_encima_del_tope_se_notifica_como_nd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Un "+500%" era el tope del rango, no una medicion."""
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        self._preparar_venta(strategy)
+        # Sin precio de entrada no hay PnL por precio con el que "corregir" el
+        # dato del trader, asi que el valor imposible llega entero hasta el tope.
+        strategy.executor.positions[MINT].entry_price = 0.0
+        strategy.tracker.positions[MINT].buy_price = 0.0
+        # Costo de compras que nunca vimos: con proceeds normal el PnL sale por
+        # encima de MAX_TRUSTED_PNL_PCT.
+        strategy._wallet_mint_sol[(TRADER, MINT)] = 1e-9
+        strategy.executor.get_token_price = AsyncMock(return_value=1e-6)
+
+        seen: dict[str, object] = {}
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: MagicMock())
+
+        await strategy._execute_copy_trade(_sell_signal())
+
+        assert seen.get("pnl_known") is False, "un PnL >500% no es una medicion"
+
+    async def test_pnl_creible_sigue_siendo_una_medicion(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """El cambio anterior no puede tapar un PnL bueno con un 'n/d'."""
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        self._preparar_venta(strategy)
+        # Costo coherente con la entrada (1000 tk a 1e-6) y salida al doble.
+        strategy._wallet_mint_sol[(TRADER, MINT)] = 0.001
+        strategy.executor.get_token_price = AsyncMock(return_value=2e-6)
+
+        seen: dict[str, object] = {}
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: MagicMock())
+
+        await strategy._execute_copy_trade(_sell_signal())
+
+        assert seen.get("pnl_known") is True
+        assert float(seen.get("pnl", 0.0)) == pytest.approx(100.0)
+
+    async def test_una_estimacion_por_encima_del_techo_no_se_muestra(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """El PnL ESTIMADO tenia suelo (-99%) pero no techo.
+
+        Una entrada de polvo contra una salida de un solo comprador daba
+        "+613.19% (estimado)": es el mismo dato sucio que un -100%, y salia
+        como si fuera el resultado de la copia.
+        """
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        self._preparar_venta(strategy)
+        # Precio de salida 100x la entrada: la estimacion por precio da +9900%.
+        strategy.executor.get_token_price = AsyncMock(return_value=1e-4)
+        # Se evita la referencia de cierre del trader (que acota el precio) para
+        # que la estimacion salga directamente del precio de mercado.
+        strategy._wallet_mint_sol[(TRADER, MINT)] = 0.0
+        strategy._wallet_mint_cost_unknown.add((TRADER, MINT))
+
+        seen: dict[str, object] = {}
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: MagicMock())
+
+        await strategy._execute_copy_trade(_sell_signal())
+
+        assert seen.get("pnl_copy") is None, "una estimacion >500% debe salir n/d"
+
+    async def test_la_venta_distingue_quien_vendio_de_quien_abrio_la_posicion(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Compró cup3, vendió cup2: el aviso tiene que decirlo.
+
+        Cuando la tx de venta no identifica el mint, `_pick_wallet_position` la
+        adjudica a la wallet que mas tiene del token, que no es necesariamente
+        la que lo compro. Antes solo se anotaba en el log, asi que en Telegram
+        se leia como un bug.
+        """
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        OTRO = "0Tr0W4ll3t1111111111111111111111111111111111"
+        strategy.wallets[OTRO] = TrackedWallet(address=OTRO, label="otro")
+        # La posicion la abrio OTRO, pero la venta la disparo TRADER.
+        self._preparar_venta(strategy)
+        strategy.tracker.positions[MINT].source_wallet = OTRO
+
+        seen: dict[str, object] = {}
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: MagicMock())
+
+        await strategy._execute_copy_trade(_sell_signal())
+
+        trader_txt = str(seen.get("trader", ""))
+        assert "trader" in trader_txt, "sigue nombrando a quien vendio"
+        assert "otro" in trader_txt, "y dice quien abrio la posicion"
+
+    async def test_si_la_posicion_la_abrio_el_mismo_no_anade_ruido(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        strategy, _executor, _tracker = _strategy(tmp_path)
+        self._preparar_venta(strategy)
+
+        seen: dict[str, object] = {}
+
+        async def _fake_sell(mint: str, *args: object, **kwargs: object) -> bool:
+            seen.update(kwargs)
+            return True
+
+        monkeypatch.setattr("core.websocket.process_sell_and_notify", _fake_sell)
+        monkeypatch.setattr("core.stats.get_trade_stats", lambda: MagicMock())
+
+        await strategy._execute_copy_trade(_sell_signal())
+
+        assert seen.get("trader") == "trader"
+
+
 class TestDRYRunHonesto:
     """El PnL simulado debe descontar los costes reales del ciclo.
 

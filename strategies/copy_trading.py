@@ -52,11 +52,18 @@ MIN_BUY_SOL = 0.005
 # token vale ~0" es indistinguible de una cotizacion rota (en los micro-caps el
 # pool vacio cotiza a polvo), asi que no se presenta como resultado: sale n/d.
 # El PnL MEDIDO de una venta real no pasa por aqui y si puede ser -100%.
+# El techo equivalente para estimaciones es MAX_TRUSTED_PNL_PCT (core/stats.py).
 MIN_ESTIMATED_PNL_PCT = -99.0
 
 # Discrepancia maxima (en puntos porcentuales) entre el PnL estimado por precio y
 # el resultado conocido del trader sobre el mismo token. Por encima, uno de los
 # dos datos esta roto y la estimacion se descarta.
+#
+# La ventana es ABSOLUTA a proposito: los dos % se miden con referencias
+# distintas (nuestra entrada vs su costo medio del trader), asi que pueden
+# separarse bastante sin que ninguno sea falso. Bajarla a 60 puntos descartaba
+# casos legitimos (trader -85% frente a un precio de +50%: 135 puntos de
+# divergencia admisible).
 MAX_ESTIMATE_VS_TRADER_GAP_PCT = 200.0
 
 # Tipos de transaccion que nos interesan
@@ -2046,6 +2053,44 @@ class CopyTradingStrategy(Strategy):
                     elif tracker_pos and tracker_pos.buy_price and tracker_pos.buy_price > 0:
                         entry = tracker_pos.buy_price
 
+                    # Simbolo para la notificacion de VENTA. `signal.token_symbol`
+                    # lo rellena `_parse_trade` con `mint[:6].upper()` porque en la
+                    # tx no viaja el ticker, asi que avisaba "Venta de 8NZ5FX"
+                    # para un token que en la COMPRA ya habia mostrado como $SOLLM.
+                    # El ticker de verdad se resolvio al comprar y quedo guardado
+                    # en la posicion del tracker; se usa ese. Si la posicion no lo
+                    # tiene (o es el mismo fallback del mint), se consulta la API
+                    # una vez, igual que hizo la compra.
+                    _fallback_symbol = signal.token_mint[:6].upper()
+                    _symbol = signal.token_symbol
+                    for _candidate in (
+                        getattr(tracker_pos, "symbol", "") if tracker_pos else "",
+                        getattr(position, "symbol", "") if position else "",
+                    ):
+                        _cand = str(_candidate or "").strip()
+                        if _cand and _cand.upper() != "N/A" and _cand != _fallback_symbol:
+                            _symbol = _cand
+                            break
+                    if _symbol == _fallback_symbol or not _symbol:
+                        try:
+                            _resolved = await self.executor.get_token_symbol(
+                                signal.token_mint
+                            )
+                            if _resolved and _resolved.upper() != "N/A":
+                                _symbol = _resolved
+                        except Exception as exc:  # noqa: BLE001 - fallo de red no bloqueante
+                            logger.warning(
+                                "CopyTrading: no se pudo resolver el ticker de {} para "
+                                "la notificacion de venta ({}); se usa {}",
+                                signal.token_mint[:8] + "...", exc, _symbol,
+                            )
+                    if _symbol != signal.token_symbol:
+                        logger.info(
+                            "CopyTrading: VENTA de {} notificada como ${} (no ${}, "
+                            "que es solo el prefijo del mint)",
+                            signal.token_mint[:8] + "...", _symbol, signal.token_symbol,
+                        )
+
                     current_price = 0.0
                     try:
                         current_price = await self.executor.get_token_price(signal.token_mint)
@@ -2354,11 +2399,24 @@ class CopyTradingStrategy(Strategy):
                     copy_pnl = None
                     if entry > 0 and _exit_ref > 0:
                         copy_pnl = (_exit_ref - entry) / entry * 100.0
-                        # Plausibilidad: un -100% "de mercado" en estos tokens es
-                        # casi siempre la cotizacion de un pool vacio, no una
-                        # perdida real. Sin esto se notificaba -100.00% (estimado)
-                        # con el trader en n/d, sin nada con que contrastarlo.
-                        if copy_pnl <= MIN_ESTIMATED_PNL_PCT:
+                        # Techo de plausibilidad para una ESTIMACION. El suelo
+                        # (`MIN_ESTIMATED_PNL_PCT`) existe desde hace tiempo
+                        # porque un -100% "de mercado" en estos tokens es la
+                        # cotizacion de un pool vacio, no una perdida real; el
+                        # lado alto tenia el mismo problema al reves: una entrada
+                        # de polvo contra una salida de un solo comprador daba
+                        # "+613.19%" y se notificaba como resultado de la copia.
+                        # Es el mismo dato sucio que un -100%: no se muestra.
+                        if copy_pnl > MAX_TRUSTED_PNL_PCT:
+                            logger.warning(
+                                "CopyTrading: PnL estimado de la copia {:.2f}% para {} "
+                                "supera el techo de plausibilidad (entry={:.10g} "
+                                "exit_ref={:.10g}); se descarta y se mostrara n/d",
+                                copy_pnl, signal.token_mint[:8] + "...",
+                                entry, _exit_ref,
+                            )
+                            copy_pnl = None
+                        elif copy_pnl <= MIN_ESTIMATED_PNL_PCT:
                             logger.warning(
                                 "CopyTrading: PnL estimado de la copia {:.2f}% para {} "
                                 "no es plausible como precio de mercado (entry={:.10g} "
@@ -2426,15 +2484,22 @@ class CopyTradingStrategy(Strategy):
 
                     # Clamp PnL: en spot trading la pérdida nunca puede ser peor que -100%
                     pnl_pct = max(-100.0, pnl_pct)
-                    # Cualquier PnL irreal (>MAX_TRUSTED) que sobreviva se limita
-                    # a ese valor para no spamear mensajes absurdos.
+                    # Un PnL por encima de MAX_TRUSTED_PNL_PCT NO se muestra como
+                    # "+500%": ese numero es el tope del rango, no una medición.
+                    # Antes se notificaba como si fuera real (`trader_pnl_known`
+                    # seguía en True) y Telegram repetía "+500.00%" venta tras
+                    # venta, indistinguible de una ganancia verdadera. Las stats
+                    # ya excluían estos trades por el mismo motivo
+                    # (core/stats.py:MAX_TRUSTED_PNL_PCT); aquí se aplica la misma
+                    # regla al mensaje: si no es creíble, es "n/d".
                     if pnl_pct > MAX_TRUSTED_PNL_PCT:
                         logger.warning(
-                            "CopyTrading: PnL {:.2f}% implausible para {} (sell_proceeds={:.6f} sold_tok={:.6g} avg_cost={:.10g}); limitado a {:.0f}% en notificación",
+                            "CopyTrading: PnL {:.2f}% implausible para {} (sell_proceeds={:.6f} sold_tok={:.6g} avg_cost={:.10g}); se notificara 'n/d', no un numero inventado",
                             pnl_pct, signal.token_mint[:12] + "...",
-                            sell_proceeds, sold_tok, avg_cost, MAX_TRUSTED_PNL_PCT,
+                            sell_proceeds, sold_tok, avg_cost,
                         )
-                        pnl_pct = MAX_TRUSTED_PNL_PCT
+                        pnl_pct = 0.0
+                        trader_pnl_known = False
                     if abs(pnl_pct) >= 99.9:
                         logger.warning(
                             "CopyTrading: PnL {:.2f}% cerca del limite para {} (sell_proceeds={} sold_tok={} w_sol={} accumulated={} avg_cost={})",
@@ -2472,6 +2537,27 @@ class CopyTradingStrategy(Strategy):
                             pnl_pct, _sol_portion_invested
                         )
 
+                    # La wallet que aparece en la notificacion es la que VENDIO,
+                    # que no siempre es la que COMPRO la posicion: si la tx de
+                    # venta no identifica el mint, `_pick_wallet_position` la
+                    # adjudica a la wallet que mas tiene de ese token. Sin decirlo
+                    # se leia "compro cup3 / vendio cup2" y parecia un bug (el
+                    # log ya lo distinguia, Telegram no). Se calculan aqui porque
+                    # el mensaje se emite justo despues.
+                    _origen = (
+                        getattr(tracker_pos, "source_wallet", "") if tracker_pos else ""
+                    )
+                    _vende_otra = bool(_origen) and _origen != signal.wallet
+                    _trader_notif = signal.trader_label
+                    if _vende_otra:
+                        _owner = self.wallets.get(_origen)
+                        _owner_label = (
+                            _owner.label if _owner else (_origen[:8] + "...")
+                        )
+                        _trader_notif = (
+                            f"{signal.trader_label} (vendió; posición de {_owner_label})"
+                        )
+
                     # Ejecuta la venta. `process_sell_and_notify` devuelve False
                     # si NO se vendio de verdad (sin saldo, orden sin confirmar,
                     # error de RPC). En ese caso NO se puede limpiar la posicion
@@ -2481,13 +2567,13 @@ class CopyTradingStrategy(Strategy):
                     _sell_result: dict[str, Any] = {}
                     sold = await process_sell_and_notify(
                         signal.token_mint,
-                        symbol=signal.token_symbol,
+                        symbol=_symbol,
                         reason="COPY_TRADE_SELL",
                         pnl=pnl_pct,
                         pnl_copy=_copy_estimate,
                         pnl_known=trader_pnl_known,
                         sell_pct=pct,
-                        trader=signal.trader_label,
+                        trader=_trader_notif,
                         account_source=False,
                         result=_sell_result,
                     )
@@ -2670,7 +2756,7 @@ class CopyTradingStrategy(Strategy):
                     from core.stats import get_trade_stats
                     get_trade_stats().record_sell(
                         mint=signal.token_mint,
-                        symbol=signal.token_symbol or signal.token_mint[:6].upper(),
+                        symbol=_symbol or signal.token_mint[:6].upper(),
                         wallet=_wallet_for_stats,
                         entry_price=_entry,
                         exit_price=_exit_price,
@@ -2685,17 +2771,9 @@ class CopyTradingStrategy(Strategy):
                         estimated=_pnl_estimated,
                     )
 
-                    # La wallet que aparece en la notificacion es la que VENDIO,
-                    # que no siempre es la que COMPRO la posicion: si la tx de
-                    # venta no identifica el mint, `_pick_wallet_position` la
-                    # adjudica a la wallet que mas tiene de ese token. Sin
-                    # decirlo, se leia "compro cup2 / vendio cup3" y parecia un
-                    # bug. Ahora se distingue la wallet que cerro la posicion.
-                    _origen = (
-                        getattr(tracker_pos, "source_wallet", "") if tracker_pos else ""
-                    )
-                    _vende_otra = bool(_origen) and _origen != signal.wallet
-
+                    # `_origen` / `_vende_otra` / `_trader_notif` se calcularon antes de la
+                    # venta para que la notificacion distinguera QUIEN vendio de
+                    # QUIEN abrio la posicion.
                     logger.success(
                         "CopyTrading: SELL {} ({}) | {} | trader {}{} | mi copia {} | sell_pct: {:.0f}%{}",
                         signal.trader_label or signal.source, signal.wallet[:8] + "...",
