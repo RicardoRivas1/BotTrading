@@ -2685,15 +2685,35 @@ class CopyTradingStrategy(Strategy):
                         estimated=_pnl_estimated,
                     )
 
+                    # La wallet que aparece en la notificacion es la que VENDIO,
+                    # que no siempre es la que COMPRO la posicion: si la tx de
+                    # venta no identifica el mint, `_pick_wallet_position` la
+                    # adjudica a la wallet que mas tiene de ese token. Sin
+                    # decirlo, se leia "compro cup2 / vendio cup3" y parecia un
+                    # bug. Ahora se distingue la wallet que cerro la posicion.
+                    _origen = (
+                        getattr(tracker_pos, "source_wallet", "") if tracker_pos else ""
+                    )
+                    _vende_otra = bool(_origen) and _origen != signal.wallet
+
                     logger.success(
-                        "CopyTrading: SELL {} ({}) | {} | trader {} | mi copia {} | sell_pct: {:.0f}%{}",
+                        "CopyTrading: SELL {} ({}) | {} | trader {}{} | mi copia {} | sell_pct: {:.0f}%{}",
                         signal.trader_label or signal.source, signal.wallet[:8] + "...",
                         signal.token_mint[:8] + "...",
                         f"{pnl_pct:+.2f}%" if trader_pnl_known else "n/d",
+                        f"{_origen[:8]}... (compro)" if _vende_otra else "",
                         f"{_our_pnl_pct:+.2f}%" if _our_pnl_pct is not None else "n/d",
                         pct,
                         " | SCALPE excluido" if _is_sniper else "",
                     )
+                    if _vende_otra:
+                        logger.info(
+                            "CopyTrading: la venta de {} la hizo {} pero la posicion "
+                            "la abrio {}; el mint no venia identificado en la tx",
+                            signal.token_mint[:8] + "...",
+                            signal.wallet[:8] + "...",
+                            _origen[:8] + "...",
+                        )
                     # Venta EXITOSA: recien ahora marcar como ejecutada (persistente)
                     # para que los redeliveries/poll tras un restart no la repitan.
                     self._mark_executed(signal.tx_signature or "")
