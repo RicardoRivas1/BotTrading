@@ -6,8 +6,7 @@ Persists to a JSON file so stats survive restarts.
 from __future__ import annotations
 
 import json
-import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -379,6 +378,11 @@ class TradeStats:
             # (incluidos los excluidos) junto a wins/losses de los válidos, y
             # "Ventas: 10 | Wins 3 | Losses 2" no cuadraba con nada.
             "total_sells": len(valid),
+            # Ventas REALES que el bot ha registrado (incluye las excluidas):
+            # "Ventas" de arriba son solo las con PnL fiable, asi que sin esto
+            # un "Ventas: 0" parece que el bot no vendo cuando en realidad
+            # veto 49 veces y todas estaban fuera de las metricas.
+            "sells_recorded": self.total_sells,
             "excluded": self.excluded_count,
             "simulated": sum(1 for t in valid if t.estimated),
             "sells_seen": self.total_sells,
@@ -407,6 +411,29 @@ class TradeStats:
             } for w, ws in self.wallets.items()},
         }
 
+    def _exclusion_breakdown(self) -> list[tuple[str, int]]:
+        """Por qué se excluyó cada venta, para poder explicar el "Ventas: N".
+
+        Distingue los motivos porque significan cosas distintas: una venta
+        parcial (el trader vendió el 40%) no es comparable con una completa
+        cuyo PnL no se pudo medir, y un PnL absurdo (>MAX_TRUSTED_PNL_PCT) es
+        un dato roto, no una operación.
+        """
+        motivos: dict[str, int] = {}
+        for t in self.trades:
+            if not t.excluded:
+                continue
+            if abs(t.pnl_pct) > MAX_TRUSTED_PNL_PCT:
+                clave = "PnL absurdo (dato corrupto)"
+            elif t.sell_pct < 99.0:
+                clave = f"venta parcial (trader vendió {t.sell_pct:.0f}%)"
+            elif t.pnl_pct == 0.0:
+                clave = "completa pero sin PnL medible"
+            else:
+                clave = "sin PnL medible"
+            motivos[clave] = motivos.get(clave, 0) + 1
+        return sorted(motivos.items(), key=lambda kv: -kv[1])
+
     def format_summary(self, open_positions: Optional[int] = None) -> str:
         """Human-readable summary for Telegram.
 
@@ -434,12 +461,26 @@ class TradeStats:
             "",
         ] + sim_note + [
             f"🔄 Compras: {s['total_buys']} | Ventas: {s['total_sells']} | Abiertas: {s['open_positions']}"
-            + (f" | Sin PnL fiable: {s['excluded']}" if s['excluded'] else ""),
+            + (f" | Sin PnL fiable: {s['excluded']}" if s["excluded"] else ""),
             f"✅ Wins: {s['wins']} | ❌ Losses: {s['losses']}",
             f"🎯 Win Rate: <b>{s['win_rate_pct']}%</b>",
             f"💰 PnL Neto: <b>{s['total_pnl_pct']:+.2f}%</b> ({s['net_pnl_sol']:+.4f} SOL) | Promedio: {s['avg_pnl_pct']:+.2f}%",
             f"🏆 Mejor: {s['best_trade_pct']:+.2f}% | 📉 Peor: {s['worst_trade_pct']:+.2f}%",
         ]
+        # Por que una venta no aparece en las metricas. Sin esto "Ventas: 0"
+        # con "Sin PnL fiable: 49" parece un fallo del bot cuando en realidad
+        # son 49 ventas que se excluiron a proposito.
+        if s["sells_recorded"] > s["total_sells"]:
+            lines += [
+                "",
+                f"ℹ️ El bot registró <b>{s['sells_recorded']} ventas</b>, pero solo "
+                f"<b>{s['total_sells']}</b> tienen PnL fiable y entran en las "
+                f"métricas de arriba. Las otras <b>{s['excluded']}</b> quedan fuera "
+                "a propósito:",
+            ]
+            motivos = self._exclusion_breakdown()
+            for motivo, n in motivos:
+                lines.append(f"  • {motivo}: {n}")
         if s["avg_hold_seconds"] > 0:
             m, sec = divmod(int(s["avg_hold_seconds"]), 60)
             lines.append(f"⏱️ Hold promedio: {m}m {sec}s")

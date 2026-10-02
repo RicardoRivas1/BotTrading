@@ -37,6 +37,66 @@ def _record(stats: TradeStats, pnl_pct: float, sol_inv: float = 0.05) -> None:
     )
 
 
+class TestVisibilidadDeVentasExcluidas:
+    """/stats tiene que explicar por qué una venta no aparece.
+
+    Se reportaron "Ventas: 0" junto a "Sin PnL fiable: 49", que parece un fallo
+    del bot (no registra ventas) cuando en realidad registró 49 y las excluyó
+    todas a propósito. El resumen tiene que distinguir ambas cosas.
+    """
+
+    def _excluded_history(self, tmp_path):
+        stats = TradeStats(path=str(tmp_path / "stats.json"))
+        stats.total_buys = 50
+        stats.positions_opened = 50
+        # 3 ventas: 1 válida, 1 sin PnL medible, 1 con PnL corrupto.
+        _record(stats, 40.0)
+        stats.record_sell(
+            mint="M2", symbol="S2", wallet="wallet1",
+            entry_price=1.0, exit_price=1.0,
+            pnl_pct=0.0, sol_invested=0.05, sol_received=0.0,
+            buy_time=1.0, sell_time=2.0, pnl_unreliable=True,
+        )
+        _record(stats, 9_000.0)
+        return stats
+
+    def test_separ_ventas_totales_de_con_pnl_fiable(self, tmp_path):
+        s = self._excluded_history(tmp_path).summary()
+        assert s["sells_recorded"] == 3      # las que el bot registró
+        assert s["total_sells"] == 1         # las que cuentan en métricas
+        assert s["excluded"] == 2
+
+    def test_el_resumen_explica_las_ventas_que_no_cuentan(self, tmp_path):
+        texto = self._excluded_history(tmp_path).format_summary(open_positions=0)
+        assert "registró" in texto
+        assert "3" in texto and "1" in texto
+        # Y nombra el motivo de cada exclusión.
+        assert "sin PnL medible" in texto
+        assert "PnL absurdo" in texto
+
+    def test_el_desglose_distingue_venta_parcial(self, tmp_path):
+        # Una venta parcial (el trader vendió el 40% de su posición) NO es lo
+        # mismo que una venta completa sin PnL: son cosas distintas y el
+        # usuario necesita verlas por separado.
+        stats = TradeStats(path=str(tmp_path / "stats.json"))
+        stats.record_sell(
+            mint="M1", symbol="S1", wallet="wallet1",
+            entry_price=1.0, exit_price=1.0,
+            pnl_pct=-50.0, sol_invested=0.05, sol_received=0.02,
+            buy_time=1.0, sell_time=2.0, sell_pct=40.0,
+            pnl_unreliable=True,
+        )
+        motivos = dict(stats._exclusion_breakdown())
+        assert any("parcial" in k and "40%" in k for k in motivos)
+
+    def test_sin_ventas_excluidas_no_muestra_el_aviso(self, tmp_path):
+        # Con todas las ventas en las métricas, el bloque extra sería ruido.
+        stats = TradeStats(path=str(tmp_path / "stats.json"))
+        _record(stats, 40.0)
+        texto = stats.format_summary(open_positions=0)
+        assert "registró" not in texto
+
+
 def test_pnl_absurdo_se_excluye(tmp_path):
     stats = TradeStats(path=str(tmp_path / "stats.json"))
     _record(stats, 1_659_118.72)
