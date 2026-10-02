@@ -452,6 +452,19 @@ class ArbSettings(BaseSettings):
             "el edge ya no existe cuando lo veamos: se reporta como NO VIABLE."
         ),
     )
+    ARB_SLIPPAGE_BPS: float = Field(
+        default=50.0,
+        ge=0,
+        le=10_000,
+        description=(
+            "Slippage EN PORCENTAJE para el escaner de arbitraje. Va separado de "
+            "trading.SLIPPAGE_BPS a proposito: ese (500 bps = 5% por lado) sirve "
+            "para copy trading de memecoins volatiles, pero para arbitraje entre "
+            "pools maduros un 5% de tolerancia hace que TODO parezca inviable y "
+            "oculta los casos que si lo son. Bajar esto sin justificacion seria "
+            "inflar el edge artificialmente."
+        ),
+    )
     ARB_MINTS: str = Field(
         default="",
         description=(
@@ -459,6 +472,47 @@ class ArbSettings(BaseSettings):
             "copy trading ya tiene abiertos (los unicos con liquidez demostrada "
             "para esta wallet). Ej: 'So111...,EPjFWdd...' "
         ),
+    )
+    ARB_XPOOL_URL: str = Field(
+        default="https://api.dexscreener.com/latest/dex/tokens",
+        description="Fuente de pares para el escaner cross-pool (DexScreener).",
+    )
+    ARB_XPOOL_MIN_LIQ_USD: float = Field(
+        default=25_000.0,
+        ge=0,
+        description=(
+            "Liquidez minima en USD del pool. Por debajo el `priceUsd` es de un "
+            "pool vacio o manipulable y produce spreads inventados."
+        ),
+    )
+    ARB_XPOOL_MIN_HOLD_MS: int = Field(
+        default=3000,
+        ge=0,
+        description=(
+            "Cuanto tiempo debe seguir existiendo el spread antes de contarlo. "
+            "Un edge que dura menos que nuestra propia latencia (~500ms) mas la "
+            "confirmacion del bloque no se puede capturar: hay que haberlo visto "
+            "persistente."
+        ),
+    )
+    ARB_XPOOL_MAX_SNAPSHOT_AGE_MS: int = Field(
+        default=15_000,
+        ge=0,
+        description=(
+            "Antiguedad maxima aceptada en el `pairCreatedAt`/timestamp del par. "
+            "Datos viejos comparados contra datos frescos producen spreads que ya "
+            "no existen."
+        ),
+    )
+    ARB_XPOOL_SNAPSHOTS: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Pasadas consecutivas que deben ver el mismo spread.",
+    )
+    ARB_XPOOL_ENABLED: bool = Field(
+        default=False,
+        description="Activar el escaner cross-pool (instrumento de medida, no ejecuta).",
     )
 
 

@@ -284,16 +284,24 @@ async def scan_from_mints(
     return await scanner.scan(list(mints))
 
 
-def costs_from_config(arb_cfg: Any, slippage_bps: float = 500.0) -> ArbCosts:
+def costs_from_config(arb_cfg: Any, slippage_bps: Optional[float] = None) -> ArbCosts:
     """Construye los costes desde la config.
 
-    `slippage_bps` va aparte a proposito: vive en `trading.SLIPPAGE_BPS`, no en
-    `arb`, porque es el mismo slippage que usa el executor al operar.
+    `slippage_bps` va aparte a proposito: el del copy trading vive en
+    `trading.SLIPPAGE_BPS` y son 500 bps = 5% por lado, tolerancia correcta para
+    una memecoin volatil pero absurda para arbitraje entre pools liquidos.
+    Mezclarlos hacia que el escaner O NO vea ningun caso viable, que es una
+    conclusion falsa tan peligrosa como la contraria. Por defecto se usa
+    `ARB_SLIPPAGE_BPS`, que es lo que el arbitraje necesita; el de trading solo
+    se usa si se pide expresamente.
     """
+    resolved = slippage_bps if slippage_bps is not None else float(
+        getattr(arb_cfg, "ARB_SLIPPAGE_BPS", 50.0)
+    )
     return ArbCosts(
         swap_fee_pct=float(getattr(arb_cfg, "ARB_SWAP_FEE_PCT", 0.25)),
         ata_rent_sol=float(getattr(arb_cfg, "ARB_ATA_RENT_SOL", 0.00203928)),
-        slippage_bps=float(slippage_bps),
+        slippage_bps=resolved,
         trade_size_sol=float(getattr(arb_cfg, "ARB_TRADE_SIZE_SOL", 0.01)),
     )
 

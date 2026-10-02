@@ -180,6 +180,13 @@ class TradingBot:
         # sin volver a pagar las cotizaciones.
         self._last_arb_report: dict | None = None
 
+        # El escaner cross-pool (/xarb) guarda el historial de spreads entre
+        # pasadas: CUANTO TIEMPO lleva existiendo cada uno. Por eso la
+        # instancia se reutiliza en vez de crearse por comando; una instancia
+        # nueva en cada /xarb no tendria memoria y no confirmaria nunca nada.
+        self._xpool_scanner = None
+        self._last_xpool_report: dict | None = None
+
     async def run(self) -> None:
         """Inicia el bot con todas las estrategias."""
         logger.info("=== TradingBot Framework Modular ===")
@@ -263,6 +270,12 @@ class TradingBot:
             costs_from_config,
             report_to_dict,
         )
+        from core.cross_pool_scanner import (
+            report_to_dict as report_to_dict_xpool,
+        )
+        from core.cross_pool_scanner import (
+            scanner_from_config,
+        )
         from core.stats import get_trade_stats
 
         cfg = self.config
@@ -332,9 +345,7 @@ class TradingBot:
                             await self.notifier.send_status(
                                 f"Escaneando {len(mints)} token(s) en seco..."
                             )
-                            costs = costs_from_config(
-                                cfg.arb, slippage_bps=cfg.trading.SLIPPAGE_BPS
-                            )
+                            costs = costs_from_config(cfg.arb)
                             scanner = ArbScanner(
                                 self.executor, costs,
                                 min_edge_pct=cfg.arb.ARB_MIN_EDGE_PCT,
@@ -348,6 +359,33 @@ class TradingBot:
                                 self._last_arb_report = report_to_dict(report)
                                 await self.notifier.send(
                                     report.format(cfg.arb.ARB_MAX_LATENCY_MS)
+                                )
+                    elif text == "/xarb":
+                        mints = self._arb_candidate_mints()
+                        if not mints:
+                            await self.notifier.send_status(
+                                "Sin mints que comparar. Abre posiciones de copy "
+                                "trading o define ARB_MINTS en la config."
+                            )
+                        else:
+                            await self.notifier.send_status(
+                                f"Comparando {len(mints)} token(s) entre sus pools..."
+                            )
+                            # Se reutiliza la instancia: es la que lleva el
+                            # historial de duraciones entre llamadas.
+                            if self._xpool_scanner is None:
+                                self._xpool_scanner = scanner_from_config(
+                                    cfg.arb, self.executor
+                                )
+                            try:
+                                report = await self._xpool_scanner.scan(mints)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.error(f"/xarb fallo: {exc}")
+                                await self.notifier.send_error(f"/xarb fallo: {exc}")
+                            else:
+                                self._last_xpool_report = report_to_dict_xpool(report)
+                                await self.notifier.send(
+                                    report.format(cfg.arb.ARB_XPOOL_MIN_HOLD_MS)
                                 )
             except asyncio.CancelledError:
                 break
