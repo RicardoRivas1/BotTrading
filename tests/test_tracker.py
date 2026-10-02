@@ -8,6 +8,7 @@ llamadas a la venta y a la notificación se simulan; nunca se toca la red.
 
 import asyncio
 import time
+from pathlib import Path as real_path
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock
@@ -48,6 +49,74 @@ def patch_sell(monkeypatch) -> AsyncMock:
     mock_sell = AsyncMock(return_value=True)
     monkeypatch.setattr("core.websocket.process_sell_and_notify", mock_sell)
     return mock_sell
+
+
+def _fake_path(tmp_path):
+    """Devuelve un constructor Path que manda todos los ficheros a tmp_path."""
+    return lambda p: real_path(tmp_path) / str(p)
+
+
+class TestMintsRecientes:
+    """Historial de mints vistos, para que /xarb no se quede sin candidatos.
+
+    El fallo original: /xarb sacaba sus mints de `tracker.positions`, que solo
+    tiene las ABIERTAS. En memecoin una posicion vive segundos, asi que el
+    usuarioReceipt sempre arrive a "Sin mints que comparar" aunque el bot
+    acabara de operar diez tokens.
+    """
+
+    def test_note_mint_sobrevive_al_cierre(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setattr(tracker_module, "Path", _fake_path(tmp_path))
+        t = PositionTracker(MagicMock(), MagicMock(), _make_config())
+
+        t.note_mint("MINT_A")
+        t.add_position("MINT_A", "A", 0.001, 0.05)
+        # El mint sigue existiendo aunque la posicion se cierre.
+        t.remove_position("MINT_A")
+        assert "MINT_A" in t.recent_mints
+        assert "MINT_A" not in t.positions
+
+    def test_se_acota_el_historial(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setattr(tracker_module, "Path", _fake_path(tmp_path))
+        t = PositionTracker(MagicMock(), MagicMock(), _make_config())
+        for i in range(t.RECENT_MINTS_MAX + 20):
+            t.note_mint(f"MINT_{i}")
+        assert len(t.recent_mints) == t.RECENT_MINTS_MAX
+        # Se conservan los MAS NUEVOS, que son los que interesan.
+        assert f"MINT_{t.RECENT_MINTS_MAX + 19}" in t.recent_mints
+        assert "MINT_0" not in t.recent_mints
+
+    def test_el_ultimo_visto_es_el_mas_reciente(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setattr(tracker_module, "Path", _fake_path(tmp_path))
+        t = PositionTracker(MagicMock(), MagicMock(), _make_config())
+        t.note_mint("VIEJO")
+        t.note_mint("NUEVO")
+        assert list(t.recent_mints)[-1] == "NUEVO"
+
+    def test_sobrevive_a_un_reinicio(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setattr(tracker_module, "Path", _fake_path(tmp_path))
+        t = PositionTracker(MagicMock(), MagicMock(), _make_config())
+        t.note_mint("PERSISTIDO")
+        # Un reinicio crea otro tracker: sin persistir, /xarb perderia los
+        # candidatos cada vez que Render reinicia el servicio.
+        t2 = PositionTracker(MagicMock(), MagicMock(), _make_config())
+        assert "PERSISTIDO" in t2.recent_mints
+
+    def test_no_acepta_mint_vacio(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setattr(tracker_module, "Path", _fake_path(tmp_path))
+        t = PositionTracker(MagicMock(), MagicMock(), _make_config())
+        t.note_mint("")
+        assert t.recent_mints == {}
 
 
 class TestRegistroPosiciones:

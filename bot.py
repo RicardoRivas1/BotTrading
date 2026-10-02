@@ -241,11 +241,17 @@ class TradingBot:
             await asyncio.gather(heartbeat_task, cmd_task, monitor_task, return_exceptions=True)
 
     def _arb_candidate_mints(self) -> list[str]:
-        """Mints a escanear: los de ARB_MINTS o, si esta vacio, los abiertos.
+        """Mints a escanear: los de ARB_MINTS, o si esta vacio, los que el
+        bot ha visto recientemente.
 
-        Se prefieren los que el copy trading ya tiene abiertos porque son los
-        unicos con liquidez demostrada para esta wallet: escanear mints
-        desconocidos solo genera ruido de "sin ruta".
+        Antes caia en `tracker.positions`, que solo contiene las ABIERTAS. Con
+        memecoins (posiciones que viven segundos) eso hacia que /xarb
+        contestara "sin mints que comparar" practicamente siempre, incluso con
+        el bot reventando trades. Ahora el orden de preferencia es:
+
+        1. ARB_MINTS, si el usuario define una lista explicita.
+        2. Posiciones abiertas: son las que tienen liquidez demostrada AHORA.
+        3. Mints vistos recientemente, aunque la posicion ya se haya cerrado.
         """
         explicit = [
             m.strip()
@@ -254,7 +260,23 @@ class TradingBot:
         ]
         if explicit:
             return explicit[: self.config.arb.ARB_MAX_TOKENS]
-        return list(self.tracker.positions)[: self.config.arb.ARB_MAX_TOKENS]
+
+        limite = self.config.arb.ARB_MAX_TOKENS
+        vistos: list[str] = []
+        # 1) Abiertas primero: son las que tienen pool ahora mismo.
+        for mint in self.tracker.positions:
+            if mint not in vistos:
+                vistos.append(mint)
+        # 2) Y despues las vistas recientemente, que ya no estan abiertas pero
+        # siguen siendo los tokens que este bot acaba de operar. `or {}` porque
+        # `getattr` con default no protege de un atributo que exista a None.
+        recientes = getattr(self.tracker, "recent_mints", None) or {}
+        for mint in reversed(list(recientes)):
+            if mint not in vistos:
+                vistos.append(mint)
+            if len(vistos) >= limite:
+                break
+        return vistos[:limite]
 
     async def _telegram_command_loop(self) -> None:
         """Polls Telegram for /stats, /wallets and /arb commands.

@@ -1347,3 +1347,68 @@ class TestTokenSymbol:
         executor._get_symbol_from_dexscreener = AsyncMock(return_value="")
         executor._get_symbol_from_pumpfun = AsyncMock(return_value="")
         assert await executor.get_token_symbol(MINT_RAYDIUM) == MINT_RAYDIUM[:6].upper()
+
+
+class TestSimboloNoSeConfundeConElDeOtroToken:
+    """Un mint debe devolver SIEMPRE su propio símbolo.
+
+    El fallo: se elegía el pool con más liquidez sin comprobar que nuestro
+    token fuese su BASE. DexScreener devuelve también pools donde el token es
+    el QUOTE, así que un mint único aparecía con dos nombres distintos
+    ($8X2BXD y $REGGIE para el mismo mint). El operador no tenía forma de
+    saber cuál de los dos era el token que se estaba copiando.
+    """
+
+    @staticmethod
+    def _fake_session(pairs: list[dict]) -> object:
+        """Sesión aiohttp falsa que devuelve `pairs` con status 200."""
+        resp = AsyncMock()
+        resp.status = 200
+        resp.json = AsyncMock(return_value={"pairs": pairs})
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=resp)
+        ctx.__aexit__ = AsyncMock(return_value=False)
+        return ctx
+
+    async def test_ignora_el_pool_de_mas_liquidez_que_no_es_nuestro(
+        self, executor: JupiterExecutor, monkeypatch
+    ) -> None:
+        # El pool con más liquidez es de OTRO token y ahí el nuestro es QUOTE.
+        nuestro, otro = MINT_RAYDIUM, "11111111111111111111111111111111111111111"
+        pares = [
+            {
+                "baseToken": {"address": otro, "symbol": "REGGIE"},
+                "quoteToken": {"address": nuestro},
+                "liquidity": {"usd": 9_000_000},
+            },
+            {
+                "baseToken": {"address": nuestro, "symbol": "8X2BXD"},
+                "quoteToken": {"address": "So11111111111111111111111111111111111111112"},
+                "liquidity": {"usd": 1_000},
+            },
+        ]
+
+        fake = self._fake_session(pares)
+
+        class Sesion:
+            """`ClientSession()` es el context manager; `.get()` devuelve la
+            respuesta, que a su vez es otro context manager."""
+
+            async def __aenter__(s):  # noqa: N805
+                return s
+
+            async def __aexit__(s, *a):  # noqa: N805
+                return False
+
+            def get(s, *a, **k):  # noqa: N805
+                return fake
+
+        monkeypatch.setattr("core.execution.aiohttp.ClientSession", lambda *a, **k: Sesion())
+        assert await executor._get_symbol_from_dexscreener(nuestro) == "8X2BXD"
+
+    async def test_sin_pools_propios_devuelve_vacio(self, executor: JupiterExecutor) -> None:
+        # Si el token solo aparece en el QUOTE de pools ajenos, no hay símbolo
+        # propio que devolver: "" y el caller cae al siguiente proveedor.
+        assert await executor._get_symbol_from_dexscreener(
+            "TokenInexistenteQueNoTieneNingunPoolPropio123"
+        ) == ""

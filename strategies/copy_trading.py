@@ -1969,6 +1969,11 @@ class CopyTradingStrategy(Strategy):
                         amount=signal.amount_sol,
                         source_wallet=signal.wallet,
                     )
+                    # Que /xarb tenga candidatos aunque esta posicion se cierre
+                    # en los siguientes segundos (que es lo que pasa siempre).
+                    note = getattr(self.tracker, "note_mint", None)
+                    if callable(note):
+                        note(signal.token_mint)
 
                     self._notify(self.notifier.send_buy(
                         signal.token_mint,

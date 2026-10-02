@@ -165,6 +165,9 @@ class PositionTracker:
     # Slippage alto para ventas de emergencia en stop-loss (20% = 2000 bps).
     EMERGENCY_SLIPPAGE_BPS = 2000
     POSITIONS_FILE = "open_positions.json"
+    # Cuantos mints recuerda el tracker para que /xarb tenga candidatos.
+    RECENT_MINTS_FILE = "recent_mints.json"
+    RECENT_MINTS_MAX = 50
 
     def __init__(self, executor: Any, notifier: Any, config: Any) -> None:
         self.executor = executor
@@ -172,13 +175,54 @@ class PositionTracker:
         self.config = config
         # Memoria global de posiciones activas (independiente del executor).
         self.positions: dict[str, TrackerPosition] = {}
+        # Mints vistos recientemente, del mas nuevo al mas viejo. Existe por un
+        # motivo concreto: /xarb tomaba sus candidatos de `positions`, que solo
+        # contiene las ABIERTAS. Como las posiciones de memecoin viven segundos,
+        # /xarb se encontraba siempre con la lista vacia justo cuando el
+        # usuario la pedia, y contestaba "sin mints que comparar". Este
+        # historial no depende de que la posicion siga viva.
+        self.recent_mints: dict[str, float] = {}
         # Callbacks de cierre: la estrategia de copy trading los usa para
         # descontar el accumulado del trader que originó la posición. Sin ellos,
         # cada cierre por TP/SL/trailing dejaba al bot creyendo que el trader
         # seguía con sus tokens, y el siguiente ciclo del mismo mint vendía solo
         # una fracción (100% -> 50% -> 33%...) hasta descontrolarse del todo.
         self._close_hooks: list[Any] = []
+        self._load_recent_mints()
         self._load_positions()
+
+    def note_mint(self, mint: str) -> None:
+        """Registra un mint visto, para que /xarb tenga candidatos aunque la
+        posicion ya se haya cerrado. Se acota para no crecer sin limite."""
+        if not mint:
+            return
+        self.recent_mints.pop(mint, None)
+        self.recent_mints[mint] = time.time()
+        while len(self.recent_mints) > self.RECENT_MINTS_MAX:
+            self.recent_mints.pop(next(iter(self.recent_mints)))
+        self._save_recent_mints()
+
+    def _save_recent_mints(self) -> None:
+        try:
+            Path(self.RECENT_MINTS_FILE).write_text(
+                json.dumps(self.recent_mints), encoding="utf-8"
+            )
+        except Exception as exc:
+            logger.debug("No se pudieron guardar los mints recientes: {}", exc)
+
+    def _load_recent_mints(self) -> None:
+        path = Path(self.RECENT_MINTS_FILE)
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                self.recent_mints = {
+                    str(k): float(v)
+                    for k, v in list(data.items())[-self.RECENT_MINTS_MAX :]
+                }
+        except Exception as exc:
+            logger.debug("No se pudieron cargar los mints recientes: {}", exc)
 
     def register_close_hook(self, callback: Any) -> None:
         """Registra un callback `f(mint, source_wallet, sold_pct, reason)`."""

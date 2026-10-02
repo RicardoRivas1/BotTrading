@@ -1317,7 +1317,28 @@ class JupiterExecutor:
         pairs = data.get("pairs") or []
         if not pairs:
             return ""
-        best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+
+        def _liq(pair: dict) -> float:
+            try:
+                return float((pair.get("liquidity") or {}).get("usd", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        # Solo sirven los pools donde NUESTRO token es el BASE. DexScreener
+        # devuelve tambien los pools donde aparece en el QUOTE (por ejemplo un
+        # par LUCY/WBTC), y el pool de mas liquidez puede ser de otro token:
+        # sin este filtro, un mint unico aparecia con dos simbolos distintos
+        # ($8X2BXD y $REGGIE para el mismo mint) y el operador acababa sin
+        # saber cual de los dos era el token que se estaba copiando.
+        def _es_base(pair: dict) -> bool:
+            base = pair.get("baseToken") or {}
+            address = base.get("address") if isinstance(base, dict) else None
+            return address == token_mint
+
+        nuestros = [p for p in pairs if isinstance(p, dict) and _es_base(p)]
+        if not nuestros:
+            return ""
+        best = max(nuestros, key=_liq)
         base_token = best.get("baseToken") or {}
         symbol = str(base_token.get("symbol", "") or "").strip()
         return symbol.upper()
