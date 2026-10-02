@@ -521,7 +521,19 @@ class CopyTradingStrategy(Strategy):
         fee_drag = min(costs / invested_sol, 0.99)
         net = (1.0 + pnl_pct / 100.0) * (1.0 - fee_drag)
         # Slippage: entramos y salimos peor que el trader (SLIPPAGE_BPS por lado).
-        slip = float(getattr(self.config, "SLIPPAGE_BPS", 500)) / 10_000.0
+        #
+        # OJO: esto leia `self.config.SLIPPAGE_BPS`, que NO EXISTE (el valor
+        # vive en `self.config.trading`). El `getattr` con default 500 hacia que
+        # saliera el numero correcto POR ACCIDENTE, y ese 500 de coincidencia
+        # es justo el valor actual de trading.SLIPPAGE_BPS. Si alguien cambiase
+        # el slippage real, el escaner seguiria usando 500 en silencio y los
+        # PnL estimados dejarian de cuadrar con el coste verdadero.
+        slip_bps = getattr(
+            getattr(self.config, "trading", None), "SLIPPAGE_BPS", None
+        )
+        if slip_bps is None:
+            slip_bps = float(getattr(self.config, "SLIPPAGE_BPS", 500))
+        slip = float(slip_bps) / 10_000.0
         net *= (1.0 - slip) ** 2
         return (net - 1.0) * 100.0
 

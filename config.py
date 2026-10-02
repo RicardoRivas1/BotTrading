@@ -416,10 +416,17 @@ class ArbSettings(BaseSettings):
 
     ARB_SCAN_ENABLED: bool = Field(default=False, description="Activar el escaner")
     ARB_TRADE_SIZE_SOL: float = Field(
-        default=0.01,
+        default=0.05,
         gt=0,
         ge=0.001,
-        description="Tamaño del ciclo a cotizar (SOL). El edge depende del tamaño.",
+        description=(
+            "Tamaño del ciclo a cotizar (SOL). El edge depende del tamaño, y"
+            " sobre todo el COSTE: la rent de ATA son 0.002 SOL fijos, asi que"
+            " sobre 0.01 SOL ya son el 20% del ciclo y ningun arbitrageo sale"
+            " viable. Este parametro es el tamano del INSTRUMENTO DE MEDIDA, no"
+            " el dinero que se vaya a operar: subelo para que la medicion sea"
+            " util, no paraplicear mas."
+        ),
     )
     ARB_MIN_EDGE_PCT: float = Field(
         default=0.30,

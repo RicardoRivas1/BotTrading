@@ -144,6 +144,7 @@ class CrossPoolReport:
     cost_pct: float = 0.0
     pools_seen: int = 0
     pools_usable: int = 0
+    unindexed: list[str] = field(default_factory=list)
     candidates: list[SpreadCandidate] = field(default_factory=list)
     confirmed: list[SpreadCandidate] = field(default_factory=list)
     rejected: dict[str, int] = field(default_factory=dict)
@@ -158,6 +159,13 @@ class CrossPoolReport:
         return max((c.net_edge_pct for c in self.candidates), default=0.0)
 
     def format(self, min_hold_ms: float) -> str:
+        # Un ciclo cuyo coste se acerca al 10% hace que "0 oportunidades" sea
+        # una verdad tautologica, no una conclusion sobre el mercado: ningun
+        # spread entre dos pools de un mismo token llega a eso, asi que el
+        # escaner no puede encontrar nada SIN QUE DIGA NADA. El 10% sale de ahi:
+        # un arbitrageo de un mismo token en dos DEX se mueve en centimas, y
+        # la rent de ATA (0.002 SOL fijos) ya son 20% del ciclo de 0.01 SOL.
+        hopeless = self.cost_pct >= 10.0
         lines = [
             "<b>ESCANER CROSS-POOL (seco, no ejecuta)</b>",
             "",
@@ -171,6 +179,22 @@ class CrossPoolReport:
             f"Ciclo de {self.trade_size_sol:g} SOL | Coste: <b>{self.cost_pct:.2f}%</b>",
         ]
 
+        if hopeless:
+            lines += [
+                "",
+                f"<b>AVISO:</b> con {self.trade_size_sol:g} SOL el coste del ciclo "
+                f"es {self.cost_pct:.1f}%, y la rent de ATA (SOL fijos) se come "
+                "casi todo. <b>Ningun arbitrageo puede ser viable a este tamaño</b>, "
+                "asi que un 0 aqui no dice nada sobre el mercado. Sube "
+                "ARB_TRADE_SIZE_SOL para que la medicion sirva.",
+            ]
+        elif not self.candidates:
+            lines += [
+                "",
+                "<i>Sin spreads netos. Ningun par de pools ofrece una ventaja que",
+                "sobreviva a fees, slippage y rent tras los costes.</i>",
+            ]
+
         if self.confirmed:
             lines.append("")
             for c in sorted(
@@ -182,21 +206,25 @@ class CrossPoolReport:
                     f"  neto <b>{c.net_edge_pct:+.3f}%</b> | "
                     f"visto {c.duration_ms/1000:.1f}s ({c.hits} pasadas)"
                 )
-        elif self.candidates:
+        elif self.candidates and not hopeless:
             lines += [
                 "",
                 "<i>Hay spread pero ninguno ha durado lo suficiente todavia.</i>",
-            ]
-        else:
-            lines += [
-                "",
-                "<i>Sin spreads netos. Ningun par de pools ofrece una ventaja que",
-                "sobreviva a fees, slippage y rent tras los costes.</i>",
             ]
 
         if self.rejected:
             top = ", ".join(f"{k} ({v})" for k, v in list(self.rejected.items())[:4])
             lines += ["", f"Descartados: {top}"]
+
+        if self.unindexed:
+            # No es un error: son tokens sin pools todavia. Decirlo evita que
+            # se lean como una caida de la fuente.
+            lines += [
+                "",
+                f"ℹ️ {len(self.unindexed)} token(s) sin pools Todavia (recien "
+                "lanzados, DexScreener aun no los ha indexado). No comparables:",
+                "   " + ", ".join(m[:8] + "..." for m in self.unindexed[:6]),
+            ]
 
         if self.error:
             lines += ["", f"<b>Error de fuente:</b> {self.error[:120]}"]
@@ -612,12 +640,24 @@ class CrossPoolScanner:
                 try:
                     pairs = await self._fetch_pairs(session, mint)
                 except SwapExecutionError as exc:
+                    # "sin lista de pares" es la respuesta NORMAL de un token
+                    # recién lanzado que DexScreener aún no ha indexado, no una
+                    # caída. Se separa para que /xarb no lo reporte como error.
+                    if "lista de pares" in str(exc):
+                        report._reject("token aun sin pools indexados")
+                        report.unindexed.append(mint)
+                        continue
                     report._reject("fuente caida")
                     report.error = f"{mint[:8]}...: {exc}"[:120]
                     continue
                 except (aiohttp.ClientError, OSError, asyncio.TimeoutError) as exc:
                     report._reject("red")
                     report.error = f"{mint[:8]}...: red: {exc}"[:120]
+                    continue
+
+                if not pairs:
+                    report._reject("token aun sin pools indexados")
+                    report.unindexed.append(mint)
                     continue
 
                 report.pools_seen += len(pairs)

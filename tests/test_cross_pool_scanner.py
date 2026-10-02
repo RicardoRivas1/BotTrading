@@ -539,6 +539,46 @@ class TestScanCompleto:
         assert "fuente caida" in report.rejected
 
     @pytest.mark.asyncio
+    async def test_token_sin_pools_no_es_error_de_fuente(self) -> None:
+        # DexScreener devuelve {"pairs": null} para un token recien lanzado que
+        # aun no ha indexado. Eso es NORMAL, no una caida: reportarlo como
+        # "fuente caida" hacia pensar que el escaner estaba roto.
+        from core.execution import SwapExecutionError
+
+        s = _scanner()
+        s._fetch_pairs = AsyncMock(
+            side_effect=SwapExecutionError("respuesta sin lista de pares")
+        )
+        report = await s.scan([BONK])
+        assert report.candidates == []
+        assert report.unindexed == [BONK]
+        assert "fuente caida" not in report.rejected
+        # Lo que NO debe pasar: que se announce un error de fuente.
+        assert not report.error
+
+    @pytest.mark.asyncio
+    async def test_token_con_lista_vacia_tambien_cuenta_como_sin_indexar(self) -> None:
+        s = _scanner()
+        s._fetch_pairs = AsyncMock(return_value=[])
+        report = await s.scan([BONK])
+        assert report.unindexed == [BONK]
+        assert "token aun sin pools indexados" in report.rejected
+        assert not report.error
+
+    @pytest.mark.asyncio
+    async def test_caida_real_de_la_fuente_sigue_siendo_error(self) -> None:
+        # El caso contrario: un 429 es una caida de verdad y no se debe
+        # camuflar de "token sin indexar".
+        from core.execution import SwapExecutionError
+
+        s = _scanner()
+        s._fetch_pairs = AsyncMock(side_effect=SwapExecutionError("HTTP 429"))
+        report = await s.scan([BONK])
+        assert report.unindexed == []
+        assert "fuente caida" in report.rejected
+        assert report.error
+
+    @pytest.mark.asyncio
     async def test_sin_mints_devuelve_vacio(self) -> None:
         s = _scanner()
         report = await s.scan([])
@@ -547,6 +587,31 @@ class TestScanCompleto:
 
 
 class TestInforme:
+    def test_tamano_inviable_avisa_que_el_cero_no_dice_nada(self) -> None:
+        # El fallo original: con ARB_TRADE_SIZE_SOL=0.01 el coste es del 21.9%
+        # y ningun arbitrageo puede salir. Un "0 oportunidades" ahi se lee como
+        # "el mercado no tiene spreads" cuando en realidad es una verdad
+        # tautologica del tamaño elegido.
+        report = CrossPoolReport(trade_size_sol=0.01, cost_pct=21.89, pools_usable=0)
+        texto = report.format(3000.0)
+        assert "AVISO" in texto
+        assert "ningun" in texto.lower() and "viable" in texto.lower()
+        assert "ARB_TRADE_SIZE_SOL" in texto
+
+    def test_tamano_util_no_avisa_que_es_inviable(self) -> None:
+        # El aviso no puede contaminar la lectura de un resultado real.
+        report = CrossPoolReport(trade_size_sol=0.05, cost_pct=2.7, pools_usable=14)
+        texto = report.format(3000.0)
+        assert "AVISO" not in texto
+        assert "21.9" not in texto
+
+    def test_lista_los_tokens_sin_pools(self) -> None:
+        report = CrossPoolReport(trade_size_sol=1.0, cost_pct=1.7)
+        report.unindexed = [BONK, JTO]
+        texto = report.format(3000.0)
+        assert "sin pools" in texto
+        assert BONK[:8] in texto and JTO[:8] in texto
+
     def test_avisa_de_que_no_es_senal_de_compra(self) -> None:
         # Esto va a Telegram. Si alguien lo lee como "compra esto", el modulo
         # ha propuesto una perdida.

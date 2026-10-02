@@ -1022,6 +1022,56 @@ class TestDRYRunHonesto:
         strategy, _ex, _tr = _strategy(tmp_path)
         assert strategy._estimate_after_costs(100.0, 0.0) == 100.0
 
+    def test_el_slippage_se_lee_de_la_config_real(self, tmp_path: Path) -> None:
+        """El slippage vivia en `self.config.SLIPPAGE_BPS`, que NO existe.
+
+        El valor real esta en `config.trading.SLIPPAGE_BPS`. El `getattr` con
+        default 500 hacia que saliera bien POR ACCIDENTE, y como 500 era justo
+        el valor de trading, el bug era invisible. Aqui se baja el valor real a
+        0 y se comprueba que el resultado cambia: si el codigo se quedase en el
+        500 de siempre, este test falla.
+        """
+        strategy, _ex, _tr = _strategy(tmp_path)
+        fees = strategy._estimated_costs_sol() / 1.0
+
+        con_slippage_real = strategy._estimate_after_costs(100.0, 1.0)
+        strategy.config.trading.SLIPPAGE_BPS = 0.0
+        sin_slippage = strategy._estimate_after_costs(100.0, 1.0)
+
+        esperado = ((1.0 + 1.0) * (1.0 - fees) * 1.0 - 1.0) * 100.0
+        assert sin_slippage == pytest.approx(esperado)
+        # Si el codigo leyera el default fijo de 500 en vez de la config real,
+        # bajar SLIPPAGE_BPS a 0 no cambiaria nada y estos dos valores serian
+        # iguales. La diferencia es la prueba de que ahora SI lee la config.
+        assert con_slippage_real < sin_slippage
+        assert con_slippage_real == pytest.approx(
+            ((1.0 + 1.0) * (1.0 - fees) * 0.95**2 - 1.0) * 100.0
+        )
+
+    def test_caida_de_dust_arrastra_las_ganancias_normales(self, tmp_path: Path) -> None:
+        """Documenta el -98% real que aparece en los logs.
+
+        Con 0.0001 SOL de posicion, el ciclo cuesta 0.00308928 SOL: son 3089%
+        de coste, asi que el `min(..., 0.99)` se come el 99% del capital y
+        solo queda un 1% del multiplicador. Una ganancia NORMAL (la del trader,
+        entre +15% y +250%) acaba alrededor de -98% por muy grande que sea.
+        """
+        strategy, _ex, _tr = _strategy(tmp_path)
+        for pnl_trader in (15.28, 56.80, 74.43, 191.81, 246.61):
+            dust = strategy._estimate_after_costs(pnl_trader, 0.0001)
+            assert dust < -95.0, f"trader +{pnl_trader}% dio {dust:.2f}% con dust"
+
+        # La excepcion que demuestra que la regla es "ganancia vs coste", no
+        # "dust = -98% garantizado": un +8232% (83x) deja un 1% vivo, y aunque
+        # el 5% de slippage por lado lo deja igualmente en -24.8%, esta a anos
+        # luz del -98% de las ganancias normales. El tamano importa mas que el
+        # porcentaje del trader, pero un multiplicador enorme compra margen.
+        extremo = strategy._estimate_after_costs(8232.0, 0.0001)
+        assert -50.0 < extremo < 0.0, f"un 83x deberia recuperar bastante, dio {extremo}"
+
+        # Y el tamano manda: a 0.05 SOL las mismas ganancias son rentables.
+        assert strategy._estimate_after_costs(246.61, 0.05) > 0
+
     def test_ganar_todo_no_basta_si_el_capital_es_dust(self, tmp_path: Path) -> None:
         # +8232% fue el "mejor trade" historico. Aun asi, con una posicion de
         # polvo, el coste se lo come. Por eso el filtro de scalpes importa mas
